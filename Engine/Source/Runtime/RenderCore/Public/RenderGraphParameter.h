@@ -3,6 +3,7 @@
 #pragma once
 
 #include "RenderGraphDefinitions.h"
+#include "ShaderParameterMacros.h"
 
 /** A helper class for identifying and accessing a render graph pass parameter. */
 class FRDGParameter final
@@ -12,7 +13,7 @@ public:
 
 	bool IsResource() const
 	{
-		return !IsRenderTargetBindingSlots();
+		return !IsRenderTargetBindingSlots() && !IsResourceAccessArray();
 	}
 
 	bool IsSRV() const
@@ -42,11 +43,14 @@ public:
 		return MemberType == UBMT_RDG_TEXTURE_ACCESS;
 	}
 
+	bool IsTextureAccessArray() const
+	{
+		return MemberType == UBMT_RDG_TEXTURE_ACCESS_ARRAY;
+	}
+
 	bool IsBuffer() const
 	{
-		return
-			MemberType == UBMT_RDG_BUFFER ||
-			MemberType == UBMT_RDG_BUFFER_ACCESS;
+		return MemberType == UBMT_RDG_BUFFER_ACCESS;
 	}
 
 	bool IsBufferAccess() const
@@ -54,12 +58,28 @@ public:
 		return MemberType == UBMT_RDG_BUFFER_ACCESS;
 	}
 
+	bool IsBufferAccessArray() const
+	{
+		return MemberType == UBMT_RDG_BUFFER_ACCESS_ARRAY;
+	}
+
+	bool IsResourceAccessArray() const
+	{
+		return IsBufferAccessArray() || IsTextureAccessArray();
+	}
+
 	bool IsUniformBuffer() const
 	{
 		return MemberType == UBMT_RDG_UNIFORM_BUFFER;
 	}
 
+	UE_DEPRECATED(5.1, "Use IsViewableResource instead.")
 	bool IsParentResource() const
+	{
+		return IsTexture() || IsBuffer();
+	}
+
+	bool IsViewableResource() const
 	{
 		return IsTexture() || IsBuffer();
 	}
@@ -80,16 +100,24 @@ public:
 		return *GetAs<FRDGResourceRef>();
 	}
 
-	FRDGUniformBufferRef GetAsUniformBuffer() const
+	FRDGUniformBufferBinding GetAsUniformBuffer() const
 	{
 		check(IsUniformBuffer());
-		return *GetAs<FRDGUniformBufferRef>();
+		return *GetAs<FRDGUniformBufferBinding>();
 	}
 
-	FRDGParentResourceRef GetAsParentResource() const
+	UE_DEPRECATED(5.1, "Use IsViewableResource instead.")
+	FRDGViewableResource* GetAsParentResource() const
 	{
-		check(IsParentResource());
-		return *GetAs<FRDGParentResourceRef>();
+		check(IsViewableResource());
+		return *GetAs<FRDGViewableResource*>();
+	}
+
+
+	FRDGViewableResource* GetAsViewableResource() const
+	{
+		check(IsViewableResource());
+		return *GetAs<FRDGViewableResource*>();
 	}
 
 	FRDGViewRef GetAsView() const
@@ -122,6 +150,12 @@ public:
 		return *GetAs<FRDGTextureAccess>();
 	}
 
+	const FRDGTextureAccessArray& GetAsTextureAccessArray() const
+	{
+		check(MemberType == UBMT_RDG_TEXTURE_ACCESS_ARRAY);
+		return *GetAs<FRDGTextureAccessArray>();
+	}
+
 	FRDGBufferRef GetAsBuffer() const
 	{
 		check(IsBuffer());
@@ -132,6 +166,12 @@ public:
 	{
 		check(MemberType == UBMT_RDG_BUFFER_ACCESS);
 		return *GetAs<FRDGBufferAccess>();
+	}
+
+	const FRDGBufferAccessArray& GetAsBufferAccessArray() const
+	{
+		check(MemberType == UBMT_RDG_BUFFER_ACCESS_ARRAY);
+		return *GetAs<FRDGBufferAccessArray>();
 	}
 
 	FRDGTextureSRVRef GetAsTextureSRV() const
@@ -187,8 +227,10 @@ class RENDERCORE_API FRDGParameterStruct
 {
 public:
 	template <typename ParameterStructType>
-	explicit FRDGParameterStruct(ParameterStructType* Parameters)
-		: FRDGParameterStruct(Parameters, &ParameterStructType::FTypeInfo::GetStructMetadata()->GetLayout())
+	explicit FRDGParameterStruct(const ParameterStructType* Parameters, const FShaderParametersMetadata* InParameterMetadata)
+		: Contents(reinterpret_cast<const uint8*>(Parameters))
+		, Layout(InParameterMetadata->GetLayoutPtr())
+		, Metadata(InParameterMetadata)
 	{}
 
 	explicit FRDGParameterStruct(const void* InContents, const FRHIUniformBufferLayout* InLayout)
@@ -203,6 +245,9 @@ public:
 
 	/** Returns the layout associated with this struct. */
 	const FRHIUniformBufferLayout& GetLayout() const { return *Layout; }
+	const FRHIUniformBufferLayout* GetLayoutPtr() const { return Layout; }
+
+	const FShaderParametersMetadata* GetMetadata() const { return Metadata; }
 
 	/** Helpful forwards from the layout. */
 	FORCEINLINE bool HasRenderTargets() const   { return Layout->HasRenderTargets(); }
@@ -214,6 +259,9 @@ public:
 
 	/** Returns the number of texture parameters present on the layout. */
 	uint32 GetTextureParameterCount() const { return Layout->GraphTextures.Num(); }
+
+	/** Returns the number of RDG uniform buffers present in the layout. */
+	uint32 GetUniformBufferParameterCount() const { return Layout->GraphUniformBuffers.Num(); }
 
 	/** Returns the render target binding slots. Asserts if they don't exist. */
 	const FRenderTargetBindingSlots& GetRenderTargets() const
@@ -237,18 +285,21 @@ public:
 	template <typename FunctionType>
 	void EnumerateBuffers(FunctionType Function) const;
 
-	/** Enumerates all non-null uniform buffers. Expected function signature: void(FRDGUniformBuffer*). */
+	/** Enumerates all non-null uniform buffers. Expected function signature: void(FRDGUniformBufferBinding). */
 	template <typename FunctionType>
 	void EnumerateUniformBuffers(FunctionType Function) const;
 
-	/** Returns a set of static global uniform buffer bindings for the parameter struct. */
-	FUniformBufferStaticBindings GetGlobalUniformBuffers() const;
+	/** Returns a set of static uniform buffer bindings for the parameter struct. */
+	FUniformBufferStaticBindings GetStaticUniformBuffers() const;
 
 	/** Returns the render pass info generated from the render target binding slots. */
 	FRHIRenderPassInfo GetRenderPassInfo() const;
 
+	/** Clears out all uniform buffer references in the parameter struct. */
+	static void ClearUniformBuffers(void* Contents, const FRHIUniformBufferLayout* Layout);
+
 private:
-	FRDGParameter GetParameterInternal(TArrayView<const FRHIUniformBufferLayout::FResourceParameter> Parameters, uint32 ParameterIndex) const
+	FRDGParameter GetParameterInternal(TArrayView<const FRHIUniformBufferResource> Parameters, uint32 ParameterIndex) const
 	{
 		checkf(ParameterIndex < static_cast<uint32>(Parameters.Num()), TEXT("Attempted to access RDG pass parameter outside of index for Layout '%s'"), *Layout->GetDebugName());
 		const EUniformBufferBaseType MemberType = Parameters[ParameterIndex].MemberType;
@@ -257,7 +308,8 @@ private:
 	}
 
 	const uint8* Contents;
-	const FRHIUniformBufferLayout* Layout;
+	FUniformBufferLayoutRHIRef Layout;
+	const FShaderParametersMetadata* Metadata = nullptr;
 
 	friend class FRDGPass;
 };
@@ -291,12 +343,12 @@ public:
 template <typename TParameterStruct>
 FORCEINLINE static FRHIRenderPassInfo GetRenderPassInfo(TParameterStruct* Parameters)
 {
-	return FRDGParameterStruct(Parameters).GetRenderPassInfo();
+	return FRDGParameterStruct(Parameters, TParameterStruct::FTypeInfo::GetStructMetadata()).GetRenderPassInfo();
 }
 
 /** Helper function to get RHI global uniform buffers out of a pass parameters struct. */
 template <typename TParameterStruct>
-FORCEINLINE static FUniformBufferStaticBindings GetGlobalUniformBuffers(TParameterStruct* Parameters)
+FORCEINLINE static FUniformBufferStaticBindings GetStaticUniformBuffers(TParameterStruct* Parameters)
 {
-	return FRDGParameterStruct(Parameters).GetGlobalUniformBuffers();
+	return FRDGParameterStruct(Parameters, TParameterStruct::FTypeInfo::GetStructMetadata()).GetStaticUniformBuffers();
 }

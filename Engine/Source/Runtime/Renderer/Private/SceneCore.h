@@ -41,7 +41,12 @@ public:
 	bool HasTranslucentObjectShadow() const { return bHasTranslucentObjectShadow; }
 	bool HasInsetObjectShadow() const { return bHasInsetObjectShadow; }
 	bool CastsSelfShadowOnly() const { return bSelfShadowOnly; }
-	bool IsMobileDynamicPointLight() const { return bMobileDynamicPointLight; }
+	bool IsMobileDynamicLocalLight() const { return bMobileDynamicLocalLight; }
+
+	FORCEINLINE bool IsNaniteMeshProxy() const { return bNaniteMeshProxy; }
+	FORCEINLINE bool ProxySupportsGPUScene() const { return bProxySupportsGPUScene; }
+
+
 	FLightSceneInfo* GetLight() const { return LightSceneInfo; }
 	int32 GetLightId() const { return LightId; }
 	FPrimitiveSceneInfo* GetPrimitiveSceneInfo() const { return PrimitiveSceneInfo; }
@@ -56,6 +61,10 @@ public:
 
 	/** Clears cached shadow maps, if possible */
 	void FlushCachedShadowMapData();
+
+	/** Custom new/delete */
+	void* operator new(size_t Size);
+	void operator delete(void* RawMemory);
 
 private:
 	/** The light which affects the primitive. */
@@ -103,8 +112,14 @@ private:
 	/** True if the primitive only shadows itself. */
 	uint32 bSelfShadowOnly : 1;
 
-	/** True this is a mobile dynamic point light interaction. */
-	uint32 bMobileDynamicPointLight : 1;
+	/** True this is a mobile dynamic local light interaction. */
+	uint32 bMobileDynamicLocalLight : 1;
+
+	/** If true then all meshes drawn by the primitive scene proxy are Nanite meshes. Caches the result of FPrimitiveSceneProxy::IsNaniteMesh() */
+	uint32 bNaniteMeshProxy : 1;
+
+	/** If true then all meshes drawn by the primitive scene proxy supports GPU-Scene (and thus VSM shadows). */
+	uint32 bProxySupportsGPUScene : 1;
 
 	/** Initialization constructor. */
 	FLightPrimitiveInteraction(FLightSceneInfo* InLightSceneInfo,FPrimitiveSceneInfo* InPrimitiveSceneInfo,
@@ -159,7 +174,7 @@ private:
 class FStaticMeshBatchRelevance
 {
 public:
-	FStaticMeshBatchRelevance(const FStaticMeshBatch& StaticMesh, float InScreenSize, bool InbSupportsCachingMeshDrawCommands, bool InbUseSkyMaterial, bool bInUseSingleLayerWaterMaterial, bool bInUseAnisotropy, ERHIFeatureLevel::Type FeatureLevel)
+	FStaticMeshBatchRelevance(const FStaticMeshBatch& StaticMesh, float InScreenSize, bool InbSupportsCachingMeshDrawCommands, bool InbUseSkyMaterial, bool bInUseSingleLayerWaterMaterial, bool bInUseAnisotropy, bool bInSupportsNaniteRendering, bool bInSupportsGPUScene, ERHIFeatureLevel::Type FeatureLevel)
 		: Id(StaticMesh.Id)
 		, ScreenSize(InScreenSize)
 		, NumElements(StaticMesh.Elements.Num())
@@ -178,6 +193,8 @@ public:
 		, bRenderToVirtualTexture(StaticMesh.bRenderToVirtualTexture)
 		, RuntimeVirtualTextureMaterialType(StaticMesh.RuntimeVirtualTextureMaterialType)
 		, bSupportsCachingMeshDrawCommands(InbSupportsCachingMeshDrawCommands)
+		, bSupportsNaniteRendering(bInSupportsNaniteRendering)
+		, bSupportsGPUScene(bInSupportsGPUScene)
 	{
 	}
 
@@ -222,6 +239,12 @@ public:
 	/** Cached from vertex factory to avoid dereferencing VF in InitViews. */
 	uint8 bSupportsCachingMeshDrawCommands : 1;
 
+	/** Cached from vertex factory to avoid dereferencing VF in InitViews. */
+	uint8 bSupportsNaniteRendering : 1;
+
+	/** Cached from vertex factory to avoid dereferencing VF in shadow depth rendering. */
+	uint8 bSupportsGPUScene : 1;
+
 	/** Computes index of cached mesh draw command in FPrimitiveSceneInfo::CachedMeshDrawCommandInfos, for a given mesh pass. */
 	int32 GetStaticMeshCommandInfoIndex(EMeshPass::Type MeshPass) const;
 };
@@ -264,6 +287,10 @@ public:
 	float VolumetricFogDistance;
 	float VolumetricFogStaticLightingScatteringIntensity;
 	bool bOverrideLightColorsWithFogInscatteringColors;
+	float VolumetricFogStartDistance;
+	float VolumetricFogNearFadeInDistance;
+
+	FLinearColor SkyAtmosphereAmbientContributionColorScale;
 
 	/** Initialization constructor. */
 	FExponentialHeightFogSceneInfo(const UExponentialHeightFogComponent* InComponent);

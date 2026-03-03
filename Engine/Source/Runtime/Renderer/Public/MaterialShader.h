@@ -15,7 +15,9 @@
 #include "MaterialShared.h"
 #include "GlobalShader.h"
 #include "MaterialShaderType.h"
+#if UE_ENABLE_INCLUDE_ORDER_DEPRECATED_IN_5_1
 #include "SceneRenderTargetParameters.h"
+#endif
 #include "ShaderParameterUtils.h"
 
 template<typename TBufferStruct> class TUniformBufferRef;
@@ -28,8 +30,7 @@ class FDebugUniformExpressionSet
 	DECLARE_TYPE_LAYOUT(FDebugUniformExpressionSet, NonVirtual);
 public:
 	FDebugUniformExpressionSet()
-		: NumVectorExpressions(0)
-		, NumScalarExpressions(0)
+		: NumPreshaders(0)
 	{
 		FMemory::Memzero(NumTextureExpressions);
 	}
@@ -42,8 +43,7 @@ public:
 	/** Initialize from a uniform expression set. */
 	void InitFromExpressionSet(const FUniformExpressionSet& InUniformExpressionSet)
 	{
-		NumVectorExpressions = InUniformExpressionSet.UniformVectorPreshaders.Num();
-		NumScalarExpressions = InUniformExpressionSet.UniformScalarPreshaders.Num();
+		NumPreshaders = InUniformExpressionSet.UniformPreshaders.Num();
 		for (uint32 TypeIndex = 0u; TypeIndex < NumMaterialTextureParameterTypes; ++TypeIndex)
 		{
 			NumTextureExpressions[TypeIndex] = InUniformExpressionSet.UniformTextureParameters[TypeIndex].Num();
@@ -60,12 +60,11 @@ public:
 				return false;
 			}
 		}
-		return NumVectorExpressions == InUniformExpressionSet.UniformVectorPreshaders.Num() && NumScalarExpressions == InUniformExpressionSet.UniformScalarPreshaders.Num();
+		return NumPreshaders == InUniformExpressionSet.UniformPreshaders.Num();
 	}
 	
 	/** The number of each type of expression contained in the set. */
-	LAYOUT_FIELD(int32, NumVectorExpressions);
-	LAYOUT_FIELD(int32, NumScalarExpressions);
+	LAYOUT_FIELD(int32, NumPreshaders);
 	LAYOUT_ARRAY(int32, NumTextureExpressions, NumMaterialTextureParameterTypes);
 };
 
@@ -73,8 +72,8 @@ struct FMaterialShaderPermutationParameters : public FShaderPermutationParameter
 {
 	FMaterialShaderParameters MaterialParameters;
 
-	FMaterialShaderPermutationParameters(EShaderPlatform InPlatform, const FMaterialShaderParameters& InMaterialParameters, int32 InPermutationId)
-		: FShaderPermutationParameters(InPlatform, InPermutationId)
+	FMaterialShaderPermutationParameters(EShaderPlatform InPlatform, const FMaterialShaderParameters& InMaterialParameters, int32 InPermutationId, EShaderPermutationFlags InFlags)
+		: FShaderPermutationParameters(InPlatform, InPermutationId, InFlags)
 		, MaterialParameters(InMaterialParameters)
 	{}
 };
@@ -95,27 +94,28 @@ public:
 
 	FRHIUniformBuffer* GetParameterCollectionBuffer(const FGuid& Id, const FSceneInterface* SceneInterface) const;
 
-	template<typename ShaderRHIParamRef>
-	FORCEINLINE_DEBUGGABLE void SetViewParameters(FRHICommandList& RHICmdList, const ShaderRHIParamRef ShaderRHI, const FSceneView& View, const TUniformBufferRef<FViewUniformShaderParameters>& ViewUniformBuffer)
+	template<typename ShaderRHIParamRef, typename TRHICommandList>
+	FORCEINLINE_DEBUGGABLE void SetViewParameters(TRHICommandList& RHICmdList, const ShaderRHIParamRef ShaderRHI, const FSceneView& View, const TUniformBufferRef<FViewUniformShaderParameters>& ViewUniformBuffer)
 	{
 		const auto& ViewUniformBufferParameter = GetUniformBufferParameter<FViewUniformShaderParameters>();
 		SetUniformBufferParameter(RHICmdList, ShaderRHI, ViewUniformBufferParameter, ViewUniformBuffer);
 
-		if (View.bShouldBindInstancedViewUB && View.Family->Views.Num() > 0)
+		if (View.bShouldBindInstancedViewUB)
 		{
 			// When drawing the left eye in a stereo scene, copy the right eye view values into the instanced view uniform buffer.
-			const EStereoscopicPass StereoPassIndex = IStereoRendering::IsStereoEyeView(View) ? eSSP_RIGHT_EYE : eSSP_FULL;
-
-			const FSceneView& InstancedView = View.Family->GetStereoEyeView(StereoPassIndex);
-			const auto& InstancedViewUniformBufferParameter = GetUniformBufferParameter<FInstancedViewUniformShaderParameters>();
-			SetUniformBufferParameter(RHICmdList, ShaderRHI, InstancedViewUniformBufferParameter, InstancedView.ViewUniformBuffer);
+			const FSceneView* InstancedView = View.GetInstancedSceneView();
+			if (InstancedView)
+			{
+				const auto& InstancedViewUniformBufferParameter = GetUniformBufferParameter<FInstancedViewUniformShaderParameters>();
+				SetUniformBufferParameter(RHICmdList, ShaderRHI, InstancedViewUniformBufferParameter, InstancedView->ViewUniformBuffer);
+			}
 		}
 	}
 
 	/** Sets pixel parameters that are material specific but not FMeshBatch specific. */
-	template< typename TRHIShader >
+	template<typename TRHIShader, typename TRHICommandList>
 	void SetParameters(
-		FRHICommandList& RHICmdList,
+		TRHICommandList& RHICmdList,
 		TRHIShader* ShaderRHI,
 		const FMaterialRenderProxy* MaterialRenderProxy, 
 		const FMaterial& Material,
@@ -148,6 +148,6 @@ private:
 
 protected:
 	LAYOUT_FIELD_EDITORONLY(FDebugUniformExpressionSet, DebugUniformExpressionSet);
-	LAYOUT_FIELD_EDITORONLY(FRHIUniformBufferLayout, DebugUniformExpressionUBLayout);
+	LAYOUT_FIELD_EDITORONLY(FRHIUniformBufferLayoutInitializer, DebugUniformExpressionUBLayout);
 	LAYOUT_FIELD_EDITORONLY(FMemoryImageString, DebugDescription);
 };

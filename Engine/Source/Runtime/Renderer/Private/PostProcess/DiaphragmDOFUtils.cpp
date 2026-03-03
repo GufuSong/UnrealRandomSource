@@ -44,12 +44,12 @@ float DiaphragmDOF::ComputeFocalLengthFromFov(const FSceneView& View)
 
 // Convert f-stop and focal distance into projected size in half resolution pixels.
 // Setup depth based blur.
-FVector4 DiaphragmDOF::CircleDofHalfCoc(const FViewInfo& View)
+FVector4f DiaphragmDOF::CircleDofHalfCoc(const FViewInfo& View)
 {
 	static const auto CVar = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.DepthOfFieldQuality"));
 	bool bDepthOfField = View.Family->EngineShowFlags.DepthOfField && CVar->GetValueOnRenderThread() > 0 && View.FinalPostProcessSettings.DepthOfFieldFstop > 0 && View.FinalPostProcessSettings.DepthOfFieldFocalDistance > 0;
 
-	FVector4 Ret(0, 1, 0, 0);
+	FVector4f Ret(0, 1, 0, 0);
 
 	if(bDepthOfField)
 	{
@@ -87,7 +87,7 @@ FVector4 DiaphragmDOF::CircleDofHalfCoc(const FViewInfo& View)
 
 		// The DepthOfFieldDepthBlurAmount = km at which depth blur is 50%.
 		// Need to convert to cm here.
-		Ret = FVector4(
+		Ret = FVector4f(
 			Radius, 
 			1.0f / (View.FinalPostProcessSettings.DepthOfFieldDepthBlurAmount * 100000.0f),
 			View.FinalPostProcessSettings.DepthOfFieldDepthBlurRadius * Width / 1920.0f,
@@ -102,6 +102,7 @@ void DiaphragmDOF::FPhysicalCocModel::Compile(const FViewInfo& View)
 	// Fetches DOF settings.
 	{
 		FocusDistance = View.FinalPostProcessSettings.DepthOfFieldFocalDistance;
+		Squeeze = FMath::Clamp(View.FinalPostProcessSettings.DepthOfFieldSqueezeFactor, 1.0f, 2.0f);
 
 		// -because foreground Coc are negative.
 		MinForegroundCocRadius = -CVarMaxForegroundRadius.GetValueOnRenderThread();
@@ -116,6 +117,7 @@ void DiaphragmDOF::FPhysicalCocModel::Compile(const FViewInfo& View)
 	}
 
 	// Compile coc model equation.
+	if (View.FinalPostProcessSettings.DepthOfFieldFstop > 0.f && View.FinalPostProcessSettings.DepthOfFieldFocalDistance > 0.f)
 	{
 
 		float FocalLengthInMM = DiaphragmDOF::ComputeFocalLengthFromFov(View);
@@ -138,6 +140,11 @@ void DiaphragmDOF::FPhysicalCocModel::Compile(const FViewInfo& View)
 
 		// Convert diameter in mm to resolution less radius on the filmback.
 		InfinityBackgroundCocRadius = DiameterInMM * 0.5f / SensorWidthInMM;
+	}
+	else
+	{
+		InfinityBackgroundCocRadius = 0.0f;
+		MinForegroundCocRadius = 0.0;
 	}
 }
 

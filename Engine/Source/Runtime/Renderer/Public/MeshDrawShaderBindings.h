@@ -182,6 +182,8 @@ public:
 	template<class ParameterType>
 	void Add(FShaderParameter Parameter, const ParameterType& Value)
 	{
+		static_assert(!TIsUECoreVariant<ParameterType, double>::Value, "FMeshDrawSingleShaderBindings cannot Add double core variants! Switch to float variant.");
+		static_assert(!TIsUECoreVariant<typename std::remove_pointer<typename TDecay<ParameterType>::Type>::type, double>::Value, "FMeshDrawSingleShaderBindings cannot Add double core variants! Switch to float variant.");
 		static_assert(!TIsPointer<ParameterType>::Value, "Passing by pointer is not valid.");
 		checkfSlow(Parameter.IsInitialized(), TEXT("Parameter was not serialized"));
 
@@ -197,10 +199,10 @@ public:
 
 				if (LooseParameterBuffer.BaseIndex == Parameter.GetBufferIndex())
 				{
-					TArrayView<const FShaderParameterInfo> Parameters(LooseParameterBuffer.Parameters);
+					TArrayView<const FShaderLooseParameterInfo> Parameters(LooseParameterBuffer.Parameters);
 					for (int32 LooseParameterIndex = 0; LooseParameterIndex < Parameters.Num(); LooseParameterIndex++)
 					{
-						FShaderParameterInfo LooseParameter = Parameters[LooseParameterIndex];
+						const FShaderLooseParameterInfo LooseParameter = Parameters[LooseParameterIndex];
 
 						if (Parameter.GetBaseIndex() == LooseParameter.BaseIndex)
 						{

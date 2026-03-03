@@ -8,6 +8,8 @@
 
 #include "ScreenPass.h"
 #include "PostProcessEyeAdaptation.h"
+#include "PostProcess/PostProcessTonemap.h"
+#include "PostProcess/PostProcessUpscale.h"
 
 class FViewInfo;
 
@@ -102,8 +104,8 @@ struct FMobileBloomUpInputs
 	FScreenPassTexture BloomUpSourceB;
 
 	FVector2D ScaleAB;
-	FVector4 TintA;
-	FVector4 TintB;
+	FVector4f TintA;
+	FVector4f TintB;
 };
 
 FScreenPassTexture AddMobileBloomUpPass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FMobileBloomUpInputs& Inputs);
@@ -147,27 +149,9 @@ struct FMobileSunMergeInputs
 	FScreenPassTexture BloomUp;
 	bool bUseBloom;
 	bool bUseSun;
-	bool bUseAa;
 };
 
 FScreenPassTexture AddMobileSunMergePass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FMobileSunMergeInputs& Inputs);
-
-struct FMobileSunAvgInputs
-{
-	FScreenPassTexture SunMerge;
-	FScreenPassTexture LastFrameSunMerge;
-};
-
-FScreenPassTexture AddMobileSunAvgPass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FMobileSunAvgInputs& Inputs);
-
-struct FMobileTAAInputs
-{
-	FScreenPassRenderTarget OverrideOutput;
-	FScreenPassTexture SceneColor;
-	FScreenPassTexture LastFrameSceneColor;
-};
-
-FScreenPassTexture AddMobileTAAPass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FMobileTAAInputs& Inputs);
 
 struct FMobileEyeAdaptationSetupInputs
 {
@@ -186,6 +170,7 @@ FMobileEyeAdaptationSetupOutputs AddMobileEyeAdaptationSetupPass(FRDGBuilder& Gr
 struct FMobileEyeAdaptationInputs
 {
 	FRDGBufferSRVRef EyeAdaptationSetupSRV;
+	FRDGBufferRef EyeAdaptationBuffer;
 	bool bUseBasicEyeAdaptation;
 	bool bUseHistogramEyeAdaptation;
 };
@@ -209,3 +194,6 @@ class FMSAADecodeAndCopyRectPS_Mobile : public FGlobalShader
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
 };
+
+FScreenPassTexture AddEASUPass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const ISpatialUpscaler::FInputs& PassInputs);
+FScreenPassTexture AddCASPass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const ISpatialUpscaler::FInputs& PassInputs);

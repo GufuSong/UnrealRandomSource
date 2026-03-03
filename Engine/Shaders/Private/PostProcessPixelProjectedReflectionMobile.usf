@@ -8,8 +8,7 @@
 
 #define PROJECTION_CLEAR_VALUE				0xFFFFFFFF
 #define PROJECTION_PLANE_VALUE				0xFFFFFFFE
-#define PROJECTION_OUTPUT_TYPE_BUFFER		0
-#define PROJECTION_OUTPUT_TYPE_TEXTURE		1
+
 #define QUALITY_LEVEL_BEST_PERFORMANCE		0
 #define QUALITY_LEVEL_BETTER_QUALITY		1
 #define QUALITY_LEVEL_BEST_QUALITY			2
@@ -32,9 +31,9 @@ Texture2D SceneDepthTexture;
 SamplerState SceneDepthSampler;
 
 float4 ReflectionPlane;
-half4 BufferSizeAndInvSize;
-half4 ViewSizeAndInvSize;
-half4 ViewRectMin;
+float4 BufferSizeAndInvSize;
+float4 ViewSizeAndInvSize;
+float4 ViewRectMin;
 
 float2 ProjectionPixelToBufferUV(int2 ReflectionPixel)
 {
@@ -53,10 +52,10 @@ float2 ProjectionPixelToBufferUV(int2 ReflectionPixel)
 
 RWTexture2D<half4> OutputSceneColor;
 
-#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
-RWTexture2D<uint> OutputProjection;
+#if PROJECTION_OUTPUT_TYPE_TEXTURE
+RWTexture2D<uint> OutputProjectionTexture;
 #else
-RWBuffer<uint> OutputProjection;
+RWBuffer<uint> OutputProjectionBuffer;
 #endif
 
 // Calculate coordinate system index based on offset
@@ -89,13 +88,17 @@ uint EncodeProjectionBufferValue(int2 PixelOffset)
 
 void ProjectionBufferWrite(int2 BufferPos, uint BufferValue)
 {
-#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
+#if PROJECTION_OUTPUT_TYPE_TEXTURE
 	int2 WriteOffset = BufferPos + ViewRectMin.xy;
 #else
 	int WriteOffset = (BufferPos.x + ViewRectMin.x) + ((BufferPos.y + ViewRectMin.y) * BufferSizeAndInvSize.x);
 #endif
 	uint OriginalValue = 0;
-	InterlockedMin(OutputProjection[WriteOffset], BufferValue, OriginalValue);
+#if PROJECTION_OUTPUT_TYPE_TEXTURE
+	InterlockedMin(OutputProjectionTexture[WriteOffset], BufferValue, OriginalValue);
+#else
+	InterlockedMin(OutputProjectionBuffer[WriteOffset], BufferValue, OriginalValue);
+#endif
 }
 
 void ProjectionPassWrite(int2 ReflectedPixel, half2 ReflectingCoord)
@@ -128,7 +131,7 @@ void ProjectionPassCS(
 	, out uint LayerIndex : SV_RenderTargetArrayIndex
 #elif MOBILE_MULTI_VIEW
 	, in uint ViewId : SV_ViewID
-	, out float MultiViewIndex : VIEW_ID
+	, out nointerpolation uint MultiViewIndex : VIEW_ID
 #endif
 )
 {
@@ -137,14 +140,8 @@ void ProjectionPassCS(
 	ResolvedView = ResolveView(EyeIndex);
 	LayerIndex = EyeIndex;
 #elif MOBILE_MULTI_VIEW
-#if COMPILER_GLSL_ES3_1
-	const int MultiViewId = int(ViewId);
-	ResolvedView = ResolveView(uint(MultiViewId));
-	MultiViewIndex = float(MultiViewId);
-#else
 	ResolvedView = ResolveView(ViewId);
-	MultiViewIndex = float(ViewId);
-#endif
+	MultiViewIndex = ViewId;
 #else
 	ResolvedView = ResolveView();
 #endif
@@ -161,7 +158,7 @@ void ProjectionPassCS(
 
 		float PlaneDistance = dot(ReflectionPlane, float4(ViewPosition, -1.0f));
 
-		if (PlaneDistance > 0.01f )
+		if (PlaneDistance > 0.5f )
 		{
 			float3 MirroredViewPosition = ViewPosition - ReflectionPlane.xyz * (2.f * PlaneDistance);
 
@@ -195,7 +192,7 @@ void ReflectionPassVS(
 	, out uint LayerIndex : SV_RenderTargetArrayIndex
 #elif MOBILE_MULTI_VIEW
 	, in uint ViewId : SV_ViewID
-	, out float MultiViewIndex : VIEW_ID
+	, out nointerpolation uint MultiViewIndex : VIEW_ID
 #endif
 )
 {
@@ -204,14 +201,8 @@ void ReflectionPassVS(
 	ResolvedView = ResolveView(EyeIndex);
 	LayerIndex = EyeIndex;
 #elif MOBILE_MULTI_VIEW
-#if COMPILER_GLSL_ES3_1
-	const int MultiViewId = int(ViewId);
-	ResolvedView = ResolveView(uint(MultiViewId));
-	MultiViewIndex = float(MultiViewId);
-#else
 	ResolvedView = ResolveView(ViewId);
-	MultiViewIndex = float(ViewId);
-#endif
+	MultiViewIndex = ViewId;
 #else
 	ResolvedView = ResolveView();
 #endif
@@ -220,7 +211,7 @@ void ReflectionPassVS(
 
 	float3 RotatedPosition = LocalToWorld[0].xyz * LocalPosition.xxx + LocalToWorld[1].xyz * LocalPosition.yyy + LocalToWorld[2].xyz * LocalPosition.zzz;
 	
-	float4 TranslatedWorldPosition = float4(RotatedPosition + (LocalToWorld[3].xyz + ResolvedView.PreViewTranslation.xyz), 1);
+	float4 TranslatedWorldPosition = float4(RotatedPosition + (LocalToWorld[3].xyz + LWCHackToFloat(ResolvedView.PreViewTranslation)), 1);
 
 	OutPosition = mul(TranslatedWorldPosition, ResolvedView.TranslatedWorldToClip);
 
@@ -230,21 +221,16 @@ void ReflectionPassVS(
 
 #if REFLECTION_PASS_PIXEL_SHADER
 
-#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
-Texture2D<uint> ProjectionBuffer;
-SamplerState ProjectionBufferSampler;
+#if PROJECTION_OUTPUT_TYPE_TEXTURE
+Texture2D<uint> ProjectionTextureSRV;
 #else
 Buffer<uint> ProjectionBuffer;
 #endif
 
 uint GetEncodeValue(int2 ReflectingPixel)
 {
-#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
-#if COMPILER_GLSL_ES3_1 // Force to use a point sampler for Texture2D<uint> on OpenGLES platform
-	uint EncodeValue = ProjectionBuffer.SampleLevel(ProjectionBufferSampler, (ReflectingPixel + float2(0.5f, 0.5f)) * BufferSizeAndInvSize.zw, 0).x;
-#else
-	uint EncodeValue = ProjectionBuffer.Load(int3(ReflectingPixel, 0));
-#endif
+#if PROJECTION_OUTPUT_TYPE_TEXTURE
+	uint EncodeValue = ProjectionTextureSRV.Load(int3(ReflectingPixel, 0));
 #else
 	uint EncodeValue = ProjectionBuffer[ReflectingPixel.x + ReflectingPixel.y * int(BufferSizeAndInvSize.x)];
 #endif
@@ -260,7 +246,7 @@ void DecodeProjectionBufferValue(uint EncodeValue, out int2 PixelOffset)
 	EncodeValue = EncodeValue >> 2;
 
 	// unpack whole part
-	PixelOffset.x = ((EncodeValue & 1) == 1 ? 1 : -1) * ((EncodeValue >> 1) & 2047);
+	PixelOffset.x = ((EncodeValue & 1) == 1 ? 1 : -1) * int(((EncodeValue >> 1) & 2047));
 	EncodeValue = EncodeValue >> 12;
 	PixelOffset.y = EncodeValue;
 
@@ -295,12 +281,12 @@ void ReflectionPassPS(
 	in float4 SvPosition : SV_Position,
 	in float4 PixelPosition : TEXCOORD0,
 #if MOBILE_MULTI_VIEW
-	in float MultiViewId : VIEW_ID,
+	in nointerpolation uint MultiViewId : VIEW_ID,
 #endif
-	out half4 OutColor : SV_Target0)
+	out HALF4_TYPE OutColor : SV_Target0)
 {
 #if MOBILE_MULTI_VIEW
-	ResolvedView = ResolveView(uint(MultiViewId));
+	ResolvedView = ResolveView(MultiViewId);
 #else
 	ResolvedView = ResolveView();
 #endif
@@ -352,8 +338,6 @@ void ReflectionPassPS(
 	}
 #endif
 
-#if USE_PREEXPOSURE
 	OutColor.rgb *= ResolvedView.OneOverPreExposure;
-#endif
 }
 #endif

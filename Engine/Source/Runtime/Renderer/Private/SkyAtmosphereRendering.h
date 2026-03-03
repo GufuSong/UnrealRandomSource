@@ -6,13 +6,13 @@
 
 #pragma once
 
-#include "CoreMinimal.h"
 #include "EngineDefines.h"
-#include "RendererInterface.h"
+#include "RenderGraph.h"
 #include "RenderResource.h"
 #include "Rendering/SkyAtmosphereCommonData.h"
 #include "RenderGraphResources.h"
 #include "SceneView.h"
+#include "VirtualShadowMaps/VirtualShadowMapArray.h"
 
 
 class FScene;
@@ -27,6 +27,7 @@ class FSkyAtmosphereInternalCommonParameters;
 class FVolumeShadowingShaderParametersGlobal0;
 class FVolumeShadowingShaderParametersGlobal1;
 
+struct FScreenPassTexture;
 struct FEngineShowFlags;
 
 
@@ -55,7 +56,7 @@ END_GLOBAL_SHADER_PARAMETER_STRUCT()
 // These parameters are shared on the view global uniform buffer and are dynamically changed with cvars.
 struct FSkyAtmosphereViewSharedUniformShaderParameters
 {
-	FVector4 CameraAerialPerspectiveVolumeSizeAndInvSize;
+	FVector4f CameraAerialPerspectiveVolumeSizeAndInvSize;
 	float AerialPerspectiveStartDepthKm;
 	float CameraAerialPerspectiveVolumeDepthResolution;
 	float CameraAerialPerspectiveVolumeDepthResolutionInv;
@@ -101,8 +102,11 @@ struct FSkyAtmosphereRenderContext
 	float NearClippingDistance;
 	ERHIFeatureLevel::Type FeatureLevel;
 
-	TUniformBufferRef<FVolumeShadowingShaderParametersGlobal0> LightShadowShaderParams0UniformBuffer;
-	TUniformBufferRef<FVolumeShadowingShaderParametersGlobal1> LightShadowShaderParams1UniformBuffer;
+	TRDGUniformBufferRef<FVolumeShadowingShaderParametersGlobal0> LightShadowShaderParams0UniformBuffer{};
+	TRDGUniformBufferRef<FVolumeShadowingShaderParametersGlobal1> LightShadowShaderParams1UniformBuffer{};
+
+	int VirtualShadowMapId0 = INDEX_NONE;
+	int VirtualShadowMapId1 = INDEX_NONE;
 
 	bool bShouldSampleCloudShadow;
 	FRDGTextureRef VolumetricCloudShadowMap[2];
@@ -113,6 +117,9 @@ struct FSkyAtmosphereRenderContext
 	bool bAPOnCloudMode;
 	FRDGTextureRef VolumetricCloudDepthTexture;
 	FRDGTextureRef InputCloudLuminanceTransmittanceTexture;
+
+	uint8 MSAASampleCount;
+	FRDGTextureRef MSAADepthTexture;
 
 	FSkyAtmosphereRenderContext();
 
@@ -134,6 +141,8 @@ public:
 	TRefCountPtr<IPooledRenderTarget>& GetMultiScatteredLuminanceLutTexture() { return MultiScatteredLuminanceLutTexture; }
 	TRefCountPtr<IPooledRenderTarget>& GetDistantSkyLightLutTexture();
 
+	FRDGTextureRef GetTransmittanceLutTexture(FRDGBuilder& GraphBuilder) const { return GraphBuilder.RegisterExternalTexture(TransmittanceLutTexture); }
+
 	const FAtmosphereUniformShaderParameters* GetAtmosphereShaderParameters() const { return &AtmosphereUniformShaderParameters; }
 	const FSkyAtmosphereSceneProxy& GetSkyAtmosphereSceneProxy() const { return SkyAtmosphereSceneProxy; }
 
@@ -154,6 +163,17 @@ private:
 	TRefCountPtr<IPooledRenderTarget> DistantSkyLightLutTexture;
 };
 
+enum class ESkyAtmospherePassLocation : uint32
+{
+	// Renders just before the Occlusion queries. Good for wave occuppency when SkyAtmosphere is async
+	BeforeOcclusion,
+
+	// Renders just before the BasePass.
+	BeforeBasePass
+};
+
+// Returns the location in the frame where SkyAtmosphere is rendered.
+extern ESkyAtmospherePassLocation GetSkyAtmospherePassLocation();
 
 
 bool ShouldRenderSkyAtmosphere(const FScene* Scene, const FEngineShowFlags& EngineShowFlags);
@@ -166,6 +186,7 @@ extern void SetupSkyAtmosphereViewSharedUniformShaderParameters(const class FVie
 // Prepare the sun light data as a function of the atmosphere state. 
 void PrepareSunLightProxy(const FSkyAtmosphereRenderSceneInfo& SkyAtmosphere, uint32 AtmosphereLightIndex, FLightSceneInfo& AtmosphereLight);
 
+bool IsLightAtmospherePerPixelTransmittanceEnabled(const FScene* Scene, const FViewInfo& View, const FLightSceneInfo* const LightSceneInfo);
 
 float GetValidAerialPerspectiveStartDepthInCm(const FViewInfo& View, const FSkyAtmosphereSceneProxy& SkyAtmosphereProxy);
 
@@ -175,12 +196,20 @@ struct SkyAtmosphereLightShadowData
 	const FLightSceneInfo* LightVolumetricShadowSceneinfo1 = nullptr;
 	const FProjectedShadowInfo* ProjectedShadowInfo0 = nullptr;
 	const FProjectedShadowInfo* ProjectedShadowInfo1 = nullptr;
+	int VirtualShadowMapId0 = INDEX_NONE;
+	int VirtualShadowMapId1 = INDEX_NONE;
 };
 bool ShouldSkySampleAtmosphereLightsOpaqueShadow(const FScene& Scene, const TArray<FVisibleLightInfo, SceneRenderingAllocator>& VisibleLightInfos, SkyAtmosphereLightShadowData& LightShadowData);
 void GetSkyAtmosphereLightsUniformBuffers(
-	TUniformBufferRef<FVolumeShadowingShaderParametersGlobal0>& OutLightShadowShaderParams0UniformBuffer,
-	TUniformBufferRef<FVolumeShadowingShaderParametersGlobal1>& OutLightShadowShaderParams1UniformBuffer,
+	FRDGBuilder& GraphBuilder,
+	TRDGUniformBufferRef<FVolumeShadowingShaderParametersGlobal0>& OutLightShadowShaderParams0UniformBuffer,
+	TRDGUniformBufferRef<FVolumeShadowingShaderParametersGlobal1>& OutLightShadowShaderParams1UniformBuffer,
 	const SkyAtmosphereLightShadowData& LightShadowData,
 	const FViewInfo& ViewInfo,
 	const bool bShouldSampleOpaqueShadow,
 	const EUniformBufferUsage UniformBufferUsage);
+
+
+bool ShouldRenderSkyAtmosphereDebugPasses(const FScene* Scene, const FEngineShowFlags& EngineShowFlags);
+FScreenPassTexture AddSkyAtmosphereDebugPasses(FRDGBuilder& GraphBuilder, FScene* Scene, const FSceneViewFamily& ViewFamily, const FViewInfo& View, FScreenPassTexture& ScreenPassSceneColor);
+

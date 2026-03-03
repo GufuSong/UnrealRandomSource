@@ -12,7 +12,7 @@
 
 class FViewInfo;
 class FSceneTextureParameters;
-class FSeparateTranslucencyTextures;
+struct FTranslucencyPassResources;
 struct FTemporalAAHistory;
 
 
@@ -23,7 +23,7 @@ namespace DiaphragmDOF
 bool IsEnabled(const FViewInfo& View);
 
 float ComputeFocalLengthFromFov(const FSceneView& View);
-FVector4 CircleDofHalfCoc(const FViewInfo& View);
+FVector4f CircleDofHalfCoc(const FViewInfo& View);
 
 /** Physically based circle of confusion computation model. */
 struct FPhysicalCocModel
@@ -40,6 +40,9 @@ struct FPhysicalCocModel
 	// Focus distance.
 	float FocusDistance;
 
+	// SqueezeFactor = VerticalFocalDistance / HorizontalFocalDistance
+	float Squeeze;
+
 	// The maximum radius of depth blur.
 	float MaxDepthBlurRadius;
 	float DepthBlurExponent;
@@ -49,17 +52,17 @@ struct FPhysicalCocModel
 	
 	/** Returns the CocRadius in half res pixels for given scene depth (in world unit).
 	 *
-	 * Notes: Matches Engine/Shaders/Private/DiaphragmDOF/Common.ush's DepthToHalfResCocRadius().
+	 * Notes: Matches Engine/Shaders/Private/DiaphragmDOF/Common.ush's SceneDepthToCocRadius().
 	 */
 	float DepthToResCocRadius(float SceneDepth, float HorizontalResolution) const;
 
-	/** Returns limit(DepthToHalfResCocRadius) for SceneDepth -> Infinity. */
+	/** Returns limit(SceneDepthToCocRadius) for SceneDepth -> Infinity. */
 	FORCEINLINE float ComputeViewMaxBackgroundCocRadius(float HorizontalResolution) const
 	{
 		return FMath::Min(FMath::Max(InfinityBackgroundCocRadius, MaxDepthBlurRadius), MaxBackgroundCocRadius) * HorizontalResolution;
 	}
 	
-	/** Returns limit(DepthToHalfResCocRadius) for SceneDepth -> 0.
+	/** Returns limit(SceneDepthToCocRadius) for SceneDepth -> 0.
 	 *
 	 * Note: this return negative or null value since this is foreground.
 	 */
@@ -119,14 +122,7 @@ struct FBokehModel
 inline bool IsSupported(const FStaticShaderPlatform ShaderPlatform)
 {
 	// Only compile diaphragm DOF on platform it has been tested to ensure this is not blocking anyone else.
-	return 
-		ShaderPlatform == SP_PCD3D_SM5 ||
-		ShaderPlatform == SP_XBOXONE_D3D12 ||
-		ShaderPlatform == SP_PS4 ||
-		IsVulkanSM5Platform(ShaderPlatform) ||
-		IsMetalSM5Platform(ShaderPlatform) ||
-		ShaderPlatform == SP_SWITCH ||
-		FDataDrivenShaderPlatformInfo::GetSupportsDiaphragmDOF(ShaderPlatform);
+	return FDataDrivenShaderPlatformInfo::GetSupportsDiaphragmDOF(ShaderPlatform);
 }
 
 
@@ -136,6 +132,6 @@ RENDERER_API FRDGTextureRef AddPasses(
 	const FSceneTextureParameters& SceneTextures,
 	const FViewInfo& View,
 	FRDGTextureRef InputSceneColor,
-	const FSeparateTranslucencyTextures& SeparateTranslucencyTextures);
+	const FTranslucencyPassResources& TranslucencyViewResources);
 
 } // namespace DiaphragmDOF

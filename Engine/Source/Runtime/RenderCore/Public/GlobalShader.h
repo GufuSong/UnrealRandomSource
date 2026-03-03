@@ -6,15 +6,32 @@
 
 #pragma once
 
-#include "CoreMinimal.h"
-#include "Shader.h"
-#include "Templates/UniquePtr.h"
-#include "RHIResources.h"
+#include "Containers/Array.h"
 #include "Containers/Map.h"
+#include "Containers/UnrealString.h"
+#include "CoreMinimal.h"
+#include "HAL/Platform.h"
+#include "Misc/AssertionMacros.h"
+#include "Misc/Paths.h"
+#include "RHI.h"
+#include "RHIDefinitions.h"
+#include "RHIResources.h"
+#include "Serialization/MemoryImage.h"
+#include "Serialization/MemoryLayout.h"
+#include "Shader.h"
+#include "Templates/Tuple.h"
+#include "Templates/UniquePtr.h"
+#include "UObject/NameTypes.h"
+#include "UObject/UnrealNames.h"
 
+class FArchive;
 class FShaderCommonCompileJob;
 class FShaderCompileJob;
+class FShaderParametersMetadata;
+class FShaderUniformBufferParameter;
+class FVertexFactoryType;
 class ITargetPlatform;
+struct FShaderCompilerEnvironment;
 
 /** Used to identify the global shader map in compile queues. */
 extern RENDERCORE_API const int32 GlobalShaderMapId;
@@ -25,14 +42,20 @@ class FGlobalShaderMapId
 public:
 
 	/** Create a global shader map Id for the given platform. */
-	RENDERCORE_API FGlobalShaderMapId(EShaderPlatform Platform);
+	RENDERCORE_API FGlobalShaderMapId(EShaderPlatform Platform, const ITargetPlatform* TargetPlatform);
 
 	/** Append to a string that will be used as a DDC key. */
-	RENDERCORE_API void AppendKeyString(FString& KeyString, const TArray<FShaderTypeDependency>& Dependencies, const ITargetPlatform* TargetPlatform) const;
+	RENDERCORE_API void AppendKeyString(FString& KeyString, const TArray<FShaderTypeDependency>& Dependencies) const;
 
 	RENDERCORE_API const TMap<FString, TArray<FShaderTypeDependency>>& GetShaderFilenameToDependeciesMap() const { return ShaderFilenameToDependenciesMap; }
 
+	RENDERCORE_API bool WithEditorOnly() const;
+
 private:
+	FPlatformTypeLayoutParameters LayoutParams;
+	EShaderPlatform ShaderPlatform;
+	FName IniPlatformName;
+
 	/** Shader types that this shader map is dependent on and their stored state. Mapped by shader filename, so every filename can have it's own DDC key. */
 	TMap<FString, TArray<FShaderTypeDependency>> ShaderFilenameToDependenciesMap;
 
@@ -40,13 +63,21 @@ private:
 	TArray<FShaderPipelineTypeDependency> ShaderPipelineTypeDependencies;
 };
 
-using FGlobalShaderPermutationParameters = FShaderPermutationParameters;
+struct FGlobalShaderPermutationParameters : public FShaderPermutationParameters
+{
+	const FName GlobalShaderName;
+
+	FGlobalShaderPermutationParameters(FName InGlobalShaderName, EShaderPlatform InShaderPlatform, int32 InPermutationId = 0, EShaderPermutationFlags InFlags = EShaderPermutationFlags::HasEditorOnlyData)
+		: FShaderPermutationParameters(InShaderPlatform, InPermutationId, InFlags)
+		, GlobalShaderName(InGlobalShaderName)
+	{}
+};
 
 /**
  * A shader meta type for the simplest shaders; shaders which are not material or vertex factory linked.
  * There should only a single instance of each simple shader type.
  */
-class FGlobalShaderType : public FShaderType
+class RENDERCORE_API FGlobalShaderType : public FShaderType
 {
 	friend class FGlobalShaderTypeCompiler;
 public:
@@ -88,9 +119,9 @@ public:
 	 * @param Platform - The platform to check.
 	 * @return True if this shader type should be cached.
 	 */
-	bool ShouldCompilePermutation(EShaderPlatform Platform, int32 PermutationId) const
+	bool ShouldCompilePermutation(EShaderPlatform Platform, int32 PermutationId, EShaderPermutationFlags Flags) const
 	{
-		return FShaderType::ShouldCompilePermutation(FGlobalShaderPermutationParameters(Platform, PermutationId));
+		return FShaderType::ShouldCompilePermutation(FGlobalShaderPermutationParameters(GetFName(), Platform, PermutationId, Flags));
 	}
 
 	/**
@@ -98,11 +129,9 @@ public:
 	 * @param Platform - Platform to compile for.
 	 * @param Environment - The shader compile environment that the function modifies.
 	 */
-	void SetupCompileEnvironment(EShaderPlatform Platform, int32 PermutationId, FShaderCompilerEnvironment& Environment)
-	{
-		// Allow the shader type to modify its compile environment.
-		ModifyCompilationEnvironment(FGlobalShaderPermutationParameters(Platform, PermutationId), Environment);
-	}
+	void SetupCompileEnvironment(EShaderPlatform Platform, int32 PermutationId, EShaderPermutationFlags Flags, FShaderCompilerEnvironment& Environment) const;
+
+	static bool ShouldCompilePipeline(const FShaderPipelineType* ShaderPipelineType, EShaderPlatform Platform, EShaderPermutationFlags Flags);
 };
 
 class RENDERCORE_API FGlobalShaderMapContent : public FShaderMapContent
@@ -132,7 +161,13 @@ public:
 
 	bool Serialize(FArchive& Ar);
 private:
-	inline FGlobalShaderMapSection() {}
+	inline FGlobalShaderMapSection() 
+	{ 
+#if WITH_EDITOR
+		// associate with a non-empty asset name as to not have an exception in the library
+		FShaderMapBase::AssociateWithAsset(NAME_None);
+#endif
+	}
 
 	inline FGlobalShaderMapSection(EShaderPlatform InPlatform, const FHashedName& InHashedSourceFilename)
 	{
@@ -153,7 +188,14 @@ public:
 	FShaderPipelineRef GetShaderPipeline(const FShaderPipelineType* PipelineType) const;
 
 	template<typename ShaderType>
-	TShaderRef<ShaderType> GetShader(int32 PermutationId = 0) const
+	TShaderRef<ShaderType> GetShader() const
+	{
+		ensureMsgf(ShaderType::StaticType.GetPermutationCount() == 1, TEXT("Failed to provide PermutationId for shader type %s with %u permutations"), ShaderType::StaticType.GetName(), ShaderType::StaticType.GetPermutationCount());
+		return GetShader<ShaderType>(0);
+	}
+
+	template<typename ShaderType>
+	TShaderRef<ShaderType> GetShader(int32 PermutationId) const
 	{
 		TShaderRef<FShader> Shader = GetShader(&ShaderType::StaticType, PermutationId);
 		checkf(Shader.IsValid(), TEXT("Failed to find shader type %s in Platform %s"), ShaderType::StaticType.GetName(), *LegacyShaderPlatformToShaderFormat(Platform).ToString());
@@ -179,6 +221,9 @@ public:
 
 	bool IsEmpty() const;
 
+	/** Whether the shadermap has all the shader types it needs (i.e. ones that returned ShouldCompilePermutation) */
+	bool IsComplete(const ITargetPlatform* TargetPlatform) const;
+
 	void Empty();
 	void ReleaseAllSections();
 
@@ -202,6 +247,15 @@ public:
 	void SaveShaderStableKeys(EShaderPlatform TargetShaderPlatform);
 #endif // WITH_EDITOR
 
+	const FGlobalShaderMapSection* GetFirstSection()
+	{
+		for (auto It : SectionMap)
+		{
+			return It.Value;
+		}
+		return nullptr;
+	}
+
 private:
 	TMap<FHashedName, FGlobalShaderMapSection*> SectionMap;
 	EShaderPlatform Platform;
@@ -220,6 +274,7 @@ class FGlobalShader : public FShader
 	DECLARE_EXPORTED_TYPE_LAYOUT(FGlobalShader, RENDERCORE_API, NonVirtual);
 public:
 	using ShaderMetaType = FGlobalShaderType;
+	using FPermutationParameters = FGlobalShaderPermutationParameters;
 
 	FGlobalShader() : FShader() {}
 
@@ -232,8 +287,12 @@ public:
 		SetUniformBufferParameter(RHICmdList, ShaderRHI, ViewUniformBufferParameter, ViewUniformBuffer);
 	}
 
+	static inline bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return FShader::ShouldCompilePermutation(Parameters);
+	}
 	
-	
+	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& Environment) { };
 };
 
 /**

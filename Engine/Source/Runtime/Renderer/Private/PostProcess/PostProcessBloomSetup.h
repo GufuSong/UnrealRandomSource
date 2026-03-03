@@ -5,6 +5,7 @@
 #include "ScreenPass.h"
 
 class FSceneDownsampleChain;
+class FEyeAdaptationParameters;
 
 enum class EBloomQuality : uint32
 {
@@ -19,20 +20,7 @@ enum class EBloomQuality : uint32
 
 EBloomQuality GetBloomQuality();
 
-struct FBloomInputs
-{
-	FScreenPassTexture SceneColor;
-
-	const FSceneDownsampleChain* SceneDownsampleChain = nullptr;
-};
-
-struct FBloomOutputs
-{
-	FScreenPassTexture SceneColor;
-	FScreenPassTexture Bloom;
-};
-
-FBloomOutputs AddBloomPass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FBloomInputs& Inputs);
+FScreenPassTexture AddGaussianBloomPasses(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FSceneDownsampleChain* SceneDownsampleChain);
 
 struct FBloomSetupInputs
 {
@@ -44,6 +32,15 @@ struct FBloomSetupInputs
 
 	// [Required]: The bloom threshold to apply. Must be >0.
 	float Threshold = 0.0f;
+
+	// [Optional] Eye adaptation parameters.
+	const FEyeAdaptationParameters* EyeAdaptationParameters = nullptr;
+
+	// [Optional] Luminance bilateral grid. If this is null, local exposure is disabled.
+	FRDGTextureRef LocalExposureTexture = nullptr;
+
+	// [Optional] Blurred luminance texture used to calculate local exposure.
+	FRDGTextureRef BlurredLogLuminanceTexture = nullptr;
 };
 
 FScreenPassTexture AddBloomSetupPass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FBloomSetupInputs& Inputs);

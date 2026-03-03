@@ -1,14 +1,11 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
-#include "HairStrandsVoxelPageCommonStruct.ush"
 #include "../Common.ush"
-#include "../CommonViewUniformBuffer.ush"
 #include "../SceneTextureParameters.ush"
-#include "HairStrandsVoxelPageCommonStruct.ush"
+#include "../PositionReconstructionCommon.ush" 
 #include "HairStrandsVoxelPageCommon.ush"
 
 #if SHADER_INJECTOPAQUE_VIRTUALVOXEL
-uint3 DispatchedPageIndexResolution;
 uint MacroGroupId;
 float2 SceneDepthResolution;
 uint VoxelBiasCount;
@@ -17,20 +14,10 @@ RWTexture3D<uint> OutPageTexture;
 
 uint		 VirtualVoxelParams_PageIndexCount;
 uint		 VirtualVoxelParams_PageResolution;
-float		 VirtualVoxelParams_VoxelWorldSize;
 uint3		 VirtualVoxelParams_PageCountResolution;
 Buffer<uint> VirtualVoxelParams_PageIndexBuffer;
 Buffer<uint4>VirtualVoxelParams_PageIndexCoordBuffer;
 StructuredBuffer<FPackedVirtualVoxelNodeDesc> VirtualVoxelParams_NodeDescBuffer;
-
-float3 ReconstructWorldPositionFromDepth(float2 UV, float Depth)
-{
-	float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
-	float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * Depth, Depth, 1), View.ScreenToWorld);
-	float3 WorldPosition = HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w;
-
-	return WorldPosition;
-}
 
 #define GROUP_SIZE 64
 [numthreads(1, 1, GROUP_SIZE)]
@@ -41,13 +28,13 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const uint  LinearVoxelCoord = DispatchThreadId.z;
 	const uint3 VoxelCoordOffset = IndexToCoord(LinearVoxelCoord, VirtualVoxelParams_PageResolution.xxx);
 
-	const FPackedVirtualVoxelNodeDesc PackedNode = VirtualVoxelParams_NodeDescBuffer[MacroGroupId];
-	const FVirtualVoxelNodeDesc NodeDesc = UnpackVoxelNode(PackedNode, VirtualVoxelParams_PageResolution);
+	const FVirtualVoxelNodeDesc NodeDesc = UnpackVoxelNode(VirtualVoxelParams_NodeDescBuffer[MacroGroupId], VirtualVoxelParams_PageResolution);
 
 	const uint4 PageIndexCoord = VirtualVoxelParams_PageIndexCoordBuffer[NodeDesc.PageIndexOffset + AllocatedPageIndex];
-	const uint  LinearPageIndexCoord = CoordToIndex(PageIndexCoord, NodeDesc.PageIndexResolution, NodeDesc.PageIndexOffset);
+	const uint  LinearPageIndexCoord = CoordToIndex(PageIndexCoord.xyz, NodeDesc.PageIndexResolution, NodeDesc.PageIndexOffset);
 
-	const bool bIsValid = LinearPageIndexCoord < VirtualVoxelParams_PageIndexCount;
+	// PageIndexCoord have invalid .w component if we run out of available page during the allocation
+	const bool bIsValid = LinearPageIndexCoord < VirtualVoxelParams_PageIndexCount && PageIndexCoord.w != INVALID_MACRO_GROUP_ID;
 	if (bIsValid)
 	{
 		const uint PageIndex = VirtualVoxelParams_PageIndexBuffer.Load(LinearPageIndexCoord);
@@ -55,11 +42,11 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		{
 			const uint3 VoxelCoordBase = PageIndexCoord.xyz * VirtualVoxelParams_PageResolution;
 			const uint3 VoxelCoord = VoxelCoordBase + VoxelCoordOffset;
-			const float3 WorldPosition = VoxelCoord / float3(NodeDesc.VirtualResolution) * (NodeDesc.MaxAABB - NodeDesc.MinAABB) + NodeDesc.MinAABB;
+			const float3 TranslatedWorldPosition = VoxelCoord / float3(NodeDesc.VirtualResolution) * (NodeDesc.TranslatedWorldMaxAABB - NodeDesc.TranslatedWorldMinAABB) + NodeDesc.TranslatedWorldMinAABB;
 
-			float4 ClipPos = mul(float4(WorldPosition, 1), View.WorldToClip);
+			float4 ClipPos = mul(float4(TranslatedWorldPosition, 1), PrimaryView.TranslatedWorldToClip);
 			ClipPos /= ClipPos.w;
-			const float DepthBias = VoxelBiasCount * VirtualVoxelParams_VoxelWorldSize;
+			const float DepthBias = VoxelBiasCount * NodeDesc.VoxelWorldSize;
 			const float VoxelDepth = ConvertFromDeviceZ(ClipPos.z) - DepthBias;
 			float2 SceneUV = float2(0.5f*(ClipPos.x + 1), 1 - 0.5f*(ClipPos.y + 1));
 			SceneUV = ViewportUVToBufferUV(SceneUV);
@@ -69,19 +56,19 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			if (!bIsOnScreen)
 				return;
 
-			const float ClosestDepth = ConvertFromDeviceZ(SceneDepthTexture.Load(uint3(ScenePixelCoord, 0)));
-			const float3 SceneWorldPos = ReconstructWorldPositionFromDepth(SceneUV, ClosestDepth);
-
+			const float ClosestDepth = ConvertFromDeviceZ(SceneDepthTexture.Load(uint3(ScenePixelCoord, 0)).x);
+			const float3 SceneTranslatedWorldPos = ReconstructTranslatedWorldPositionFromDepth(SceneUV, ClosestDepth);
+			
 			const bool bIsInVolume =
-				SceneWorldPos.x >= NodeDesc.MinAABB.x && SceneWorldPos.x < NodeDesc.MaxAABB.x &&
-				SceneWorldPos.y >= NodeDesc.MinAABB.y && SceneWorldPos.y < NodeDesc.MaxAABB.y &&
-				SceneWorldPos.z >= NodeDesc.MinAABB.z && SceneWorldPos.z < NodeDesc.MaxAABB.z;
+				SceneTranslatedWorldPos.x >= NodeDesc.TranslatedWorldMinAABB.x && SceneTranslatedWorldPos.x < NodeDesc.TranslatedWorldMaxAABB.x&&
+				SceneTranslatedWorldPos.y >= NodeDesc.TranslatedWorldMinAABB.y && SceneTranslatedWorldPos.y < NodeDesc.TranslatedWorldMaxAABB.y&&
+				SceneTranslatedWorldPos.z >= NodeDesc.TranslatedWorldMinAABB.z && SceneTranslatedWorldPos.z < NodeDesc.TranslatedWorldMaxAABB.z;
 
 			if (!bIsInVolume)
 				return;
 
 			// Inject opaque depth on a thin layer (Dist < DistThreshold) for avoiding weird projection
-			if (ClosestDepth < VoxelDepth && abs(ClosestDepth - VoxelDepth) < VoxelMarkCount * VirtualVoxelParams_VoxelWorldSize)
+			if (ClosestDepth < VoxelDepth && abs(ClosestDepth - VoxelDepth) < VoxelMarkCount * NodeDesc.VoxelWorldSize)
 			{
 				const uint3 VoxelPageIndexCoord = VoxelCoord / VirtualVoxelParams_PageResolution;
 				const uint3 VoxelIndexCoordBase = VoxelPageIndexCoord * VirtualVoxelParams_PageResolution;

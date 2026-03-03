@@ -12,6 +12,19 @@
 
 #if RHI_RAYTRACING
 
+static TAutoConsoleVariable<int32> CVarRayTracingAMDHitToken(
+	TEXT("r.RayTracing.AMDHitToken"),
+	1,
+	TEXT("Whether to allow the AMD HitToken extension"),
+	ECVF_RenderThreadSafe
+);
+
+bool CanUseRayTracingAMDHitToken()
+{
+	return GRHISupportsRayTracingAMDHitToken
+		&& CVarRayTracingAMDHitToken.GetValueOnRenderThread() != 0;
+}
+
 class FRayTracingDeferredMaterialCHS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FRayTracingDeferredMaterialCHS)
@@ -53,7 +66,7 @@ class FRayTracingDeferredMaterialMS : public FGlobalShader
 
 IMPLEMENT_GLOBAL_SHADER(FRayTracingDeferredMaterialMS, "/Engine/Private/RayTracing/RayTracingDeferredMaterials.usf", "DeferredMaterialMS", SF_RayMiss);
 
-FRayTracingPipelineState* FDeferredShadingSceneRenderer::BindRayTracingDeferredMaterialGatherPipeline(FRHICommandList& RHICmdList, const FViewInfo& View, const TArrayView<FRHIRayTracingShader*>& RayGenShaderTable)
+FRayTracingPipelineState* FDeferredShadingSceneRenderer::CreateRayTracingDeferredMaterialGatherPipeline(FRHICommandList& RHICmdList, const FViewInfo& View, const TArrayView<FRHIRayTracingShader*>& RayGenShaderTable)
 {
 	SCOPE_CYCLE_COUNTER(STAT_BindRayTracingPipeline);
 
@@ -74,18 +87,21 @@ FRayTracingPipelineState* FDeferredShadingSceneRenderer::BindRayTracingDeferredM
 
 	FRayTracingPipelineState* PipelineState = PipelineStateCache::GetAndOrCreateRayTracingPipelineState(RHICmdList, Initializer);
 
-	const FViewInfo& ReferenceView = Views[0];
+	return PipelineState;
+}
 
-	const int32 NumTotalBindings = ReferenceView.VisibleRayTracingMeshCommands.Num();
+void FDeferredShadingSceneRenderer::BindRayTracingDeferredMaterialGatherPipeline(FRHICommandListImmediate& RHICmdList, const FViewInfo& View, FRayTracingPipelineState* PipelineState)
+{
+	const int32 NumTotalBindings = View.VisibleRayTracingMeshCommands.Num();
 
 	const uint32 MergedBindingsSize = sizeof(FRayTracingLocalShaderBindings) * NumTotalBindings;
 	FRayTracingLocalShaderBindings* Bindings = (FRayTracingLocalShaderBindings*)(RHICmdList.Bypass()
-		? FMemStack::Get().Alloc(MergedBindingsSize, alignof(FRayTracingLocalShaderBindings))
+		? Allocator.Malloc(MergedBindingsSize, alignof(FRayTracingLocalShaderBindings))
 		: RHICmdList.Alloc(MergedBindingsSize, alignof(FRayTracingLocalShaderBindings)));
 
 	uint32 BindingIndex = 0;
 
-	for (const FVisibleRayTracingMeshCommand VisibleMeshCommand : ReferenceView.VisibleRayTracingMeshCommands)
+	for (const FVisibleRayTracingMeshCommand VisibleMeshCommand : View.VisibleRayTracingMeshCommands)
 	{
 		const FRayTracingMeshCommand& MeshCommand = *VisibleMeshCommand.RayTracingMeshCommand;
 
@@ -100,12 +116,10 @@ FRayTracingPipelineState* FDeferredShadingSceneRenderer::BindRayTracingDeferredM
 
 	const bool bCopyDataToInlineStorage = false; // Storage is already allocated from RHICmdList, no extra copy necessary
 	RHICmdList.SetRayTracingHitGroups(
-		View.RayTracingScene.RayTracingSceneRHI,
+		View.GetRayTracingSceneChecked(),
 		PipelineState,
 		NumTotalBindings, Bindings,
 		bCopyDataToInlineStorage);
-
-	return PipelineState;
 }
 
 class FMaterialSortCS : public FGlobalShader
@@ -120,7 +134,7 @@ class FMaterialSortCS : public FGlobalShader
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(int, NumTotalEntries)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(StructuredBuffer<FDeferredMaterialPayload>, MaterialBuffer)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FDeferredMaterialPayload>, MaterialBuffer)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)

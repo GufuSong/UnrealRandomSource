@@ -5,7 +5,7 @@
 #if 0
 #include "SpriteIndexBuffer.h"
 #include "ScreenRendering.h"
-#include "SceneFilterRendering.h"
+#include "PostProcess/SceneFilterRendering.h"
 #include "RenderTargetPool.h"
 #include "GlobalShader.h"
 #include "PipelineStateCache.h"
@@ -115,7 +115,7 @@ bool FVirtualTextureTest::RequestPageData( uint8 vLevel, uint64 vAddress, void* 
 
 class FVirtualTextureTestPS : public FGlobalShader
 {
-	DECLARE_SHADER_TYPE(FVirtualTextureTestPS, Global);
+	DECLARE_GLOBAL_SHADER(FVirtualTextureTestPS);
 
 	static bool ShouldCache( EShaderPlatform Platform )
 	{
@@ -185,9 +185,9 @@ void FVirtualTextureTest::ProducePageData( FRHICommandList& RHICmdList, ERHIFeat
 
 	auto ShaderMap = GetGlobalShaderMap( FeatureLevel );
 
-	FSceneRenderTargetItem& RenderTarget = PhysicalTexture->GetRenderTargetItem();
+	FRHITexture* RenderTarget = PhysicalTexture->GetRHI();
 
-	FRHIRenderPassInfo RPInfo(RenderTarget.TargetableTexture, ERenderTargetActions::Load_Store);
+	FRHIRenderPassInfo RPInfo(RenderTarget, ERenderTargetActions::Load_Store);
 	RHICmdList.BeginRenderPass(RPInfo, TEXT("ProducePageData"));
 	{
 		RHICmdList.SetViewport(DstRect.Min.X, DstRect.Min.Y, 0.0f, DstRect.Max.X, DstRect.Max.Y, 1.0f);
@@ -206,7 +206,7 @@ void FVirtualTextureTest::ProducePageData( FRHICommandList& RHICmdList, ERHIFeat
 		GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GFilterVertexDeclaration.VertexDeclarationRHI;
 		GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
 		GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
-		SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit);
+		SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
 
 		DrawRectangle(
 			RHICmdList,
@@ -220,7 +220,7 @@ void FVirtualTextureTest::ProducePageData( FRHICommandList& RHICmdList, ERHIFeat
 			EDRF_UseTriangleOptimization);
 	}
 	RHICmdList.EndRenderPass();
-	RHICmdList.CopyToResolveTarget(RenderTarget.TargetableTexture, RenderTarget.ShaderResourceTexture, FResolveParams());
+	RHICmdList.Transition(FRHITransitionInfo(RenderTarget, ERHIAccess::RTV, ERHIAccess::SRVMask));
 
 	GVisualizeTexture.SetCheckPoint( RHICmdList, PhysicalTexture );
 }

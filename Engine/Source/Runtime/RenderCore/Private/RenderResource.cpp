@@ -10,6 +10,7 @@
 #include "RenderingThread.h"
 #include "ProfilingDebugging/LoadTimeTracker.h"
 #include "CoreGlobals.h"
+#include "RayTracingGeometryManager.h"
 
 /** Whether to enable mip-level fading or not: +1.0f if enabled, -1.0f if disabled. */
 float GEnableMipLevelFading = 1.0f;
@@ -25,31 +26,210 @@ FAutoConsoleVariableRef CVarMaxVertexBytesAllocatedPerFrame(
 int32 GGlobalBufferNumFramesUnusedThresold = 30;
 FAutoConsoleVariableRef CVarReadBufferNumFramesUnusedThresold(
 	TEXT("r.NumFramesUnusedBeforeReleasingGlobalResourceBuffers"),
-	GGlobalBufferNumFramesUnusedThresold ,
+	GGlobalBufferNumFramesUnusedThresold,
 	TEXT("Number of frames after which unused global resource allocations will be discarded. Set 0 to ignore. (default=30)"));
 
-FThreadSafeCounter FRenderResource::ResourceListIterationActive;
+bool GFreeStructuresOnRHIBufferCreation = true;
+FAutoConsoleVariableRef CVarFreeStructuresOnRHIBufferCreation(
+	TEXT("r.FreeStructuresOnRHIBufferCreation"),
+	GFreeStructuresOnRHIBufferCreation,
+	TEXT("Toggles experimental method for freeing helper structures that own the resource arrays after submitting to RHI instead of in the callback sink."));
 
-TArray<int32>& GetFreeIndicesList()
+int32 GVarDebugForceRuntimeBLAS = 0;
+FAutoConsoleVariableRef CVarDebugForceRuntimeBLAS(
+	TEXT("r.Raytracing.DebugForceRuntimeBLAS"),
+	GVarDebugForceRuntimeBLAS,
+	TEXT("Force building BLAS at runtime."),
+	ECVF_ReadOnly);
+
+/** Tracks render resources in a list. The implementation is optimized to allow fast allocation / deallocation from any thread,
+ *  at the cost of period coalescing of thread-local data at a sync point each frame. Furthermore, iteration is not thread safe
+ *  and must be performed at sync points.
+ */
+class FRenderResourceList
 {
-	static TArray<int32> FreeIndicesList;
-	return FreeIndicesList;
+public:
+	static FRenderResourceList& Get()
+	{
+		static FRenderResourceList Instance;
+		return Instance;
+	}
+
+	~FRenderResourceList()
+	{
+		for (FFreeList* FreeList : LocalFreeLists)
+		{
+			delete FreeList;
+		}
+		FPlatformTLS::FreeTlsSlot(TLSSlot);
+	}
+
+	int32 Allocate(FRenderResource* Resource)
+	{
+		if (bIsIterating)
+		{
+			// This part is not thread safe. Iteration requires that no adds / removals are happening concurrently. The only
+			// supported case is recursive adds on the same thread (i.e. a parent resource initializes a child resource). In
+			// this case, we need to add the resource to the end so that it gets iterated as well.
+			check(IsInRenderingThread());
+			return ResourceList.AddElement(Resource);
+		}
+
+		FFreeList& LocalFreeList = GetLocalFreeList();
+
+		if (LocalFreeList.IsEmpty())
+		{
+			FScopeLock Lock(&CS);
+
+			// Try to allocate free slots from the global free list.
+			const int32 OldFreeListSize = GlobalFreeList.Num();
+			const int32 NewFreeListSize = FMath::Max(OldFreeListSize - ChunkSize, 0);
+			int32 NumElements = OldFreeListSize - NewFreeListSize;
+
+			if (NumElements > 0)
+			{
+				LocalFreeList.Append(GlobalFreeList.GetData() + NewFreeListSize, NumElements);
+				GlobalFreeList.SetNum(NewFreeListSize, false);
+			}
+
+			// Allocate more if we didn't get a full chunk from the global list.
+			while (NumElements < ChunkSize)
+			{
+				LocalFreeList.Emplace(ResourceList.AddElement(nullptr));
+				NumElements++;
+			}
+		}
+
+		int32 Index = LocalFreeList.Pop(false);
+		ResourceList[Index] = Resource;
+		return Index;
+	}
+
+	void Deallocate(int32 Index)
+	{
+		GetLocalFreeList().Emplace(Index);
+		ResourceList[Index] = nullptr;
+	}
+
+	//////////////////////////////////////////////////////////////////////////////
+	// These methods must be called at sync points where allocations / deallocations can't occur from another thread.
+
+	void Clear()
+	{
+		check(IsInRenderingThread());
+
+		for (FFreeList* FreeList : LocalFreeLists)
+		{
+			FreeList->Empty();
+		}
+		ResourceList.Empty();
+	}
+
+	void Coalesce()
+	{
+		check(IsInRenderingThread());
+
+		for (FFreeList* FreeList : LocalFreeLists)
+		{
+			GlobalFreeList.Append(*FreeList);
+			FreeList->Empty();
+		}
+	}
+
+	template<typename FunctionType>
+	void ForEach(const FunctionType& Function)
+	{
+		check(IsInRenderingThread());
+		check(!bIsIterating);
+		bIsIterating = true;
+		for (int32 Index = 0; Index < ResourceList.Num(); ++Index)
+		{
+			FRenderResource* Resource = ResourceList[Index];
+			if (Resource)
+			{
+				check(Resource->GetListIndex() == Index);
+				Function(Resource);
+			}
+		}
+		bIsIterating = false;
+	}
+
+	template<typename FunctionType>
+	void ForEachReverse(const FunctionType& Function)
+	{
+		check(IsInRenderingThread());
+		check(!bIsIterating);
+		bIsIterating = true;
+		for (int32 Index = ResourceList.Num() - 1; Index >= 0; --Index)
+		{
+			FRenderResource* Resource = ResourceList[Index];
+			if (Resource)
+			{
+				check(Resource->GetListIndex() == Index);
+				Function(Resource);
+			}
+		}
+		bIsIterating = false;
+	}
+
+	//////////////////////////////////////////////////////////////////////////////
+
+private:
+	FRenderResourceList()
+	{
+		TLSSlot = FPlatformTLS::AllocTlsSlot();
+	}
+
+	const int32 ChunkSize = 1024;
+
+	using FFreeList = TArray<int32>;
+
+	FFreeList& GetLocalFreeList()
+	{
+		void* TLSValue = FPlatformTLS::GetTlsValue(TLSSlot);
+		if (TLSValue == nullptr)
+		{
+			FFreeList* TLSCache = new FFreeList();
+			FPlatformTLS::SetTlsValue(TLSSlot, (void*)(TLSCache));
+			FScopeLock S(&CS);
+			LocalFreeLists.Add(TLSCache);
+			return *TLSCache;
+		}
+		return *((FFreeList*)TLSValue);
+	}
+
+	uint32 TLSSlot;
+	FCriticalSection CS;
+	TArray<FFreeList*> LocalFreeLists;
+	FFreeList GlobalFreeList;
+	TChunkedArray<FRenderResource*> ResourceList;
+	bool bIsIterating = false;
+};
+
+void FRenderResource::CoalesceResourceList()
+{
+	FRenderResourceList::Get().Coalesce();
 }
 
-TArray<FRenderResource*>& FRenderResource::GetResourceList()
+void FRenderResource::ReleaseRHIForAllResources()
 {
-	static TArray<FRenderResource*> RenderResourceList;
-	return RenderResourceList;
+	FRenderResourceList& ResourceList = FRenderResourceList::Get();
+	ResourceList.ForEachReverse([](FRenderResource* Resource) { check(Resource->IsInitialized()); Resource->ReleaseRHI(); });
+	ResourceList.ForEachReverse([](FRenderResource* Resource) { Resource->ReleaseDynamicRHI(); });
 }
 
 /** Initialize all resources initialized before the RHI was initialized */
 void FRenderResource::InitPreRHIResources()
-{	
+{
+	FRenderResourceList& ResourceList = FRenderResourceList::Get();
+
 	// Notify all initialized FRenderResources that there's a valid RHI device to create their RHI resources for now.
-	FRenderResource::InitRHIForAllResources();
+	ResourceList.ForEach([](FRenderResource* Resource) { Resource->InitRHI(); });
+	// Dynamic resources can have dependencies on static resources (with uniform buffers) and must initialized last!
+	ResourceList.ForEach([](FRenderResource* Resource) { Resource->InitDynamicRHI(); });
 
 #if !PLATFORM_NEEDS_RHIRESOURCELIST
-	FRenderResource::GetResourceList().Empty();
+	ResourceList.Clear();
 #endif
 }
 
@@ -58,7 +238,7 @@ void FRenderResource::ChangeFeatureLevel(ERHIFeatureLevel::Type NewFeatureLevel)
 	ENQUEUE_RENDER_COMMAND(FRenderResourceChangeFeatureLevel)(
 		[NewFeatureLevel](FRHICommandList& RHICmdList)
 	{
-		FRenderResource::ForAllResources([NewFeatureLevel](FRenderResource* Resource)
+		FRenderResourceList::Get().ForEach([NewFeatureLevel](FRenderResource* Resource)
 		{
 			// Only resources configured for a specific feature level need to be updated
 			if (Resource->HasValidFeatureLevel() && (Resource->FeatureLevel != NewFeatureLevel))
@@ -75,24 +255,19 @@ void FRenderResource::ChangeFeatureLevel(ERHIFeatureLevel::Type NewFeatureLevel)
 
 void FRenderResource::InitResource()
 {
-	check(IsInRenderingThread());
 	if (ListIndex == INDEX_NONE)
 	{
-		TArray<FRenderResource*>& ResourceList = GetResourceList();
-		TArray<int32>& FreeIndicesList = GetFreeIndicesList();
-
-		// If resource list is currently being iterated, new resources must be added to the end of the list, to ensure they're processed during the iteration
-		// Otherwise empty slots in the list may be re-used for new resources
 		int32 LocalListIndex = INDEX_NONE;
-		if (FreeIndicesList.Num() > 0 && ResourceListIterationActive.GetValue() == 0)
+
+		if (PLATFORM_NEEDS_RHIRESOURCELIST || !GIsRHIInitialized)
 		{
-			LocalListIndex = FreeIndicesList.Pop();
-			check(ResourceList[LocalListIndex] == nullptr);
-			ResourceList[LocalListIndex] = this;
+			LLM_SCOPE(ELLMTag::SceneRender);
+			LocalListIndex = FRenderResourceList::Get().Allocate(this);
 		}
 		else
 		{
-			LocalListIndex = ResourceList.Add(this);
+			// Mark this resource as initialized
+			LocalListIndex = 0;
 		}
 
 		if (GIsRHIInitialized)
@@ -111,7 +286,6 @@ void FRenderResource::ReleaseResource()
 {
 	if ( !GIsCriticalError )
 	{
-		check(IsInRenderingThread());
 		if(ListIndex != INDEX_NONE)
 		{
 			if(GIsRHIInitialized)
@@ -120,10 +294,9 @@ void FRenderResource::ReleaseResource()
 				ReleaseDynamicRHI();
 			}
 
-			TArray<FRenderResource*>& ResourceList = GetResourceList();
-			TArray<int32>& FreeIndicesList = GetFreeIndicesList();
-			ResourceList[ListIndex] = nullptr;
-			FreeIndicesList.Add(ListIndex);
+#if PLATFORM_NEEDS_RHIRESOURCELIST
+			FRenderResourceList::Get().Deallocate(ListIndex);
+#endif
 			ListIndex = INDEX_NONE;
 		}
 	}
@@ -143,6 +316,8 @@ void FRenderResource::UpdateRHI()
 
 FRenderResource::~FRenderResource()
 {
+	checkf(ResourceState == ERenderResourceState::Default, TEXT(" Invalid Resource State: %s"), ResourceState == ERenderResourceState::BatchReleased ? TEXT("BatchReleased") : TEXT("Deleted"));
+	ResourceState = ERenderResourceState::Deleted;
 	if (IsInitialized() && !GIsCriticalError)
 	{
 		// Deleting an initialized FRenderResource will result in a crash later since it is still linked
@@ -152,6 +327,7 @@ FRenderResource::~FRenderResource()
 
 void BeginInitResource(FRenderResource* Resource)
 {
+	LLM_SCOPE(ELLMTag::SceneRender);
 	ENQUEUE_RENDER_COMMAND(InitCommand)(
 		[Resource](FRHICommandListImmediate& RHICmdList)
 		{
@@ -174,50 +350,40 @@ struct FBatchedReleaseResources
 	{
 		NumPerBatch = 16
 	};
-	int32 NumBatch;
-	FRenderResource* Resources[NumPerBatch];
-	FBatchedReleaseResources()
-	{
-		Reset();
-	}
-	void Reset()
-	{
-		NumBatch = 0;
-	}
-	void Execute()
-	{
-		for (int32 Index = 0; Index < NumBatch; Index++)
-		{
-			Resources[Index]->ReleaseResource();
-		}
-		Reset();
-	}
+	TArray<FRenderResource*, TInlineAllocator<NumPerBatch>> Resources;
+
 	void Flush()
 	{
-		if (NumBatch)
+		if (Resources.Num())
 		{
-			const FBatchedReleaseResources BatchedReleaseResources = *this;
 			ENQUEUE_RENDER_COMMAND(BatchReleaseCommand)(
-				[BatchedReleaseResources](FRHICommandList& RHICmdList)
+			[BatchedReleaseResources = MoveTemp(Resources)](FRHICommandList& RHICmdList)
+			{
+				for (FRenderResource* Resource : BatchedReleaseResources)
 				{
-					((FBatchedReleaseResources&)BatchedReleaseResources).Execute();
-				});
-			Reset();
+					check(Resource->ResourceState == ERenderResourceState::BatchReleased);
+					Resource->ReleaseResource();
+					Resource->ResourceState = ERenderResourceState::Default;
+				}
+			});
 		}
 	}
+
 	void Add(FRenderResource* Resource)
 	{
-		if (NumBatch >= NumPerBatch)
+		if (Resources.Num() >= NumPerBatch)
 		{
 			Flush();
 		}
-		check(NumBatch < NumPerBatch);
-		Resources[NumBatch] = Resource;
-		NumBatch++;
+		check(Resources.Num() < NumPerBatch);
+		check(Resource->ResourceState == ERenderResourceState::Default);
+		Resource->ResourceState = ERenderResourceState::BatchReleased;
+		Resources.Push(Resource);
 	}
+
 	bool IsEmpty()
 	{
-		return !NumBatch;
+		return Resources.Num() == 0;
 	}
 };
 
@@ -283,17 +449,36 @@ void FTextureReference::BeginRelease_GameThread()
 	bInitialized_GameThread = false;
 }
 
+double FTextureReference::GetLastRenderTime() const
+{
+	if (bInitialized_GameThread && TextureReferenceRHI)
+	{
+		return TextureReferenceRHI->GetLastRenderTime();
+	}
+
+	return FLastRenderTimeContainer().GetLastRenderTime();
+}
+
 void FTextureReference::InvalidateLastRenderTime()
 {
-	LastRenderTimeRHI.SetLastRenderTime(-FLT_MAX);
+	if (bInitialized_GameThread && TextureReferenceRHI)
+	{
+		TextureReferenceRHI->SetLastRenderTime(-FLT_MAX);
+	}
 }
 
 void FTextureReference::InitRHI()
 {
 	SCOPED_LOADTIMER(FTextureReference_InitRHI);
-	TextureReferenceRHI = RHICreateTextureReference(&LastRenderTimeRHI);
+	TextureReferenceRHI = RHICreateTextureReference();
 }
 	
+int32 GTextureReferenceRevertsLastRenderContainer = 1;
+FAutoConsoleVariableRef CVarTextureReferenceRevertsLastRenderContainer(
+	TEXT("r.TextureReferenceRevertsLastRenderContainer"),
+	GTextureReferenceRevertsLastRenderContainer,
+	TEXT(""));
+
 void FTextureReference::ReleaseRHI()
 {
 	TextureReferenceRHI.SafeRelease();
@@ -309,6 +494,145 @@ TGlobalResource<FNullColorVertexBuffer> GNullColorVertexBuffer;
 
 /** The global null vertex buffer, which is set with a stride of 0 on meshes */
 TGlobalResource<FNullVertexBuffer> GNullVertexBuffer;
+
+/*------------------------------------------------------------------------------
+	FRayTracingGeometry implementation.
+------------------------------------------------------------------------------*/
+
+#if RHI_RAYTRACING
+
+void FRayTracingGeometry::CreateRayTracingGeometryFromCPUData(TResourceArray<uint8>& OfflineData)
+{
+	check(OfflineData.Num() == 0 || Initializer.OfflineData == nullptr);
+	if (OfflineData.Num())
+	{
+		Initializer.OfflineData = &OfflineData;
+	}
+
+	if (GVarDebugForceRuntimeBLAS && Initializer.OfflineData != nullptr)
+	{
+		Initializer.OfflineData->Discard();
+		Initializer.OfflineData = nullptr;
+	}
+
+	bRequiresBuild = Initializer.OfflineData == nullptr;		
+	RayTracingGeometryRHI = RHICreateRayTracingGeometry(Initializer);
+}
+
+void FRayTracingGeometry::RequestBuildIfNeeded(ERTAccelerationStructureBuildPriority InBuildPriority)
+{
+	RayTracingGeometryRHI->SetInitializer(Initializer);
+
+	if (bRequiresBuild)
+	{
+		RayTracingBuildRequestIndex = GRayTracingGeometryManager.RequestBuildAccelerationStructure(this, InBuildPriority);
+		bRequiresBuild = false;
+	}	
+}
+
+void FRayTracingGeometry::CreateRayTracingGeometry(ERTAccelerationStructureBuildPriority InBuildPriority)
+{
+	// Release previous RHI object if any
+	ReleaseRHI();
+
+	check(RawData.Num() == 0 || Initializer.OfflineData == nullptr);
+	if (RawData.Num())
+	{
+		Initializer.OfflineData = &RawData;
+	}
+
+	if (GVarDebugForceRuntimeBLAS && Initializer.OfflineData != nullptr)
+	{
+		Initializer.OfflineData->Discard();
+		Initializer.OfflineData = nullptr;
+	}
+
+	bool bAllSegmentsAreValid = Initializer.Segments.Num() > 0 || Initializer.OfflineData;
+	for (const FRayTracingGeometrySegment& Segment : Initializer.Segments)
+	{
+		if (!Segment.VertexBuffer)
+		{
+			bAllSegmentsAreValid = false;
+			break;
+		}
+	}
+
+	const bool bWithoutNativeResource = Initializer.Type == ERayTracingGeometryInitializerType::StreamingDestination;
+	if (bAllSegmentsAreValid)
+	{
+		bValid = !bWithoutNativeResource;
+		RayTracingGeometryRHI = RHICreateRayTracingGeometry(Initializer);
+		if (Initializer.OfflineData == nullptr)
+		{
+			// Request build if not skip
+			if (InBuildPriority != ERTAccelerationStructureBuildPriority::Skip)
+			{
+				RayTracingBuildRequestIndex = GRayTracingGeometryManager.RequestBuildAccelerationStructure(this, InBuildPriority);
+				bRequiresBuild = false;
+			}
+			else
+			{
+				bRequiresBuild = true;
+			}
+		}
+		else
+		{
+			bRequiresBuild = false;
+
+			// Offline data ownership is transferred to the RHI, which discards it after use.
+			// It is no longer valid to use it after this point.
+			Initializer.OfflineData = nullptr;
+		}
+	}
+}
+
+bool FRayTracingGeometry::IsValid() const
+{
+	return RayTracingGeometryRHI != nullptr && Initializer.TotalPrimitiveCount > 0 && bValid;
+}
+
+void FRayTracingGeometry::InitRHI()
+{
+	if (!IsRayTracingEnabled())
+		return;
+
+	ERTAccelerationStructureBuildPriority BuildPriority = Initializer.Type != ERayTracingGeometryInitializerType::Rendering
+		? ERTAccelerationStructureBuildPriority::Skip
+		: ERTAccelerationStructureBuildPriority::Normal;
+	CreateRayTracingGeometry(BuildPriority);
+}
+
+void FRayTracingGeometry::ReleaseRHI()
+{
+	RemoveBuildRequest();
+	RayTracingGeometryRHI.SafeRelease();
+}
+
+void FRayTracingGeometry::RemoveBuildRequest()
+{
+	if (HasPendingBuildRequest())
+	{
+		GRayTracingGeometryManager.RemoveBuildRequest(RayTracingBuildRequestIndex);
+		RayTracingBuildRequestIndex = INDEX_NONE;
+	}
+}
+
+void FRayTracingGeometry::ReleaseResource()
+{
+	// Release any resource references held by the initializer.
+	// This includes index and vertex buffers used for building the BLAS.
+	Initializer = FRayTracingGeometryInitializer {};
+
+	FRenderResource::ReleaseResource();
+}
+
+void FRayTracingGeometry::BoostBuildPriority(float InBoostValue) const
+{
+	check(HasPendingBuildRequest());
+	GRayTracingGeometryManager.BoostPriority(RayTracingBuildRequestIndex, InBoostValue);
+}
+
+#endif // RHI_RAYTRACING
 
 /*------------------------------------------------------------------------------
 	FGlobalDynamicVertexBuffer implementation.
@@ -347,7 +671,7 @@ public:
 		check(MappedBuffer == NULL);
 		check(AllocatedByteCount == 0);
 		check(IsValidRef(VertexBufferRHI));
-		MappedBuffer = (uint8*)RHILockVertexBuffer(VertexBufferRHI, 0, BufferSize, RLM_WriteOnly);
+		MappedBuffer = (uint8*)RHILockBuffer(VertexBufferRHI, 0, BufferSize, RLM_WriteOnly);
 	}
 
 	/**
@@ -357,7 +681,7 @@ public:
 	{
 		check(MappedBuffer != NULL);
 		check(IsValidRef(VertexBufferRHI));
-		RHIUnlockVertexBuffer(VertexBufferRHI);
+		RHIUnlockBuffer(VertexBufferRHI);
 		MappedBuffer = NULL;
 		AllocatedByteCount = 0;
 		NumFramesUnused = 0;
@@ -367,7 +691,7 @@ public:
 	virtual void InitRHI() override
 	{
 		check(!IsValidRef(VertexBufferRHI));
-		FRHIResourceCreateInfo CreateInfo;
+		FRHIResourceCreateInfo CreateInfo(TEXT("FDynamicVertexBuffer"));
 		VertexBufferRHI = RHICreateVertexBuffer(BufferSize, BUF_Volatile, CreateInfo);
 		MappedBuffer = NULL;
 		AllocatedByteCount = 0;
@@ -552,7 +876,7 @@ public:
 		check(MappedBuffer == NULL);
 		check(AllocatedByteCount == 0);
 		check(IsValidRef(IndexBufferRHI));
-		MappedBuffer = (uint8*)RHILockIndexBuffer(IndexBufferRHI, 0, BufferSize, RLM_WriteOnly);
+		MappedBuffer = (uint8*)RHILockBuffer(IndexBufferRHI, 0, BufferSize, RLM_WriteOnly);
 	}
 
 	/**
@@ -562,7 +886,7 @@ public:
 	{
 		check(MappedBuffer != NULL);
 		check(IsValidRef(IndexBufferRHI));
-		RHIUnlockIndexBuffer(IndexBufferRHI);
+		RHIUnlockBuffer(IndexBufferRHI);
 		MappedBuffer = NULL;
 		AllocatedByteCount = 0;
 		NumFramesUnused = 0;
@@ -572,7 +896,7 @@ public:
 	virtual void InitRHI() override
 	{
 		check(!IsValidRef(IndexBufferRHI));
-		FRHIResourceCreateInfo CreateInfo;
+		FRHIResourceCreateInfo CreateInfo(TEXT("FDynamicIndexBuffer"));
 		IndexBufferRHI = RHICreateIndexBuffer(Stride, BufferSize, BUF_Volatile, CreateInfo);
 		MappedBuffer = NULL;
 		AllocatedByteCount = 0;
@@ -843,10 +1167,8 @@ bool IsRayTracingEnabled()
 
 #if DO_CHECK && WITH_EDITOR
 	{
-		FString Commandline = FCommandLine::Get();
-		bool bIsCookCommandlet = IsRunningCommandlet() && Commandline.Contains(TEXT("run=cook"));
 		// This function must not be called while cooking
-		if (bIsCookCommandlet)
+		if (IsRunningCookCommandlet())
 		{
 			return false;
 		}
@@ -857,3 +1179,7 @@ bool IsRayTracingEnabled()
 	return GUseRayTracing;
 }
 
+bool IsRayTracingEnabled(EShaderPlatform ShaderPlatform)
+{
+	return IsRayTracingEnabled() && RHISupportsRayTracing(ShaderPlatform);
+}

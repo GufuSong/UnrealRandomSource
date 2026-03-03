@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "Common.ush"
+#include "Landscape/LandscapeCommon.ush"
 
 Texture2D ReadTexture1;
 Texture2D ReadTexture2;							// This one is optional, it's valid when OutputConfig.z == 1
@@ -14,9 +15,10 @@ float CurrentMipComponentVertexCount;
 float2 CurrentMipTextureSize;
 float2 ParentMipTextureSize;
 
-float ExtractHeight(float2 InPackedHeight)
+float ExtractAndScaleHeight(float2 InPackedHeight)
 {
-	return float(((int)round(InPackedHeight.r * 255.0) << 8) | (int)round(InPackedHeight.g * 255.0));
+	float Height = UnpackHeight(InPackedHeight) - 32768.0;
+	return Height * LandscapeGridScale.z * TERRAIN_ZSCALE;
 }
 
 float ExtractAlpha(float2 InPackedAlpha)
@@ -26,36 +28,11 @@ float ExtractAlpha(float2 InPackedAlpha)
 	return float(Alpha) / 65532.0; // 0xFFFC in float
 }
 
-float2 PackHeight(float InExtractedHeight)
-{
-	InExtractedHeight = clamp(InExtractedHeight, 0.0f, 65535.0f);
-	int iHeight = (int)InExtractedHeight;
-	return float2((float)((iHeight - (iHeight & 255)) >> 8) / 255.0, (float)(iHeight & 255) / 255.0);
-}
-
-float3 SampleTextureYNormal(float2 InTextureCoordinates, float2 InTexelSize, bool InUp)
-{
-	float2 SamplingUV = InTextureCoordinates;
-	SamplingUV.y = InUp ? SamplingUV.y - InTexelSize.y : SamplingUV.y + InTexelSize.y;
-	float2 PosSample = ReadTexture1.SampleLevel(ReadTexture1Sampler, SamplingUV, 0).rg;
-	float PosHeight = ExtractHeight(PosSample) - 32768.0;
-	return float3(SamplingUV * TextureSize * LandscapeGridScale.xy, PosHeight * LandscapeGridScale.z * TERRAIN_ZSCALE);
-}
-
-float3 SampleTextureXNormal(float2 InTextureCoordinates, float2 InTexelSize, bool InLeft)
-{
-	float2 SamplingUV = InTextureCoordinates;
-	SamplingUV.x = InLeft ? SamplingUV.x - InTexelSize.x : SamplingUV.x + InTexelSize.x;
-	float2 PosSample = ReadTexture1.SampleLevel(ReadTexture1Sampler, SamplingUV, 0).rg;
-	float PosHeight = ExtractHeight(PosSample) - 32768.0;
-	return float3(SamplingUV * TextureSize * LandscapeGridScale.xy, PosHeight * LandscapeGridScale.z * TERRAIN_ZSCALE);
-}
-
 void PSHeightmapMain(float2 InTextureCoordinates : TEXCOORD0, out float4 OutColor : SV_Target0)
 {
 	float LayerVisibility = LayerInfo.y;
 	float4 SourceColor = ReadTexture1.Sample(ReadTexture1Sampler, InTextureCoordinates);
-	float Height = ExtractHeight(SourceColor.rg);
+	float Height = UnpackHeight(SourceColor.rg);
 	
 	// Perform calculation 0 based
 	Height -= 32768.0f;
@@ -71,7 +48,7 @@ void PSHeightmapMain(float2 InTextureCoordinates : TEXCOORD0, out float4 OutColo
 	if (OutputConfig.z == 1.0)
 	{
 		float2 BaseColor = ReadTexture2.Sample(ReadTexture2Sampler, InTextureCoordinates).rg;
-		float BaseHeight = ExtractHeight(BaseColor.rg);
+		float BaseHeight = UnpackHeight(BaseColor.rg);
 		BaseHeight -= 32768.0;
 
 		float LayerBlendMode = LayerInfo.z;
@@ -114,102 +91,71 @@ void PSHeightmapMain(float2 InTextureCoordinates : TEXCOORD0, out float4 OutColo
 	{
 		float2 TexelSize = 1.0 / TextureSize;
 
-		bool IsMinBorderTexelX = InTextureCoordinates.x <= TexelSize.x;
-		bool IsMinBorderTexelY = InTextureCoordinates.y <= TexelSize.y;
-		bool IsMaxBorderTexelX = InTextureCoordinates.x >= TexelSize.x * min(CurrentMipComponentVertexCount - 1, 1.0);
-		bool IsMaxBorderTexelY = InTextureCoordinates.y >= TexelSize.y * min(CurrentMipComponentVertexCount - 1, 1.0);
+		bool bIsMinBorderTexelX = InTextureCoordinates.x <= TexelSize.x;
+		bool bIsMinBorderTexelY = InTextureCoordinates.y <= TexelSize.y;
+		bool bIsMaxBorderTexelX = InTextureCoordinates.x >= 1.0f - TexelSize.x;
+		bool bIsMaxBorderTexelY = InTextureCoordinates.y >= 1.0f - TexelSize.y;
 
-		float3 CurrentPos = float3(InTextureCoordinates * TextureSize * LandscapeGridScale.xy, (Height - 32768.0f) * LandscapeGridScale.z * TERRAIN_ZSCALE);
-		float3 FinalNormal = 0.0;
+		// The triangle topology is the following (where C = center, T = top, B = bottom, L = left, R = right and Nx the normals we need to interpolate):
+		// TL ------ TT
+		// | \       | \
+		// |  \      |  \
+		// |   \     |   \
+		// | N0 \ N1 | N3 \
+		// |     \   |     \
+		// |      \  |      \
+		// |       \ |       \
+		// LL ------ CC ------ RR
+		//   \       | \       |
+		//    \      |  \      |
+		//     \     |   \     |
+		//      \ N2 | N4 \ N5 |
+		//       \   |     \   |
+		//        \  |      \  |
+		//         \ |       \ |
+		//           BB ------ BR
+		// So we can retrieve all 7 samples using 4 gathers : 
+		// Make sure we gather the 4 pixels in the bottom right direction by sampling at (0.75, 0.75) of the pixel (gather retrieves the 4 samples that would be used for bilinear interpolation):
+		float2 GatherLocation = InTextureCoordinates + 0.25f * TexelSize; 
+		float4 Red0 = ReadTexture1.GatherRed(ReadTexture1Sampler, GatherLocation - TexelSize);
+		float4 Green0 = ReadTexture1.GatherGreen(ReadTexture1Sampler, GatherLocation - TexelSize);
+		float4 Red1 = ReadTexture1.GatherRed(ReadTexture1Sampler, GatherLocation);
+		float4 Green1 = ReadTexture1.GatherGreen(ReadTexture1Sampler, GatherLocation);
 
-		if (IsMinBorderTexelX) // left border
+		float3 TL = float3((InTextureCoordinates * TextureSize + float2(-1, -1)) * LandscapeGridScale.xy, ExtractAndScaleHeight(float2(Red0.w, Green0.w)));
+		float3 TT = float3((InTextureCoordinates * TextureSize + float2(+0, -1)) * LandscapeGridScale.xy, ExtractAndScaleHeight(float2(Red0.z, Green0.z)));
+		float3 CC = float3((InTextureCoordinates * TextureSize + float2(+0, +0)) * LandscapeGridScale.xy, ExtractAndScaleHeight(float2(Red0.y, Green0.y)));
+		float3 LL = float3((InTextureCoordinates * TextureSize + float2(-1, +0)) * LandscapeGridScale.xy, ExtractAndScaleHeight(float2(Red0.x, Green0.x)));
+		float3 RR = float3((InTextureCoordinates * TextureSize + float2(+1, +0)) * LandscapeGridScale.xy, ExtractAndScaleHeight(float2(Red1.z, Green1.z)));
+		float3 BR = float3((InTextureCoordinates * TextureSize + float2(+1, +1)) * LandscapeGridScale.xy, ExtractAndScaleHeight(float2(Red1.y, Green1.y)));
+		float3 BB = float3((InTextureCoordinates * TextureSize + float2(+0, +1)) * LandscapeGridScale.xy, ExtractAndScaleHeight(float2(Red1.x, Green1.x)));
+
+		float3 N0 = normalize(cross(CC - LL, LL - TL));
+		float3 N1 = normalize(cross(TL - TT, TT - CC));
+		float3 N2 = normalize(cross(LL - CC, CC - BB));
+		float3 N3 = normalize(cross(RR - CC, CC - TT));
+		float3 N4 = normalize(cross(BR - BB, BB - CC));
+		float3 N5 = normalize(cross(CC - RR, RR - BR));
+		
+		// Handle edge cases by simply cancelling the normal so that it doesn't contribute : 
+		if (bIsMinBorderTexelX)
 		{
-			if (IsMinBorderTexelY) // top border
-			{
-				float3 PosDown = SampleTextureYNormal(InTextureCoordinates, TexelSize, false);
-				float3 PosRight = SampleTextureXNormal(InTextureCoordinates, TexelSize, false);
-				FinalNormal = normalize(cross(PosRight - CurrentPos, PosDown - CurrentPos));
-			}
-			else if (IsMaxBorderTexelY) // bottom border
-			{
-				float3 PosUp = SampleTextureYNormal(InTextureCoordinates, TexelSize, true);
-				float3 PosRight = SampleTextureXNormal(InTextureCoordinates, TexelSize, false);
-				FinalNormal = normalize(cross(PosUp - CurrentPos, PosRight - CurrentPos));
-			}
-			else
-			{
-				float3 PosUp = SampleTextureYNormal(InTextureCoordinates, TexelSize, true);
-				float3 PosRight = SampleTextureXNormal(InTextureCoordinates, TexelSize, false);
-				float3 PosDown = SampleTextureYNormal(InTextureCoordinates, TexelSize, false);
-
-				float3 VectorUpRight = cross(PosUp - CurrentPos, PosRight - CurrentPos);
-				float3 VectorRightDown = cross(PosRight - CurrentPos, PosDown - CurrentPos);
-				FinalNormal = normalize(VectorUpRight + VectorRightDown);
-			}
+			N0 = N1 = N2 = 0.0f;
 		}
-		else if (IsMaxBorderTexelX) // right border
+		if (bIsMinBorderTexelY)
 		{
-			if (IsMinBorderTexelY) // top border
-			{
-				float3 PosDown = SampleTextureYNormal(InTextureCoordinates, TexelSize, false);
-				float3 PosLeft = SampleTextureXNormal(InTextureCoordinates, TexelSize, true);
-				FinalNormal = normalize(cross(PosDown - CurrentPos, PosLeft - CurrentPos));
-			}
-			else if (IsMaxBorderTexelY) // bottom border
-			{
-				float3 PosUp = SampleTextureYNormal(InTextureCoordinates, TexelSize, true);
-				float3 PosLeft = SampleTextureXNormal(InTextureCoordinates, TexelSize, true);
-				FinalNormal = normalize(cross(PosLeft - CurrentPos, PosUp - CurrentPos));
-			}
-			else
-			{
-				float3 PosUp = SampleTextureYNormal(InTextureCoordinates, TexelSize, true);
-				float3 PosLeft = SampleTextureXNormal(InTextureCoordinates, TexelSize, true);
-				float3 PosDown = SampleTextureYNormal(InTextureCoordinates, TexelSize, false);
-
-				float3 VectorLeftUp = cross(PosLeft - CurrentPos, PosUp - CurrentPos);
-				float3 VectorDownLeft = cross(PosDown - CurrentPos, PosLeft - CurrentPos);
-				FinalNormal = normalize(VectorDownLeft + VectorLeftUp);
-			}
+			N0 = N1 = N3 = 0.0f;
 		}
-		else // center border
+		if (bIsMaxBorderTexelX)
 		{
-			if (IsMinBorderTexelY) // top border
-			{
-				float3 PosRight = SampleTextureXNormal(InTextureCoordinates, TexelSize, false);
-				float3 PosLeft = SampleTextureXNormal(InTextureCoordinates, TexelSize, true);
-				float3 PosDown = SampleTextureYNormal(InTextureCoordinates, TexelSize, false);
-
-				float3 VectorRightDown = cross(PosRight - CurrentPos, PosDown - CurrentPos);
-				float3 VectorDownLeft = cross(PosDown - CurrentPos, PosLeft - CurrentPos);
-				FinalNormal = normalize(VectorRightDown + VectorDownLeft);
-			}
-			else if (IsMaxBorderTexelY) // bottom border
-			{
-				float3 PosRight = SampleTextureXNormal(InTextureCoordinates, TexelSize, false);
-				float3 PosLeft = SampleTextureXNormal(InTextureCoordinates, TexelSize, true);
-				float3 PosUp = SampleTextureYNormal(InTextureCoordinates, TexelSize, true);
-
-				float3 VectorUpRight = cross(PosUp - CurrentPos, PosRight - CurrentPos);
-				float3 VectorLeftUp = cross(PosLeft - CurrentPos, PosUp - CurrentPos);
-				FinalNormal = normalize(VectorUpRight + VectorLeftUp);
-			}
-			else
-			{
-				float3 PosRight = SampleTextureXNormal(InTextureCoordinates, TexelSize, false);
-				float3 PosLeft = SampleTextureXNormal(InTextureCoordinates, TexelSize, true);
-				float3 PosUp = SampleTextureYNormal(InTextureCoordinates, TexelSize, true);
-				float3 PosDown = SampleTextureYNormal(InTextureCoordinates, TexelSize, false);
-
-				float3 VectorRightDown = cross(PosRight - CurrentPos, PosDown - CurrentPos);
-				float3 VectorDownLeft = cross(PosDown - CurrentPos, PosLeft - CurrentPos);
-
-				float3 VectorUpRight = cross(PosUp - CurrentPos, PosRight - CurrentPos);
-				float3 VectorLeftUp = cross(PosLeft - CurrentPos, PosUp - CurrentPos);
-
-				FinalNormal = normalize(VectorUpRight + VectorLeftUp + VectorRightDown + VectorDownLeft);
-			}
-		}		
+			N3 = N4 = N5 = 0.0f;
+		}
+		if (bIsMaxBorderTexelY)
+		{
+			N2 = N4 = N5 = 0.0f;
+		}
+		
+		float3 FinalNormal = normalize(N0 + N1 + N2 + N3 + N4 + N5);
 
 		// Scale back to be 0-1 normal
 		OutColor.b = (FinalNormal.x + 1.0) * 0.5;
@@ -262,8 +208,8 @@ void PSHeightmapMainMips(float2 InTextureCoordinates : TEXCOORD0, out float4 Out
 	{
 		float4 SourceSample = ReadTexture1.SampleLevel(ReadTexture1Sampler, SourceUV, 0);
 		float4 DownSample = ReadTexture1.SampleLevel(ReadTexture1Sampler, SourceUV + float2(0.0, ParentMipTexelSize.y), 0);
-		float SourceHeight = ExtractHeight(SourceSample.rg);
-		float DownHeight = ExtractHeight(DownSample.rg);
+		float SourceHeight = UnpackHeight(SourceSample.rg);
+		float DownHeight = UnpackHeight(DownSample.rg);
 
 		if (IsMinBorderTexelY) // on top border
 		{
@@ -286,8 +232,8 @@ void PSHeightmapMainMips(float2 InTextureCoordinates : TEXCOORD0, out float4 Out
 	{
 		float4 RightSample = ReadTexture1.SampleLevel(ReadTexture1Sampler, SourceUV + float2(ParentMipTexelSize.x, 0.0), 0);
 		float4 DownRightSample = ReadTexture1.SampleLevel(ReadTexture1Sampler, SourceUV + ParentMipTexelSize, 0);
-		float RightHeight = ExtractHeight(RightSample.rg);
-		float DownRightHeight = ExtractHeight(DownRightSample.rg);
+		float RightHeight = UnpackHeight(RightSample.rg);
+		float DownRightHeight = UnpackHeight(DownRightSample.rg);
 
 		if (IsMinBorderTexelY) // on top border
 		{
@@ -313,10 +259,10 @@ void PSHeightmapMainMips(float2 InTextureCoordinates : TEXCOORD0, out float4 Out
 		float4 RightSample = ReadTexture1.SampleLevel(ReadTexture1Sampler, SourceUV + float2(ParentMipTexelSize.x, 0.0), 0);
 		float4 DownRightSample = ReadTexture1.SampleLevel(ReadTexture1Sampler, SourceUV + ParentMipTexelSize, 0);
 
-		float SourceHeight = ExtractHeight(SourceSample.rg);
-		float DownHeight = ExtractHeight(DownSample.rg);
-		float RightHeight = ExtractHeight(RightSample.rg);
-		float DownRightHeight = ExtractHeight(DownRightSample.rg);
+		float SourceHeight = UnpackHeight(SourceSample.rg);
+		float DownHeight = UnpackHeight(DownSample.rg);
+		float RightHeight = UnpackHeight(RightSample.rg);
+		float DownRightHeight = UnpackHeight(DownRightSample.rg);
 
 		if (IsMinBorderTexelY) // on top border
 		{
@@ -344,8 +290,6 @@ void PSHeightmapMainMips(float2 InTextureCoordinates : TEXCOORD0, out float4 Out
 	float2 PackedHeightResult = PackHeight(HeightResult);
 	OutColor = float4(PackedHeightResult.xy, NormalResult.xy);
 }
-
-float4 WeightmapLayerWeightBlend; // each xyzw == 1 texture channel
 
 void PSWeightmapMain(float2 InTextureCoordinates : TEXCOORD0, out float4 OutColor : SV_Target0)
 {
@@ -402,8 +346,6 @@ void PSWeightmapMainMips(float2 InTextureCoordinates : TEXCOORD0, out float4 Out
 
 	float2 ParentMipTexelSize = 1.0 / ParentMipTextureSize;
 	float2 SourceUV = InTextureCoordinates - (ParentMipTexelSize * 0.5);
-	float2 HeightResult = 0;
-	float2 NormalResult = 0;
 	float Alpha = 0.5;
 	OutColor = 0; // Default to 0
 

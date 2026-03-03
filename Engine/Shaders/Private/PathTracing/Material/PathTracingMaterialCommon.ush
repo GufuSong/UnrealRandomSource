@@ -9,141 +9,135 @@ PathTracingMaterialCommon.usf: Brdf utility functions
 #include "../PathTracingCommon.ush"
 #include "/Engine/Private/BRDF.ush"
 
-float3 GetMaterialEmission(FMaterialClosestHitPayload HitInfo)
+// Given two lobes that will roughly contribute colors A and B to the total (estimated for example using directional albedo)
+// return the probability of choosing lobe A
+float LobeSelectionProb(float3 A, float3 B)
 {
-	return HitInfo.Radiance;
+	const float SumA = A.x + A.y + A.z;
+	const float SumB = B.x + B.y + B.z;
+	// use MIS routine to robustly compute SumA / (SumA + SumB) even when both are 0, or overflow, etc ...
+	return MISWeightBalanced(SumA, SumB);
 }
 
-float3 GetBaseColor(FMaterialClosestHitPayload HitInfo)
+// Takes as input the sample weight and pdf for a certain lobe of a mixed model, together with the probability of picking that lobe
+// This function then updates a running total Weight and Pdf value that represents the overall contribution of the BxDF
+// This function should be called when a BxDF is made up of multiple lobes combined with a sum to correctly account for the probability
+// of sampling directions via all lobes.
+// NOTE: this function also contains special logic to handle cases with infinite pdfs cleanly
+void AddLobeWithMIS(inout float3 Weight, inout float Pdf, float3 LobeWeight, float LobePdf, float LobeProb)
 {
-	return HitInfo.BaseColor;
-}
-
-float3 GetDiffuseColor(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.DiffuseColor;
-}
-
-float3 GetSpecularColor(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.SpecularColor;
-}
-
-float GetRoughness(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.Roughness;
-}
-
-float GetMetallic(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.Metallic;
-}
-
-float GetClearCoat(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.CustomData.x;
-}
-
-float GetClearCoatRoughness(FMaterialClosestHitPayload HitInfo)
-{
-	return max(HitInfo.CustomData.y, 0.02);
-}
-
-float3 GetClearCoatBottomNormal(FMaterialClosestHitPayload HitInfo)
-{
-	float3 N = HitInfo.WorldNormal;
-#ifdef PATH_TRACING
-	#if CLEAR_COAT_BOTTOM_NORMAL
-	// Functionally inverse of behavior in RayTracingMaterialHitShader.usf
-	float2 oct2 = UnitVectorToOctahedron(HitInfo.WorldNormal);
-	float2 oct3 = float2(HitInfo.CustomData.a, HitInfo.CustomData.z);
-	float2 oct1 = (oct3 - (128.0 / 255.0)) * 2.0 + oct2;
-
-	N = OctahedronToUnitVector(oct1);
-	#endif
-#endif
-	return N;
-}
-
-float GetClearCoatThickness(FMaterialClosestHitPayload HitInfo)
-{
-	// Assume normalized thickness
-	return 1.0;
-}
-
-float GetClearCoatIor(FMaterialClosestHitPayload HitInfo)
-{
-	return 1.5;
-}
-
-float GetIor(FMaterialClosestHitPayload HitInfo)
-{
-	return DielectricF0ToIor(DielectricSpecularToF0(HitInfo.Specular));
-}
-
-float3 GetSubsurfaceColor(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.CustomData.xyz;
-}
-
-float3 GetWorldNormal(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.WorldNormal;
-}
-
-bool IsPureSpecular(FMaterialClosestHitPayload HitInfo)
-{
-	return GetRoughness(HitInfo) < GLOSSY_MIN_ROUGHNESS;
-}
-
-bool IsPureSpecularReflection(FMaterialClosestHitPayload HitInfo)
-{
-	return IsPureSpecular(HitInfo) && HitInfo.BlendingMode == 0 && HitInfo.Metallic == 1;
-}
-
-bool IsPureSpecularTransmission(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.BlendingMode > RAY_TRACING_BLEND_MODE_OPAQUE;
-}
-
-bool IsLambert(FMaterialClosestHitPayload HitInfo)
-{
-	return GetRoughness(HitInfo) > GLOSSY_MAX_ROUGHNESS;
-}
-
-bool IsDefaultLitMaterial(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.ShadingModelID == SHADINGMODELID_DEFAULT_LIT;
-}
-
-bool IsClearCoatMaterial(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.ShadingModelID == SHADINGMODELID_CLEAR_COAT;
-}
-
-bool IsTwoSidedFoliageMaterial(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.ShadingModelID == SHADINGMODELID_TWOSIDED_FOLIAGE;
-}
-
-bool IsMaterialTransmissive(FMaterialClosestHitPayload HitInfo)
-{
-	return HitInfo.ShadingModelID == SHADINGMODELID_TWOSIDED_FOLIAGE;
-}
-
-bool BSDF_Refract(float3 V, float3 N, float Eta, out float3 L)
-{
-	const float CosThetaI = dot(V, N);
-	const float CosThetaT2 = 1.f - Eta * Eta * (1.0f - CosThetaI * CosThetaI);
-	if (CosThetaT2 < 0.0f)
+	const float MinLobeProb = 1.1754943508e-38; // smallest normal float
+	if (LobeProb > MinLobeProb)
 	{
-		// Total internal reflection
-		L = reflect(-V, N);
-		return false;
+		LobePdf *= LobeProb;
+		LobeWeight *= 1 / LobeProb;
+
+		float MISWeight = MISWeightBalanced(LobePdf, Pdf);
+
+		Weight = lerp(Weight, LobeWeight, MISWeight);
+		Pdf += LobePdf;
 	}
+}
 
-	const float CosThetaT = -(CosThetaI >= 0.0f ? 1.0f : -1.0f) * sqrt(CosThetaT2);
-	L = (Eta * CosThetaI + CosThetaT) * N - Eta * V;
+// The following structs are used as return types for the Eval/Sample methods
 
-	return true;
+struct FMaterialSample
+{
+	float3 Direction;
+	float3 Weight;
+	float Pdf;
+	float PositionBiasSign;
+	float Roughness;
+};
+
+FMaterialSample NullMaterialSample()
+{
+	// return a zero initialized sample, for cases where we couldn't sample the material (such as rays below the horizon, etc..)
+	return (FMaterialSample)0;
+}
+
+FMaterialSample CreateMaterialSample(float3 Direction, float3 Weight, float Pdf, float PositionBiasSign, float Roughness)
+{
+	FMaterialSample Result;
+	Result.Direction = Direction;
+	Result.Weight = Weight;
+	Result.Pdf = Pdf;
+	Result.PositionBiasSign = PositionBiasSign;
+	Result.Roughness = Roughness;
+	return Result;
+}
+
+struct FMaterialEval
+{
+	float3 Weight;
+	float Pdf;
+};
+
+FMaterialEval NullMaterialEval()
+{
+	return (FMaterialEval)0;
+}
+
+FMaterialEval CreateMaterialEval(float3 Weight, float Pdf)
+{
+	FMaterialEval Result;
+	Result.Weight = Weight;
+	Result.Pdf = Pdf;
+	return Result;
+}
+
+
+
+#define PATH_TRACER_SHADOW_TERMINATOR   1 /// 0: off 1: imageworks 2: disney 3: dreamworks (see paper references below)
+
+float ShadowTerminatorTerm(float3 L, float3 N, float3 Ns)
+{
+	// #jira UE-121401
+#if PATH_TRACER_SHADOW_TERMINATOR == 1
+	// Imageworks terminator softening:
+	// "A Microfacet-Based Shadowing Function to Solve the Bump Terminator Problem"
+	// Alejandro Conty Estevez, Pascal Lecocq, and Clifford Stein.
+	// Ray Tracing Gems(2019), 149 - 158.
+	// http://www.aconty.com/pdf/bump-terminator-nvidia2019.pdf
+	const float Epsilon = 1e-6; // avoid division by 0
+	const float CosD = saturate(abs(dot(Ns, N)));
+	const float Tan2D = (1.0 - CosD * CosD) / (CosD * CosD + Epsilon);
+	const float Alpha2 = saturate(0.125 * Tan2D);
+	const float CosI = saturate(dot(Ns, L));
+	const float Tan2I = (1.0f - CosI * CosI) / (CosI * CosI + Epsilon);
+	return CosI > 0 ? 2.0f / (1.0f + sqrt(1.0f + Alpha2 * Tan2I)) : 0.0;
+#elif PATH_TRACER_SHADOW_TERMINATOR == 2
+	// Disney terminator softening:
+	// "Taming the Shadow Terminator"
+	// Matt Jen-Yuan Chiang, Yining Karl Li, and Brent Burley
+	// SIGGRAPH 2019 Talks
+	// https://www.yiningkarlli.com/projects/shadowterminator.html
+	const float NoL = saturate(dot(N, L));
+	const float NgoL = saturate(dot(Ns, L));
+	const float NgoN = saturate(dot(Ns, N));
+	const float G = saturate(NgoL / (NoL * NgoN + 1e-6));
+	return G + G * (G - G * G); // smooth
+#elif PATH_TRACER_SHADOW_TERMINATOR == 3
+	// Dreamworks terminator softening:
+	// "Predictable and Targeted Softening of the Shadow Terminator"
+	// Priyamvad Deshmukh, Brian Green
+	// SIGGRAPH 2020 Talks
+	// https://research.dreamworks.com/wp-content/uploads/2020/08/talk_shadow_terminator.pdf
+	const float CosD = saturate(abs(dot(Ns, N)));
+	const float d = lerp(0.15, 0.05, CosD);
+	const float t = saturate(dot(Ns, L) / d);
+	return t * t * (3.0 - 2.0 * t);
+#else
+	// no special handling of the terminator, don't do anything
+	return 1.0;
+#endif
+}
+
+float3 GetPathTracingDiffuseModel(float3 DiffuseColor, float Roughness, float NoV, float NoL, float VoH, float NoH)
+{
+#if MATERIAL_ROUGHDIFFUSE
+	return PI * Diffuse_Chan(DiffuseColor, Pow4(Roughness), NoV, NoL, VoH, NoH, 1.0f);
+#else
+	return DiffuseColor;
+#endif
 }

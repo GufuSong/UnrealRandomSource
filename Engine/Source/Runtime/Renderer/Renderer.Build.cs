@@ -8,9 +8,6 @@ public class Renderer : ModuleRules
 	{
 		PrivateIncludePaths.AddRange(
 			new string[] {
-				"Runtime/Renderer/Private",
-				"Runtime/Renderer/Private/CompositionLighting",
-				"Runtime/Renderer/Private/PostProcess",
 				"../Shaders/Shared"
 				}
 			);
@@ -43,5 +40,7 @@ public class Renderer : ModuleRules
 
         PrivateIncludePathModuleNames.AddRange(new string[] { "HeadMountedDisplay" });
         DynamicallyLoadedModuleNames.AddRange(new string[] { "HeadMountedDisplay" });
+		PrivateIncludePathModuleNames.AddRange(new string[] { "EyeTracker" });
+		DynamicallyLoadedModuleNames.AddRange(new string[] { "EyeTracker" });
 	}
 }

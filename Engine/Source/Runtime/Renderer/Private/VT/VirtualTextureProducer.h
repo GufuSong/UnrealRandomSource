@@ -63,6 +63,9 @@ public:
 	uint32 RemoveAllCallbacks(const void* Baton);
 	void CallPendingCallbacks();
 
+	/** Notify producers marked as "continous notify" that all requests have been completed. */
+	void NotifyRequestsCompleted();
+
 	/**
 	 * Gets the producer associated with the given handle, or nullptr if handle is invalid
 	 * Returned pointer is only valid until the next call to RegisterProducer, so should not be stored beyond scope of a function
@@ -203,5 +206,6 @@ private:
 
 	TArray<FProducerEntry> Producers;
 	TArray<FCallbackEntry> Callbacks;
+	TMap<void*, TArray<uint32>> CallbacksMap;
 	uint32 NumPendingCallbacks;
 };

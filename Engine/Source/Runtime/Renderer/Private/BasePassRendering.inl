@@ -32,16 +32,6 @@ void TBasePassVertexShaderPolicyParamType<LightMapPolicyType>::GetShaderBindings
 {
 	FMeshMaterialShader::GetShaderBindings(Scene, FeatureLevel, PrimitiveSceneProxy, MaterialRenderProxy, Material, DrawRenderState, ShaderElementData, ShaderBindings);
 
-	if (Scene)
-	{
-		FRHIUniformBuffer* ReflectionCaptureUniformBuffer = Scene->UniformBuffers.ReflectionCaptureUniformBuffer.GetReference();
-		ShaderBindings.Add(ReflectionCaptureBuffer, ReflectionCaptureUniformBuffer);
-	}
-	else
-	{
-		ShaderBindings.Add(ReflectionCaptureBuffer, DrawRenderState.GetReflectionCaptureUniformBuffer());
-	}
-
 	LightMapPolicyType::GetVertexShaderBindings(
 		PrimitiveSceneProxy,
 		ShaderElementData.LightMapPolicyElementData,
@@ -80,17 +70,27 @@ void TBasePassPixelShaderPolicyParamType<LightMapPolicyType>::GetShaderBindings(
 {
 	FMeshMaterialShader::GetShaderBindings(Scene, FeatureLevel, PrimitiveSceneProxy, MaterialRenderProxy, Material, DrawRenderState, ShaderElementData, ShaderBindings);
 
-	if (Scene)
-	{
-		FRHIUniformBuffer* ReflectionCaptureUniformBuffer = Scene->UniformBuffers.ReflectionCaptureUniformBuffer.GetReference();
-		ShaderBindings.Add(ReflectionCaptureBuffer, ReflectionCaptureUniformBuffer);
-	}
-	else
-	{
-		ShaderBindings.Add(ReflectionCaptureBuffer, DrawRenderState.GetReflectionCaptureUniformBuffer());
-	}
-
 	LightMapPolicyType::GetPixelShaderBindings(
+		PrimitiveSceneProxy,
+		ShaderElementData.LightMapPolicyElementData,
+		this,
+		ShaderBindings);
+}
+
+template<typename LightMapPolicyType>
+void TBasePassComputeShaderPolicyParamType<LightMapPolicyType>::GetShaderBindings(
+	const FScene* Scene,
+	ERHIFeatureLevel::Type FeatureLevel,
+	const FPrimitiveSceneProxy* PrimitiveSceneProxy,
+	const FMaterialRenderProxy& MaterialRenderProxy,
+	const FMaterial& Material,
+	const FMeshPassProcessorRenderState& DrawRenderState,
+	const TBasePassShaderElementData<LightMapPolicyType>& ShaderElementData,
+	FMeshDrawSingleShaderBindings& ShaderBindings) const
+{
+	FMeshMaterialShader::GetShaderBindings(Scene, FeatureLevel, PrimitiveSceneProxy, MaterialRenderProxy, Material, DrawRenderState, ShaderElementData, ShaderBindings);
+
+	LightMapPolicyType::GetComputeShaderBindings(
 		PrimitiveSceneProxy,
 		ShaderElementData.LightMapPolicyElementData,
 		this,

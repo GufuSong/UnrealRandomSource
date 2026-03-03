@@ -44,9 +44,9 @@ static inline void ConvertRawR16DataToFColor(uint32 Width, uint32 Height, uint8 
 		for (uint32 X = 0; X < Width; X++)
 		{
 			uint16 Value16 = *SrcPtr;
-			float Value = Value16 / (float)(0xffff);
+			int Value = FColor::Requantize16to8(Value16);
 
-			*DestPtr = FLinearColor(Value, Value, Value).Quantize();
+			*DestPtr = FColor(Value, Value, Value);
 			++SrcPtr;
 			++DestPtr;
 		}
@@ -91,6 +91,29 @@ static inline void ConvertRawB8G8R8A8DataToFColor(uint32 Width, uint32 Height, u
 	}
 }
 
+static inline void ConvertRawR16G16B16A16FDataToFFloat16Color(uint32 Width, uint32 Height, uint8* In, uint32 SrcPitch, FFloat16Color* Out)
+{
+	const uint32 DstPitch = Width * sizeof(FFloat16Color);
+
+	// If source & dest pitch matches, perform a single memcpy.
+	if (DstPitch == SrcPitch)
+	{
+		FPlatformMemory::Memcpy(Out, In, Width * Height * sizeof(FFloat16Color));
+	}
+	else
+	{
+		check(SrcPitch > DstPitch);
+
+		// Need to copy row wise since the Pitch does not match the Width.
+		for (uint32 Y = 0; Y < Height; Y++)
+		{
+			FFloat16Color* SrcPtr = (FFloat16Color*)(In + Y * SrcPitch);
+			FFloat16Color* DestPtr = Out + Y * Width;
+			FMemory::Memcpy(DestPtr, SrcPtr, DstPitch);
+		}
+	}
+}
+
 static inline void ConvertRawR10G10B10A2DataToFColor(uint32 Width, uint32 Height, uint8 *In, uint32 SrcPitch, FColor* Out)
 {
 	for (uint32 Y = 0; Y < Height; Y++)
@@ -99,12 +122,32 @@ static inline void ConvertRawR10G10B10A2DataToFColor(uint32 Width, uint32 Height
 		FColor* DestPtr = Out + Y * Width;
 		for (uint32 X = 0; X < Width; X++)
 		{
-			*DestPtr = FLinearColor(
-				(float)SrcPtr->R / 1023.0f,
-				(float)SrcPtr->G / 1023.0f,
-				(float)SrcPtr->B / 1023.0f,
-				(float)SrcPtr->A / 3.0f
-			).Quantize();
+			*DestPtr = FColor::MakeRequantizeFrom1010102(
+				SrcPtr->R,
+				SrcPtr->G,
+				SrcPtr->B,
+				SrcPtr->A
+			);
+			++SrcPtr;
+			++DestPtr;
+		}
+	}
+}
+
+static inline void ConvertRawB10G10R10A2DataToFColor(uint32 Width, uint32 Height, uint8* In, uint32 SrcPitch, FColor* Out)
+{
+	for (uint32 Y = 0; Y < Height; Y++)
+	{
+		FRHIR10G10B10A2* SrcPtr = (FRHIR10G10B10A2*)(In + Y * SrcPitch);
+		FColor* DestPtr = Out + Y * Width;
+		for (uint32 X = 0; X < Width; X++)
+		{
+			*DestPtr = FColor::MakeRequantizeFrom1010102(
+				SrcPtr->B,
+				SrcPtr->G,
+				SrcPtr->R,
+				SrcPtr->A
+			);
 			++SrcPtr;
 			++DestPtr;
 		}
@@ -163,6 +206,26 @@ static inline void ConvertRawR11G11B10DataToFColor(uint32 Width, uint32 Height, 
 	for (uint32 Y = 0; Y < Height; Y++)
 	{
 		FFloat3Packed* SrcPtr = (FFloat3Packed*)(In + Y * SrcPitch);
+		FColor* DestPtr = Out + Y * Width;
+
+		for (uint32 X = 0; X < Width; X++)
+		{
+			FLinearColor Value = (*SrcPtr).ToLinearColor();
+
+			*DestPtr = Value.ToFColor(LinearToGamma);
+			++SrcPtr;
+			++DestPtr;
+		}
+	}
+}
+
+static inline void ConvertRawR9G9B9E5DataToFColor(uint32 Width, uint32 Height, uint8* In, uint32 SrcPitch, FColor* Out, bool LinearToGamma)
+{
+	check(sizeof(FFloat3PackedSE) == sizeof(uint32));
+
+	for (uint32 Y = 0; Y < Height; Y++)
+	{
+		FFloat3PackedSE* SrcPtr = (FFloat3PackedSE*)(In + Y * SrcPitch);
 		FColor* DestPtr = Out + Y * Width;
 
 		for (uint32 X = 0; X < Width; X++)
@@ -280,12 +343,12 @@ static inline void ConvertRawR16G16B16A16DataToFColor(uint32 Width, uint32 Heigh
 		FColor* DestPtr = Out + Y * Width;
 		for (uint32 X = 0; X < Width; X++)
 		{
-			*DestPtr = FLinearColor(
-				(float)SrcPtr->R / 65535.0f,
-				(float)SrcPtr->G / 65535.0f,
-				(float)SrcPtr->B / 65535.0f,
-				(float)SrcPtr->A / 65535.0f
-			).Quantize();
+			*DestPtr = FColor(
+				FColor::Requantize16to8(SrcPtr->R),
+				FColor::Requantize16to8(SrcPtr->G),
+				FColor::Requantize16to8(SrcPtr->B),
+				FColor::Requantize16to8(SrcPtr->A)
+			);
 			++SrcPtr;
 			++DestPtr;
 		}
@@ -300,10 +363,10 @@ static inline void ConvertRawR16G16DataToFColor(uint32 Width, uint32 Height, uin
 		FColor* DestPtr = Out + Y * Width;
 		for (uint32 X = 0; X < Width; X++)
 		{
-			*DestPtr = FLinearColor(
-				(float)SrcPtr->R / 65535.0f,
-				(float)SrcPtr->G / 65535.0f,
-				0).Quantize();
+			*DestPtr = FColor(
+				FColor::Requantize16to8(SrcPtr->R),
+				FColor::Requantize16to8(SrcPtr->G),
+				0);
 			++SrcPtr;
 			++DestPtr;
 		}
@@ -616,6 +679,7 @@ static inline void ConvertRawR32DataToFLinearColor(uint32 Width, uint32 Height, 
 			float DeviceStencil = (float)(*(SrcStart + 4)) / 255.0f;
 			*DestPtr = FLinearColor(LinearValue, DeviceStencil, 0.0f, 0.0f);
 			SrcStart += 8; //64 bit format with the last 24 bit ignore
+			++DestPtr;
 		}
 	}
 }

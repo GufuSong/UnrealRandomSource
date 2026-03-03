@@ -1,12 +1,13 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 /*=============================================================================================
-	PathTracingSpotLight.usf: Light sampling functions for Spot light implementation
+	PathTracingSpotLight.ush: Light sampling functions for Spot light implementation
 ===============================================================================================*/
 
 #pragma once
 
 #include "PathTracingLightCommon.ush"
+#include "PathTracingSpotLight.ush"
 
 // #dxr_todo: These are stolen from DynamicLightingCommon.ush but I was having trouble getting that header to include cleanly
 /** 
@@ -26,138 +27,149 @@ float SpotAttenuation(float3 L, float3 SpotDirection, float2 SpotAngles)
 }
 
 
-void SpotLight_GenerateLightRay(
-	RayDesc Ray,
-	int LightId,
-	float3 LightUV,
-	out RayDesc OutLightRay
-)
-{
-	float3 LightDirection = GetPosition(LightId) - Ray.Origin;
+FLightHit SpotLight_TraceLight(FRayDesc Ray, int LightId) {
 
-	OutLightRay.Origin = Ray.Origin;
-	OutLightRay.TMin = 0.001;
-	OutLightRay.Direction = TangentToWorld(LightUV, normalize(LightDirection));
-
-	// Compute distance to sphere edge
-	float Radius = GetRadius(LightId);
-	float Radius2 = Pow2(Radius);
-
-	float RayLength2 = dot(LightDirection, LightDirection);
-	float RayLength = sqrt(RayLength2);
-	float SinThetaMax2 = Radius2 / RayLength2;
-
-	float CosTheta = LightUV.z;
-	float SinTheta2 = 1.0 - CosTheta * CosTheta;
-
-	OutLightRay.TMax = RayLength * (CosTheta - sqrt(max(SinThetaMax2 - SinTheta2, 0.0)));
+	FLightHit Result = PointLight_TraceLight(Ray, LightId);
+	if (Result.IsHit())
+	{
+		float3 TranslatedLightPosition = GetTranslatedPosition(LightId);
+		float3 LightNormal = GetNormal(LightId);
+		float2 CosConeAngles = GetCosConeAngles(LightId);
+		Result.Radiance *= SpotAttenuation(-normalize(Ray.Origin - TranslatedLightPosition), LightNormal, CosConeAngles);
+	}
+	return Result;
 }
 
-void SpotLight_PdfLight(
-	RayDesc Ray,
+FLightSample SpotLight_SampleLight(
 	int LightId,
-	float3 LightUV,
-	out float OutPdf
+	float2 RandSample,
+	float3 TranslatedWorldPos,
+	float3 WorldNormal
 )
 {
-	OutPdf = 0.0;
-}
+	FLightSample Result = PointLight_SampleLight(LightId, RandSample, TranslatedWorldPos, WorldNormal);
 
-void SpotLight_EvalLight(
-	int LightId,
-	float3 LightUV,
-	RayDesc Ray,
-	out float3 OutRadiance
-)
-{
-	float3 LightDirection = GetPosition(LightId) - Ray.Origin;
-	float LightDistanceSquared = dot(LightDirection, LightDirection);
-
-	float3 Color = GetColor(LightId);
-	float Radius = GetRadius(LightId);
-	float Falloff = ComputeAttenuationFalloff(Ray.TMax, GetAttenuation(LightId));
-	OutRadiance = Color * Falloff;
-
-	// #dxr-todo: See math in point lights - ideally spot light would share that logic somehow
-	OutRadiance *= 1.0 / LightDistanceSquared;
-
-	// This appears to be the only difference between point and spot lights
+	float3 TranslatedLightPosition = GetTranslatedPosition(LightId);
 	float3 LightNormal = GetNormal(LightId);
 	float2 CosConeAngles = GetCosConeAngles(LightId);
-	OutRadiance *= SpotAttenuation(normalize(LightDirection), LightNormal, CosConeAngles);
+	Result.RadianceOverPdf *= SpotAttenuation(-normalize(TranslatedWorldPos - TranslatedLightPosition), LightNormal, CosConeAngles);
+
+	return Result;
 }
 
-void SpotLight_EstimateLight(
+float SpotLight_EstimateLight(
 	int LightId,
-	RayDesc Ray,
-	FMaterialClosestHitPayload Payload,
-	out float OutIrradiance
+	float3 TranslatedWorldPos,
+	float3 WorldNormal,
+	bool IsTransmissiveMaterial
 )
 {
-	float3 LightPosition = GetPosition(LightId);
+	float3 TranslatedLightPosition = GetTranslatedPosition(LightId);
 	float3 LightNormal = GetNormal(LightId);
 	float LightPower = Luminance(GetColor(LightId));
 	float Radius = GetRadius(LightId);
 	
 	// Distance
-	float3 LightDirection = GetPosition(LightId) - Payload.WorldPos;
+	float3 LightDirection = TranslatedLightPosition - TranslatedWorldPos;
 	float LightDistanceSquared = dot(LightDirection, LightDirection);
-	LightDirection = normalize(LightDirection);
 
 	// Geometric term
-	float3 SurfaceNormal = Payload.WorldNormal;
+	float NoL = 1.0; // trivial upper bound -- trying to be more accurate appears to reduce performance
 
-	float NoL = 1.0;
-	if (GetRadius(LightId) == 0.0)
-	{
-		float NoL = dot(SurfaceNormal, LightDirection);
-		NoL = ENABLE_TRANSMISSION && HasTransmission(LightId) ? abs(NoL) : saturate(NoL);
-	}
-
-	float Falloff = ComputeAttenuationFalloff(sqrt(LightDistanceSquared), GetAttenuation(LightId));
-	OutIrradiance = LightPower * Falloff * NoL / LightDistanceSquared;
+	float Falloff = ComputeAttenuationFalloff(LightDistanceSquared, LightId);
+	float OutIrradiance = LightPower * Falloff * NoL / LightDistanceSquared;
 	
 	float2 CosConeAngles = GetCosConeAngles(LightId);
-	OutIrradiance *= SpotAttenuation(LightDirection, LightNormal, CosConeAngles);
+	OutIrradiance *= SpotAttenuation(normalize(LightDirection), LightNormal, CosConeAngles);
+
+	return OutIrradiance;
 }
-	
-void SpotLight_SampleLight(
-	RayDesc Ray,
-	FMaterialClosestHitPayload Payload,
-	float4 RandSample,
+
+float2 IntersectInfiniteConeVolume(
+	float3  ro, float3  rd,
+	float3  apex, float3  normal,
+	float radius)
+{
+	// Adapted from: https://www.iquilezles.org/www/articles/intersectors/intersectors.htm
+	const float3 ba = normal;
+	const float3 oa = ro - apex;
+
+	const float m0 = dot(ba, ba);
+	const float m1 = dot(oa, ba);
+	const float m3 = dot(rd, ba);
+
+	const float m4 = dot(rd, oa);
+	const float m5 = dot(oa, oa);
+	const float hy = m0 + radius * radius;
+
+	const float k2 = m0 * m0 - m3 * m3 * hy;
+	const float k1 = m0 * m0 * m4 - m1 * m3 * hy;
+	const float k0 = m0 * m0 * m5 - m1 * m1 * hy;
+
+	const float h = k1 * k1 - k2 * k0;
+	if (h > 0)
+	{
+		const float s = sign(k2);
+		const float2 t = (-k1 + float2(-s, s) * sqrt(h)) / k2;
+		const float2 y = m1 + t * m3;
+
+		// check which hits are valid:
+		const int c = ((y.x > 0) ? 1 : 0) + (y.y > 0 ? 2 : 0);
+		if (c == 1)
+		{
+			// only smaller root is valid, far root is invalid
+			return float2(0.0, t.x);
+		}
+		if (c == 2)
+		{
+			// only larger root is valid, must have started outside the cone
+			return float2(t.y, POSITIVE_INFINITY);
+		}
+		if (c == 3)
+		{
+			// both roots are valid
+			return t;
+		}
+	}
+	return -1.0;
+}
+
+
+FVolumeLightSampleSetup SpotLight_PrepareLightVolumeSample(
 	int LightId,
-	out float3 OutLightUV,
-	out float OutPdf
+	float3 RayOrigin,
+	float3 RayDirection,
+	float TMin,
+	float TMax
 )
 {
-	float Radius = GetRadius(LightId);
-	if (Radius > 0.0)
+	float3 Center = GetTranslatedPosition(LightId);
+	float AttenuationRadius = rcp(GetAttenuation(LightId));
+	float AttenuationRadius2 = Pow2(AttenuationRadius);
+	float3 oc = RayOrigin - Center;
+	float b = dot(oc, RayDirection);
+	float h = AttenuationRadius2 - length2(oc - b * RayDirection);
+	if (h > 0)
 	{
-		// Soft case - sample the solid angle subtended by the sphere
-		float3 LightDirection = GetPosition(LightId) - Payload.WorldPos;
-		float LightDistanceSquared = dot(LightDirection, LightDirection);
-		float Radius2 = Pow2(Radius);
-		
-		// outside the light
-		float SinThetaMax2 = Radius2 / LightDistanceSquared;
-		// #dxr_todo: find a better way of handling the region inside the light
-		float CosThetaMax = sqrt(max(1.0 - SinThetaMax2, 0.0));
-		float4 DirAndPdf = UniformSampleCone(RandSample.yz, CosThetaMax);
+		float2 t = -b + float2(-1, +1) * sqrt(h);
+		TMin = max(t.x, TMin);
+		TMax = min(t.y, TMax);
 
-		OutLightUV = DirAndPdf.xyz;
-#if 0
-		OutPdf = DirAndPdf.w;
-#else
-		// doing the "right" thing leads to unstable math for small radius lights
-		// #dxr_todo: Revisit this when implementing MIS for all lights
-		OutPdf = 1.0;
-#endif
+		float3 N = GetNormal(LightId);
+		// now clip against the cone of the spot
+		const float CosOuterConeAngle = GetCosConeAngles(LightId).x;
+		const float SinOuterConeAngle = sqrt(1 - CosOuterConeAngle * CosOuterConeAngle);
+
+		float2 TCone = IntersectInfiniteConeVolume(RayOrigin, RayDirection, Center, N * CosOuterConeAngle, SinOuterConeAngle);
+		if (TCone.x < TCone.y)
+		{
+			TMin = max(TCone.x, TMin);
+			TMax = min(TCone.y, TMax);
+			float3 C = GetColor(LightId);
+			float LightImportance = max3(C.x, C.y, C.z);
+			return CreateEquiAngularSampler(LightImportance, Center, RayOrigin, RayDirection, TMin, TMax);
+		}
 	}
-	else
-	{
-		// Singular case
-		OutLightUV = float3(0, 0, 1);
-		// #dxr_todo: this isn't really part of the pdf, the pdf should be +inf for the singular case
-		OutPdf = 1.0;
-	}
+	return NullVolumeLightSetup();
+
 }

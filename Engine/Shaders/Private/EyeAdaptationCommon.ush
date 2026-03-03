@@ -4,22 +4,26 @@
 
 #include "Common.ush"
 
+#if !EYE_ADAPTATION_DISABLED
+
 Texture2D EyeAdaptationTexture;
 Buffer<float4> EyeAdaptationBuffer;
 
 #if SHADING_PATH_DEFERRED
-float EyeAdaptationLookup(Texture2D InEyeAdaptation)
+float4 EyeAdaptationLookupTexture2D(Texture2D InEyeAdaptation)
 {
-	return InEyeAdaptation.Load(int3(0, 0, 0)).x;
+	return InEyeAdaptation.Load(int3(0, 0, 0));
 }
 #elif SHADING_PATH_MOBILE
-float EyeAdaptationLookup(Buffer<float4> InEyeAdaptation)
+float4 EyeAdaptationLookupBuffer(Buffer<float4> InEyeAdaptation)
 {
-	return InEyeAdaptation[0].x;
+	return InEyeAdaptation[0];
 }
 #else
 	#error Unknown shading path.
 #endif
+
+#endif // !EYE_ADAPTATION_DISABLED
 
 #if defined (EyeAdaptationStruct)
 	#if EYE_ADAPTATION_LOOSE_PARAMETERS
@@ -40,17 +44,17 @@ float EyeAdaptationLookup()
 	return 0.0f;
 #elif defined (EyeAdaptationStruct)
 	#if SHADING_PATH_DEFERRED
-		return EyeAdaptationLookup(EyeAdaptationStruct.EyeAdaptationTexture);
+		return EyeAdaptationLookupTexture2D(EyeAdaptationStruct.EyeAdaptationTexture).x;
 	#elif SHADING_PATH_MOBILE
-		return EyeAdaptationLookup(EyeAdaptationStruct.EyeAdaptationBuffer);
+		return EyeAdaptationLookupBuffer(EyeAdaptationStruct.EyeAdaptationBuffer).x;
 	#else
 		#error Unknown shading path.
 	#endif
 #elif EYE_ADAPTATION_LOOSE_PARAMETERS
 	#if SHADING_PATH_DEFERRED
-		return EyeAdaptationLookup(EyeAdaptationTexture);
+		return EyeAdaptationLookupTexture2D(EyeAdaptationTexture).x;
 	#elif SHADING_PATH_MOBILE
-		return EyeAdaptationLookup(EyeAdaptationBuffer);
+		return EyeAdaptationLookupBuffer(EyeAdaptationBuffer).x;
 	#else
 		#error Unknown shading path.
 	#endif
@@ -58,3 +62,22 @@ float EyeAdaptationLookup()
 	return 0.0f;
 #endif
 }
+
+float3 EyeAdaptationInverseLookup(float3 LightValue, float Alpha)
+{
+	float Adaptation = EyeAdaptationLookup();
+
+	// When Alpha=0.0, we want to multiply by 1.0. when Alpha = 1.0, we want to multiply by 1/Adaptation.
+	// So the lerped value is:
+	//     LerpLogScale = Lerp(log(1),log(1/Adaptaiton),T)
+	// Which is simplified as:
+	//     LerpLogScale = Lerp(0,-log(Adaptation),T)
+	//     LerpLogScale = -T * logAdaptation;
+
+	float LerpLogScale = -Alpha * log(Adaptation);
+	float Scale = exp(LerpLogScale);
+	return LightValue * Scale;
+}
+
+
+

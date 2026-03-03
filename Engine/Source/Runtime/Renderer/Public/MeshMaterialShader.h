@@ -27,6 +27,7 @@ public:
 	FRHIUniformBuffer* DitherUniformBuffer = nullptr;
 
 	RENDERER_API void InitializeMeshMaterialData(const FSceneView* SceneView, const FPrimitiveSceneProxy* RESTRICT PrimitiveSceneProxy, const FMeshBatch& RESTRICT MeshBatch, int32 StaticMeshId, bool bAllowStencilDither);
+	RENDERER_API void InitializeMeshMaterialData(const FSceneView* SceneView, const FPrimitiveSceneProxy* RESTRICT PrimitiveSceneProxy, int32 StaticMeshId, bool bDitheredLODTransition, bool bAllowStencilDither);
 };
 
 struct FMeshMaterialShaderPermutationParameters : public FMaterialShaderPermutationParameters
@@ -34,22 +35,32 @@ struct FMeshMaterialShaderPermutationParameters : public FMaterialShaderPermutat
 	// Type of vertex factory to compile.
 	const FVertexFactoryType* VertexFactoryType;
 
-	FMeshMaterialShaderPermutationParameters(EShaderPlatform InPlatform, const FMaterialShaderParameters& InMaterialParameters, const FVertexFactoryType* InVertexFactoryType, const int32 InPermutationId)
-		: FMaterialShaderPermutationParameters(InPlatform, InMaterialParameters, InPermutationId)
+	FMeshMaterialShaderPermutationParameters(EShaderPlatform InPlatform, const FMaterialShaderParameters& InMaterialParameters, const FVertexFactoryType* InVertexFactoryType, int32 InPermutationId, EShaderPermutationFlags InFlags)
+		: FMaterialShaderPermutationParameters(InPlatform, InMaterialParameters, InPermutationId, InFlags)
 		, VertexFactoryType(InVertexFactoryType)
 	{}
 };
 
 struct FVertexFactoryShaderPermutationParameters
 {
-	EShaderPlatform Platform;
-	FMaterialShaderParameters MaterialParameters;
+	const FShaderType* ShaderType;
 	const FVertexFactoryType* VertexFactoryType;
+	FMaterialShaderParameters MaterialParameters;
+	EShaderPlatform Platform;
+	EShaderPermutationFlags Flags;
 
-	FVertexFactoryShaderPermutationParameters(EShaderPlatform InPlatform, const FMaterialShaderParameters& InMaterialParameters, const FVertexFactoryType* InVertexFactoryType)
-		: Platform(InPlatform)
-		, MaterialParameters(InMaterialParameters)
+	FVertexFactoryShaderPermutationParameters(
+		EShaderPlatform InPlatform,
+		const FMaterialShaderParameters& InMaterialParameters, 
+		const FVertexFactoryType* InVertexFactoryType,
+		const FShaderType* InShaderType,
+		EShaderPermutationFlags InFlags
+		)
+		: ShaderType(InShaderType)
 		, VertexFactoryType(InVertexFactoryType)
+		, MaterialParameters(InMaterialParameters)
+		, Platform(InPlatform)
+		, Flags(InFlags)
 	{}
 };
 
@@ -113,3 +124,4 @@ private:
 protected:
 	LAYOUT_FIELD(FShaderUniformBufferParameter, PassUniformBuffer);
 };
+

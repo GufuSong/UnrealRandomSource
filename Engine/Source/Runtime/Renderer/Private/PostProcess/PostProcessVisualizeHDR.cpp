@@ -16,7 +16,6 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 		SHADER_PARAMETER_STRUCT(FEyeAdaptationParameters, EyeAdaptation)
-		SHADER_PARAMETER_STRUCT_INCLUDE(FMobileFilmTonemapParameters, MobileTonemap)
 		SHADER_PARAMETER_STRUCT_INCLUDE(FTonemapperOutputDeviceParameters, OutputDevice)
 		SHADER_PARAMETER_STRUCT(FScreenPassTextureViewportParameters, Input)
 		SHADER_PARAMETER_STRUCT(FScreenPassTextureViewportParameters, Output)
@@ -27,6 +26,12 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, HDRSceneColorSampler)
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneColorSampler)
 		SHADER_PARAMETER_TEXTURE(Texture2D, MiniFontTexture)
+		SHADER_PARAMETER(float, FilmSlope)
+		SHADER_PARAMETER(float, FilmToe)
+		SHADER_PARAMETER(float, FilmShoulder)
+		SHADER_PARAMETER(float, FilmBlackClip)
+		SHADER_PARAMETER(float, FilmWhiteClip)
+		SHADER_PARAMETER(float, IlluminanceMeterEnabled)
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -42,10 +47,18 @@ public:
 		OutEnvironment.SetDefine(TEXT("USE_SHADOW_TINT"), 1);
 		OutEnvironment.SetDefine(TEXT("USE_CONTRAST"), 1);
 		OutEnvironment.SetDefine(TEXT("USE_APPROXIMATE_SRGB"), (uint32)0);
+
+		// This shader takes a very long time to compile with FXC, so we pre-compile it with DXC first and then forward the optimized HLSL to FXC.
+		OutEnvironment.CompilerFlags.Add(CFLAG_PrecompileWithDXC);
 	}
 };
 
 IMPLEMENT_GLOBAL_SHADER(FVisualizeHDRPS, "/Engine/Private/PostProcessVisualizeHDR.usf", "MainPS", SF_Pixel);
+
+bool IsIlluminanceMeterSupportedByView(const FViewInfo& View)
+{
+	return !IsForwardShadingEnabled(View.GetShaderPlatform()) && !View.Family->EngineShowFlags.PathTracing;
+}
 
 FScreenPassTexture AddVisualizeHDRPass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FVisualizeHDRInputs& Inputs)
 {
@@ -67,6 +80,8 @@ FScreenPassTexture AddVisualizeHDRPass(FRDGBuilder& GraphBuilder, const FViewInf
 
 	FRHISamplerState* BilinearClampSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 
+	const FPostProcessSettings& Settings = View.FinalPostProcessSettings;
+
 	FVisualizeHDRPS::FParameters* PassParameters = GraphBuilder.AllocParameters<FVisualizeHDRPS::FParameters>();
 	PassParameters->RenderTargets[0] = Output.GetRenderTargetBinding();
 	PassParameters->View = View.ViewUniformBuffer;
@@ -80,12 +95,14 @@ FScreenPassTexture AddVisualizeHDRPass(FRDGBuilder& GraphBuilder, const FViewInf
 	PassParameters->EyeAdaptationTexture = Inputs.EyeAdaptationTexture;
 	PassParameters->EyeAdaptation = *Inputs.EyeAdaptationParameters;
 	PassParameters->OutputDevice = GetTonemapperOutputDeviceParameters(*View.Family);
-	PassParameters->MobileTonemap = GetMobileFilmTonemapParameters(
-		View.FinalPostProcessSettings,
-		/* UseColorMatrix = */ true,
-		/* UseShadowTint = */ true,
-		/* UseContrast = */ true);
 	PassParameters->MiniFontTexture = GetMiniFontTexture();
+	PassParameters->FilmSlope = Settings.FilmSlope;
+	PassParameters->FilmToe = Settings.FilmToe;
+	PassParameters->FilmShoulder = Settings.FilmShoulder;
+	PassParameters->FilmBlackClip = Settings.FilmBlackClip;
+	PassParameters->FilmWhiteClip = Settings.FilmWhiteClip;
+	PassParameters->IlluminanceMeterEnabled = IsIlluminanceMeterSupportedByView(View) ? 1.0f : 0.0f;
+	
 
 	TShaderMapRef<FVisualizeHDRPS> PixelShader(View.ShaderMap);
 
@@ -198,6 +215,22 @@ FScreenPassTexture AddVisualizeHDRPass(FRDGBuilder& GraphBuilder, const FViewInf
 			Line = FString::Printf(TEXT("%.3g"), CurveExposureBias);
 			Canvas.DrawShadowedString(X, Y += YStep, TEXT("Exposure Compensation (Curve):"), GetStatsFont(), FLinearColor(1, 1, 1));
 			Canvas.DrawShadowedString(X + ColumnWidth, Y, *Line, GetStatsFont(), FLinearColor(1, 1, 1));
+
+			const float IlluminanceMeterTextX = Output.ViewRect.Min.X + Output.ViewRect.Size().X * 0.5f - 180.0f;
+			const float IlluminanceMeterTextY = Output.ViewRect.Min.Y + Output.ViewRect.Size().Y * 0.5f - 130.0f;
+			if(IsIlluminanceMeterSupportedByView(View))
+			{
+				Canvas.DrawShadowedString(IlluminanceMeterTextX, IlluminanceMeterTextY, TEXT("Illuminance meter - over the hemisphere of the surface patch"), GetStatsFont(), FLinearColor(1, 1, 1));
+			}
+			else
+			{
+				Canvas.DrawShadowedString(IlluminanceMeterTextX, IlluminanceMeterTextY, TEXT("Illuminance meter - not available with Forward Shading"), GetStatsFont(), FLinearColor(1, 1, 1));
+			}
+			
+
+			const float LuminanceMeterTextX = Output.ViewRect.Min.X + Output.ViewRect.Size().X * 0.5f - 50.0f;
+			const float LuminanceMeterTextY = Output.ViewRect.Min.Y + Output.ViewRect.Size().Y * 0.5f - 30.0f;
+			Canvas.DrawShadowedString(LuminanceMeterTextX, LuminanceMeterTextY, TEXT("Luminance meter"), GetStatsFont(), FLinearColor(1, 1, 1));
 
 			AutoExposureBias += CurveExposureBias;
 		}

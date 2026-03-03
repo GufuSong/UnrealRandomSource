@@ -17,9 +17,18 @@ public class RHI : ModuleRules
 
 			if (Target.Type != TargetRules.TargetType.Server)   // Dedicated servers should skip loading everything but NullDrv
 			{
+				if (Target.Platform.IsInGroup(UnrealPlatformGroup.Desktop))
+                {
+					PublicDefinitions.Add("RHI_WANT_BREADCRUMB_EVENTS=1");
+				}
+
+				if (Target.Configuration != UnrealTargetConfiguration.Shipping && Target.Configuration != UnrealTargetConfiguration.Test)
+                {
+					PublicDefinitions.Add("RHI_WANT_RESOURCE_INFO=1");
+                }
+
 				// UEBuildAndroid.cs adds VulkanRHI for Android builds if it is enabled
-				if (Target.Platform == UnrealTargetPlatform.Win64 ||
-					Target.Platform == UnrealTargetPlatform.Win32)
+				if (Target.Platform.IsInGroup(UnrealPlatformGroup.Windows))
 				{
 					DynamicallyLoadedModuleNames.Add("D3D11RHI");
 				}
@@ -30,21 +39,13 @@ public class RHI : ModuleRules
 					DynamicallyLoadedModuleNames.Add("D3D12RHI");
 				}
 
-				if ((Target.Platform == UnrealTargetPlatform.HoloLens))
-				{
-					DynamicallyLoadedModuleNames.Add("D3D11RHI");
-					DynamicallyLoadedModuleNames.Add("D3D12RHI");
-				}
-
-				if ((Target.Platform == UnrealTargetPlatform.Win64) ||
-					(Target.Platform == UnrealTargetPlatform.Win32) ||
+				if ((Target.Platform.IsInGroup(UnrealPlatformGroup.Windows)) ||
 					(Target.IsInPlatformGroup(UnrealPlatformGroup.Unix) && (Target.Architecture.StartsWith("x86_64") || Target.Architecture.StartsWith("aarch64"))))	// temporary, not all archs can support Vulkan atm
 				{
 					DynamicallyLoadedModuleNames.Add("VulkanRHI");
 				}
 
-				if ((Target.Platform == UnrealTargetPlatform.Win32) ||
-					(Target.Platform == UnrealTargetPlatform.Win64) ||
+				if ((Target.Platform.IsInGroup(UnrealPlatformGroup.Windows)) ||
 					(Target.IsInPlatformGroup(UnrealPlatformGroup.Linux) && Target.Type != TargetRules.TargetType.Server))  // @todo should servers on all platforms skip this?
 				{
 					DynamicallyLoadedModuleNames.Add("OpenGLDrv");
@@ -56,9 +57,5 @@ public class RHI : ModuleRules
 		{
 			PrivateIncludePathModuleNames.AddRange(new string[] { "TaskGraph" });
 		}
-
-		PrivateIncludePaths.Add("Runtime/RHI/Private");
-
-        AddEngineThirdPartyPrivateStaticDependencies(Target, "GeForceNOW");
     }
 }

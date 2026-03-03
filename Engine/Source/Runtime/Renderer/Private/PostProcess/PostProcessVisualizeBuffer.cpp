@@ -2,8 +2,8 @@
 
 #include "PostProcess/PostProcessVisualizeBuffer.h"
 #include "HighResScreenshot.h"
-#include "PostProcessMaterial.h"
-#include "PostProcessDownsample.h"
+#include "PostProcess/PostProcessMaterial.h"
+#include "PostProcess/PostProcessDownsample.h"
 #include "ImagePixelData.h"
 #include "ImageWriteStream.h"
 #include "ImageWriteTask.h"
@@ -138,10 +138,13 @@ FScreenPassTexture AddVisualizeBufferPass(FRDGBuilder& GraphBuilder, const FView
 
 	AddDrawCanvasPass(GraphBuilder, RDG_EVENT_NAME("Labels"), View, Output, [LocalTileLabels = MoveTemp(TileLabels)](FCanvas& Canvas)
 	{
+		Canvas.SetBaseTransform(FMatrix(FScaleMatrix(Canvas.GetDPIScale()) * Canvas.CalcBaseTransform2D(Canvas.GetViewRect().Width(), Canvas.GetViewRect().Height())));
+
 		const FLinearColor LabelColor(1, 1, 0);
 		for (const FTileLabel& TileLabel : LocalTileLabels)
 		{
-			Canvas.DrawShadowedString(TileLabel.Location.X, TileLabel.Location.Y, *TileLabel.Label, GetStatsFont(), LabelColor);
+			const float DPIScale = Canvas.GetDPIScale();
+			Canvas.DrawShadowedString(TileLabel.Location.X / DPIScale, TileLabel.Location.Y / DPIScale, *TileLabel.Label, GetStatsFont(), LabelColor);
 		}
 	});
 
@@ -180,6 +183,8 @@ TUniquePtr<FImagePixelData> ReadbackPixelData(FRHICommandListImmediate& RHICmdLi
 	SourceRect.Min.X *= MSAAXSamples;
 	SourceRect.Max.X *= MSAAXSamples;
 
+	// todo: SourceRect is not clipped to Texture bounds
+
 	switch (Texture->GetFormat())
 	{
 	case PF_FloatRGBA:
@@ -194,6 +199,7 @@ TUniquePtr<FImagePixelData> ReadbackPixelData(FRHICommandListImmediate& RHICmdLi
 	}
 
 	case PF_A32B32G32R32F:
+	case PF_A2B10G10R10:
 	{
 		FReadSurfaceDataFlags ReadDataFlags(RCM_MinMax);
 		ReadDataFlags.SetLinearToGamma(false);
@@ -250,12 +256,19 @@ void AddDumpToFilePass(FRDGBuilder& GraphBuilder, FScreenPassTexture Input, cons
 
 	if (GIsHighResScreenshot && HighResScreenshotConfig.CaptureRegion.Area())
 	{
+		// todo: CaptureRegion is not clipped to Texture bounds
 		Input.ViewRect = HighResScreenshotConfig.CaptureRegion;
 	}
 
 	AddReadbackTexturePass(GraphBuilder, RDG_EVENT_NAME("DumpToFile(%s)", Input.Texture->Name), Input.Texture,
 		[&HighResScreenshotConfig, Input, Filename](FRHICommandListImmediate& RHICmdList)
 	{
+		// this is where HighResShot bDumpBufferVisualizationTargets are written to EXRs
+
+		// @todo Oodle alternative : use the exact same pixelformat that this buffer would have in the renderer
+		//	 use the DDS writer which can output arbitrary pixel formats
+		//	 do no format conversions so we dump the exact same bits the game renderer would see
+
 		TUniquePtr<FImagePixelData> PixelData = ReadbackPixelData(RHICmdList, Input.Texture->GetRHI(), Input.ViewRect);
 
 		if (!PixelData.IsValid())
@@ -274,28 +287,32 @@ void AddDumpToFilePass(FRDGBuilder& GraphBuilder, FScreenPassTexture Input, cons
 			// Always write full alpha
 			ImageTask->PixelPreProcessors.Add(TAsyncAlphaWrite<FColor>(255));
 
-			if (ImageTask->Format == EImageFormat::EXR)
-			{
-				// Write FColors with a gamma curve. This replicates behavior that previously existed in ExrImageWrapper.cpp (see following overloads) that assumed
-				// any 8 bit output format needed linearizing, but this is not a safe assumption to make at such a low level:
-				// void ExtractAndConvertChannel(const uint8*Src, uint32 SrcChannels, uint32 x, uint32 y, float* ChannelOUT)
-				// void ExtractAndConvertChannel(const uint8*Src, uint32 SrcChannels, uint32 x, uint32 y, FFloat16* ChannelOUT)
-				ImageTask->PixelPreProcessors.Add(TAsyncGammaCorrect<FColor>(2.2f));
-			}
+			// ImageTask->PixelData should be sRGB
+			//  it will gamma correct automatically if written to EXR
 		}
 
 		HighResScreenshotConfig.ImageWriteQueue->Enqueue(MoveTemp(ImageTask));
 	});
 }
 
-void AddDumpToColorArrayPass(FRDGBuilder& GraphBuilder, FScreenPassTexture Input, TArray<FColor>* OutputColorArray)
+void AddDumpToColorArrayPass(FRDGBuilder& GraphBuilder, FScreenPassTexture Input, TArray<FColor>* OutputColorArray, FIntPoint* OutputExtents)
 {
 	check(Input.IsValid());
 	check(OutputColorArray);
 	AddReadbackTexturePass(GraphBuilder, RDG_EVENT_NAME("DumpToPipe(%s)", Input.Texture->Name), Input.Texture,
-		[Input, OutputColorArray](FRHICommandListImmediate& RHICmdList)
+		[Input, OutputColorArray, OutputExtents](FRHICommandListImmediate& RHICmdList)
 	{
-		RHICmdList.ReadSurfaceData(Input.Texture->GetRHI(), Input.ViewRect, *OutputColorArray, FReadSurfaceDataFlags());
+		// By design, we want the whole surface, not the view rectangle, as this code is used for generating a screenshot
+		// mask surface that needs to match the corresponding screenshot color surface.  The scene may render as a viewport
+		// inside a larger surface, but the screenshot logic emits the entire surface, not just the viewport, and we must
+		// do the same for correct results (also to prevent an assert in FHighResScreenshotConfig::MergeMaskIntoAlpha).
+		// See FSceneView, UnscaledViewRect versus UnconstrainedViewRect.
+		FIntRect WholeSurfaceRect;
+		WholeSurfaceRect.Min = FIntPoint(0, 0);
+		WholeSurfaceRect.Max = Input.Texture->Desc.Extent;
+
+		RHICmdList.ReadSurfaceData(Input.Texture->GetRHI(), WholeSurfaceRect, *OutputColorArray, FReadSurfaceDataFlags());
+		*OutputExtents = Input.Texture->Desc.Extent;
 	});
 }
 
@@ -382,6 +399,7 @@ FScreenPassTexture AddVisualizeGBufferOverviewPass(
 				MaterialFilename = BaseFilename + TEXT("_") + MaterialName;
 			}
 
+			// always makes a .png filename even when bCaptureHDR was set, which will actually save an EXR
 			MaterialFilename.Append(TEXT(".png"));
 
 			AddDumpToFilePass(GraphBuilder, Output, MaterialFilename);

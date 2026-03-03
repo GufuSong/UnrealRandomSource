@@ -32,7 +32,7 @@ void SetShaderValue(
 {
 	static_assert(!TIsPointer<ParameterType>::Value, "Passing by value is not valid.");
 
-	const uint32 AlignedTypeSize = Align(sizeof(ParameterType), SHADER_PARAMETER_ARRAY_ELEMENT_ALIGNMENT);
+	const uint32 AlignedTypeSize = (uint32)Align(sizeof(ParameterType), SHADER_PARAMETER_ARRAY_ELEMENT_ALIGNMENT);
 	const int32 NumBytesToSet = FMath::Min<int32>(sizeof(ParameterType),Parameter.GetNumBytes() - ElementIndex * AlignedTypeSize);
 
 	// This will trigger if the parameter was not serialized
@@ -49,6 +49,7 @@ void SetShaderValue(
 			);
 	}
 }
+
 
 template<typename ShaderRHIParamRef, class ParameterType>
 void SetShaderValueOnContext(
@@ -79,53 +80,6 @@ void SetShaderValueOnContext(
 	}
 }
 
-
-
-/** Specialization of the above for C++ bool type. */
-template<typename ShaderRHIParamRef>
-UE_DEPRECATED(4.24, "Please use integer values for boolean shader parameters instead.")
-void SetShaderValue(
-	FRHICommandList& RHICmdList, 
-	const ShaderRHIParamRef& Shader,
-	const FShaderParameter& Parameter,
-	bool Value,
-	uint32 ElementIndex = 0
-	)
-{
-	const uint32 BoolValue = Value;
-	SetShaderValue(RHICmdList, Shader, Parameter, BoolValue, ElementIndex);
-}
-
-/** Specialization of the above for C++ bool type. */
-template<typename ShaderRHIParamRef>
-UE_DEPRECATED(4.24, "Please use integer values for boolean shader parameters instead.")
-void SetShaderValue(
-	FRHIComputeCommandList& RHICmdList,
-	const ShaderRHIParamRef& Shader,
-	const FShaderParameter& Parameter,
-	bool Value,
-	uint32 ElementIndex = 0
-	)
-{
-	const uint32 BoolValue = Value;
-	SetShaderValue(RHICmdList, Shader, Parameter, BoolValue, ElementIndex);
-}
-
-/** Specialization of the above for C++ bool type. */
-template<typename ShaderRHIParamRef>
-UE_DEPRECATED(4.24, "Please use integer values for boolean shader parameters instead.")
-void SetShaderValue(
-	FRHICommandListImmediate& RHICmdList,
-	const ShaderRHIParamRef& Shader,
-	const FShaderParameter& Parameter,
-	bool Value,
-	uint32 ElementIndex = 0
-	)
-{
-	const uint32 BoolValue = Value;
-	SetShaderValue(RHICmdList, Shader, Parameter, BoolValue, ElementIndex);
-}
-
 /**
  * Sets the value of a shader parameter array.  Template'd on shader type
  * A template parameter specified the type of the parameter value.
@@ -142,7 +96,7 @@ void SetShaderValueArray(
 	uint32 BaseElementIndex = 0
 	)
 {
-	const uint32 AlignedTypeSize = Align(sizeof(ParameterType), SHADER_PARAMETER_ARRAY_ELEMENT_ALIGNMENT);
+	const uint32 AlignedTypeSize = (uint32)Align(sizeof(ParameterType), SHADER_PARAMETER_ARRAY_ELEMENT_ALIGNMENT);
 	const int32 NumBytesToSet = FMath::Min<int32>(NumElements * AlignedTypeSize,Parameter.GetNumBytes() - BaseElementIndex * AlignedTypeSize);
 
 	// This will trigger if the parameter was not serialized
@@ -174,74 +128,86 @@ void SetShaderValueArray(
 	UE_LOG(LogShaders, Fatal, TEXT("SetShaderValueArray does not support bool arrays."));
 }
 
-/**
- * Sets the value of a pixel shader bool parameter.
- */
-UE_DEPRECATED(4.24, "Please use integer values for boolean shader parameters instead.")
-inline void SetPixelShaderBool(
-	FRHICommandList& RHICmdList, 
-	FRHIPixelShader* PixelShader,
-	const FShaderParameter& Parameter,
-	bool Value
-	)
-{
-	// This will trigger if the parameter was not serialized
-	checkSlow(Parameter.IsInitialized());
 
-	if (Parameter.GetNumBytes() > 0)
+// LWC_TODO: Setting guards to catch attempts to pass a type with double components. Could just convert these to the correct type internally, but would prefer to catch potential issues + optimize where possible.
+#define GUARD_SETSHADERVALUE(_TYPE)																																						\
+template<typename ShaderRHIParamRef, typename TRHICmdList>																																\
+void SetShaderValue(  TRHICmdList& RHICmdList,	const ShaderRHIParamRef& Shader, const FShaderParameter& Parameter,																		\
+	const _TYPE##d& Value, uint32 ElementIndex = 0) { static_assert(sizeof(ShaderRHIParamRef) == 0, "Passing unsupported "#_TYPE"d. Requires "#_TYPE"f"); }								\
+template<typename ShaderRHIParamRef>																																					\
+void SetShaderValueOnContext(IRHICommandContext& RHICmdListContext,	const ShaderRHIParamRef& Shader, const FShaderParameter& Parameter,													\
+	const _TYPE##d& Value, uint32 ElementIndex = 0) { static_assert(sizeof(ShaderRHIParamRef) == 0, "Passing unsupported "#_TYPE"d. Requires "#_TYPE"f"); }								\
+template<typename ShaderRHIParamRef, typename TRHICmdList>																																\
+void SetShaderValueArray(TRHICmdList& RHICmdList, const ShaderRHIParamRef& Shader, const FShaderParameter& Parameter,																	\
+	const _TYPE##d* Values, uint32 NumElements, uint32 BaseElementIndex = 0) { static_assert(sizeof(ShaderRHIParamRef) == 0, "Passing unsupported "#_TYPE"d*. Requires "#_TYPE"f*"); }	\
+
+// Primary
+GUARD_SETSHADERVALUE(FMatrix44)
+GUARD_SETSHADERVALUE(FVector2)
+GUARD_SETSHADERVALUE(FVector3)
+GUARD_SETSHADERVALUE(FVector4)
+GUARD_SETSHADERVALUE(FPlane4)
+GUARD_SETSHADERVALUE(FQuat4)
+// Secondary
+GUARD_SETSHADERVALUE(FSphere3)
+GUARD_SETSHADERVALUE(FBox3)
+
+template<typename TRHIShader, typename TRHICmdList>
+FORCEINLINE void SetBindlessParameter(TRHICmdList& RHICmdList, TRHIShader* Shader, const FShaderResourceParameter& Parameter, FRHIDescriptorHandle Handle)
+{
+	if (Handle.IsValid())
 	{
-		// Convert to uint32 before passing to RHI
-		uint32 BoolValue = Value;
-		RHICmdList.SetShaderParameter(
-			PixelShader,
-			Parameter.GetBufferIndex(),
-			Parameter.GetBaseIndex(),
-			sizeof(BoolValue),
-			&BoolValue
-			);
+		const uint32 BindlessIndex = Handle.GetIndex();
+		RHICmdList.SetShaderParameter(Shader, 0, Parameter.GetBaseIndex(), sizeof(BindlessIndex), &BindlessIndex);
 	}
 }
 
+
 /**
- * Sets the value of a shader texture parameter.  Template'd on shader type
+ * Sets the value of a shader surface parameter (e.g. to access MSAA samples).
+ * Template'd on shader type (e.g. pixel shader or compute shader).
  */
 template<typename TRHIShader, typename TRHICmdList>
-FORCEINLINE void SetTextureParameter(
-	TRHICmdList& RHICmdList,
-	TRHIShader* Shader,
-	const FShaderResourceParameter& TextureParameter,
-	const FShaderResourceParameter& SamplerParameter,
-	const FTexture* Texture,
-	uint32 ElementIndex = 0
-	)
+FORCEINLINE void SetTextureParameter(TRHICmdList& RHICmdList, TRHIShader* Shader, const FShaderResourceParameter& Parameter, FRHITexture* NewTextureRHI, uint32 ElementIndex = 0)
 {
-	// This will trigger if the parameter was not serialized
-	checkSlow(TextureParameter.IsInitialized());
-	checkSlow(SamplerParameter.IsInitialized());
-	if(TextureParameter.IsBound())
+	if (Parameter.IsBound() && ElementIndex < Parameter.GetNumResources())
 	{
-		Texture->LastRenderTime = FApp::GetCurrentTime();
-
-		if (ElementIndex < TextureParameter.GetNumResources())
+#if PLATFORM_SUPPORTS_BINDLESS_RENDERING
+		if (Parameter.GetType() == EShaderParameterType::BindlessResourceIndex)
 		{
-			RHICmdList.SetShaderTexture( Shader, TextureParameter.GetBaseIndex() + ElementIndex, Texture->TextureRHI);
+			const FRHIDescriptorHandle Handle = NewTextureRHI ? NewTextureRHI->GetDefaultBindlessHandle() : FRHIDescriptorHandle();
+			SetBindlessParameter(RHICmdList, Shader, Parameter, Handle);
 		}
-	}
-	
-	// @todo ue4 samplerstate Should we maybe pass in two separate values? SamplerElement and TextureElement? Or never allow an array of samplers? Unsure best
-	// if there is a matching sampler for this texture array index (ElementIndex), then set it. This will help with this case:
-	//			Texture2D LightMapTextures[NUM_LIGHTMAP_COEFFICIENTS];
-	//			SamplerState LightMapTexturesSampler;
-	// In this case, we only set LightMapTexturesSampler when ElementIndex is 0, we don't set the sampler state for all 4 textures
-	// This assumes that the all textures want to use the same sampler state
-	if(SamplerParameter.IsBound())
-	{
-		if (ElementIndex < SamplerParameter.GetNumResources())
+		else
+#endif
 		{
-			RHICmdList.SetShaderSampler( Shader, SamplerParameter.GetBaseIndex() + ElementIndex, Texture->SamplerStateRHI);
+			RHICmdList.SetShaderTexture(Shader, Parameter.GetBaseIndex() + ElementIndex, NewTextureRHI);
 		}
 	}
 }
+
+/**
+ * Sets the value of a shader sampler parameter. Template'd on shader type.
+ */
+template<typename TRHIShader, typename TRHICmdList>
+FORCEINLINE void SetSamplerParameter(TRHICmdList& RHICmdList, TRHIShader* Shader, const FShaderResourceParameter& Parameter, FRHISamplerState* SamplerStateRHI, uint32 ElementIndex = 0)
+{
+	if (Parameter.IsBound() && ElementIndex < Parameter.GetNumResources())
+	{
+#if PLATFORM_SUPPORTS_BINDLESS_RENDERING
+		if (Parameter.GetType() == EShaderParameterType::BindlessSamplerIndex)
+		{
+			const FRHIDescriptorHandle Handle = SamplerStateRHI ? SamplerStateRHI->GetBindlessHandle() : FRHIDescriptorHandle();
+			SetBindlessParameter(RHICmdList, Shader, Parameter, Handle);
+		}
+		else
+#endif
+		{
+			RHICmdList.SetShaderSampler(Shader, Parameter.GetBaseIndex() + ElementIndex, SamplerStateRHI);
+		}
+	}
+}
+
 
 /**
  * Sets the value of a shader texture parameter. Template'd on shader type.
@@ -257,72 +223,37 @@ FORCEINLINE void SetTextureParameter(
 	uint32 ElementIndex = 0
 	)
 {
-	// This will trigger if the parameter was not serialized
-	checkSlow(TextureParameter.IsInitialized());
-	checkSlow(SamplerParameter.IsInitialized());
-	if(TextureParameter.IsBound())
-	{
-		if (ElementIndex < TextureParameter.GetNumResources())
-		{
-			RHICmdList.SetShaderTexture( Shader, TextureParameter.GetBaseIndex() + ElementIndex, TextureRHI);
-		}
-	}
-	// @todo ue4 samplerstate Should we maybe pass in two separate values? SamplerElement and TextureElement? Or never allow an array of samplers? Unsure best
+	SetTextureParameter(RHICmdList, Shader, TextureParameter, TextureRHI, ElementIndex);
+	
+	// @todo UE samplerstate Should we maybe pass in two separate values? SamplerElement and TextureElement? Or never allow an array of samplers? Unsure best
 	// if there is a matching sampler for this texture array index (ElementIndex), then set it. This will help with this case:
 	//			Texture2D LightMapTextures[NUM_LIGHTMAP_COEFFICIENTS];
 	//			SamplerState LightMapTexturesSampler;
 	// In this case, we only set LightMapTexturesSampler when ElementIndex is 0, we don't set the sampler state for all 4 textures
 	// This assumes that the all textures want to use the same sampler state
-	if(SamplerParameter.IsBound())
-	{
-		if (ElementIndex < SamplerParameter.GetNumResources())
-		{
-			RHICmdList.SetShaderSampler( Shader, SamplerParameter.GetBaseIndex() + ElementIndex, SamplerStateRHI);
-		}
-	}
+
+	SetSamplerParameter(RHICmdList, Shader, SamplerParameter, SamplerStateRHI, ElementIndex);
 }
 
 /**
- * Sets the value of a shader surface parameter (e.g. to access MSAA samples).
- * Template'd on shader type (e.g. pixel shader or compute shader).
+ * Sets the value of a shader texture parameter.  Template'd on shader type
  */
 template<typename TRHIShader, typename TRHICmdList>
 FORCEINLINE void SetTextureParameter(
 	TRHICmdList& RHICmdList,
 	TRHIShader* Shader,
-	const FShaderResourceParameter& Parameter,
-	FRHITexture* NewTextureRHI
-	)
+	const FShaderResourceParameter& TextureParameter,
+	const FShaderResourceParameter& SamplerParameter,
+	const FTexture* Texture,
+	uint32 ElementIndex = 0
+)
 {
-	if(Parameter.IsBound())
+	if (TextureParameter.IsBound())
 	{
-		RHICmdList.SetShaderTexture(
-			Shader,
-			Parameter.GetBaseIndex(),
-			NewTextureRHI
-			);
+		Texture->LastRenderTime = FApp::GetCurrentTime();
 	}
-}
 
-/**
- * Sets the value of a shader sampler parameter. Template'd on shader type.
- */
-template<typename TRHIShader, typename TRHICmdList>
-FORCEINLINE void SetSamplerParameter(
-	TRHICmdList& RHICmdList,
-	TRHIShader* Shader,
-	const FShaderResourceParameter& Parameter,
-	FRHISamplerState* SamplerStateRHI
-	)
-{
-	if(Parameter.IsBound())
-	{
-		RHICmdList.SetShaderSampler(
-			Shader,
-			Parameter.GetBaseIndex(),
-			SamplerStateRHI
-			);
-	}
+	SetTextureParameter(RHICmdList, Shader, TextureParameter, SamplerParameter, Texture->SamplerStateRHI, Texture->TextureRHI, ElementIndex);
 }
 
 /**
@@ -337,13 +268,9 @@ FORCEINLINE void SetSRVParameter(
 	FRHIShaderResourceView* NewShaderResourceViewRHI
 	)
 {
-	if(Parameter.IsBound())
+	if (Parameter.IsBound())
 	{
-		RHICmdList.SetShaderResourceViewParameter(
-			Shader,
-			Parameter.GetBaseIndex(),
-			NewShaderResourceViewRHI
-			);
+		RHICmdList.SetShaderResourceViewParameter(Shader, Parameter.GetBaseIndex(), NewShaderResourceViewRHI);
 	}
 }
 
@@ -358,40 +285,31 @@ FORCEINLINE void SetSRVParameter(
 {
 	if (Parameter.IsBound())
 	{
-		RHICmdList.SetShaderResourceViewParameter(
-			Shader.GetReference(),
-			Parameter.GetBaseIndex(),
-			NewShaderResourceViewRHI
-		);
-	}
-}
-/**
- * Sets the value of a unordered access view parameter
- */
-template<typename TRHICmdList>
-FORCEINLINE void SetUAVParameter(
-	TRHICmdList& RHICmdList,
-	FRHIComputeShader* ComputeShader,
-	const FShaderResourceParameter& Parameter,
-	FRHIUnorderedAccessView* NewUnorderedAccessViewRHI
-	)
-{
-	if(Parameter.IsBound())
-	{
-		RHICmdList.SetUAVParameter(
-			ComputeShader,
-			Parameter.GetBaseIndex(),
-			NewUnorderedAccessViewRHI
-			);
+		RHICmdList.SetShaderResourceViewParameter(Shader.GetReference(), Parameter.GetBaseIndex(), NewShaderResourceViewRHI);
 	}
 }
 
 /**
  * Sets the value of a unordered access view parameter
  */
-template<typename TRHICmdList>
 FORCEINLINE void SetUAVParameter(
-	TRHICmdList& RHICmdList,
+	FRHIComputeCommandList& RHICmdList,
+	FRHIComputeShader* ComputeShader,
+	const FShaderResourceParameter& Parameter,
+	FRHIUnorderedAccessView* NewUnorderedAccessViewRHI
+	)
+{
+	if (Parameter.IsBound())
+	{
+		RHICmdList.SetUAVParameter(ComputeShader, Parameter.GetBaseIndex(), NewUnorderedAccessViewRHI);
+	}
+}
+
+/**
+ * Sets the value of a unordered access view parameter
+ */
+FORCEINLINE void SetUAVParameter(
+	FRHICommandList& RHICmdList,
 	FRHIPixelShader* PixelShader,
 	const FShaderResourceParameter& Parameter,
 	FRHIUnorderedAccessView* NewUnorderedAccessViewRHI
@@ -399,14 +317,9 @@ FORCEINLINE void SetUAVParameter(
 {
 	if (Parameter.IsBound())
 	{
-		RHICmdList.SetUAVParameter(
-			PixelShader,
-			Parameter.GetBaseIndex(),
-			NewUnorderedAccessViewRHI
-		);
+		RHICmdList.SetUAVParameter(PixelShader, Parameter.GetBaseIndex(), NewUnorderedAccessViewRHI);
 	}
 }
-
 
 
 template<typename TRHICmdList>
@@ -420,18 +333,6 @@ inline bool SetUAVParameterIfCS(TRHICmdList& RHICmdList, FRHIPixelShader* Shader
 {
 	SetUAVParameter(RHICmdList, Shader, UAVParameter, UAV);
 	return UAVParameter.IsBound();
-}
-
-template<typename TRHICmdList>
-inline bool SetUAVParameterIfCS(TRHICmdList& RHICmdList, FRHIHullShader* Shader, const FShaderResourceParameter& UAVParameter, FRHIUnorderedAccessView* UAV)
-{
-	return false;
-}
-
-template<typename TRHICmdList>
-inline bool SetUAVParameterIfCS(TRHICmdList& RHICmdList, FRHIDomainShader* Shader, const FShaderResourceParameter& UAVParameter, FRHIUnorderedAccessView* UAV)
-{
-	return false;
 }
 
 template<typename TRHICmdList>
@@ -482,9 +383,10 @@ inline void FRWShaderParameter::UnsetUAV(TRHICmdList& RHICmdList, FRHIComputeSha
 
 
 /** Sets the value of a shader uniform buffer parameter to a uniform buffer containing the struct. */
-template<typename TShaderRHIRef>
+template<typename TShaderRHIRef, typename TRHICmdList>
+UE_DEPRECATED(5.1, "Local uniform buffers are now deprecated. Use SetUniformBufferParameter instead.")
 inline void SetLocalUniformBufferParameter(
-	FRHICommandList& RHICmdList,
+	TRHICmdList& RHICmdList,
 	const TShaderRHIRef& Shader,
 	const FShaderUniformBufferParameter& Parameter,
 	const FLocalUniformBuffer& LocalUniformBuffer
@@ -494,7 +396,9 @@ inline void SetLocalUniformBufferParameter(
 	checkSlow(Parameter.IsInitialized());
 	if(Parameter.IsBound())
 	{
+	PRAGMA_DISABLE_DEPRECATION_WARNINGS
 		RHICmdList.SetLocalShaderUniformBuffer(Shader, Parameter.GetBaseIndex(), LocalUniformBuffer);
+	PRAGMA_ENABLE_DEPRECATION_WARNINGS
 	}
 }
 
@@ -571,8 +475,8 @@ inline void SetUniformBufferParameterImmediate(
 		RHICmdList.SetShaderUniformBuffer(
 			Shader,
 			Parameter.GetBaseIndex(),
-			RHICreateUniformBuffer(&UniformBufferValue,TBufferStruct::StaticStructMetadata.GetLayout(),UniformBuffer_SingleDraw)
-			);
+			RHICreateUniformBuffer(&UniformBufferValue, &TBufferStruct::StaticStructMetadata.GetLayout(), UniformBuffer_SingleDraw)
+		);
 	}
 }
 
@@ -592,7 +496,7 @@ inline void SetUniformBufferParameterImmediate(
 		RHICmdList.SetShaderUniformBuffer(
 			Shader,
 			Parameter.GetBaseIndex(),
-			RHICreateUniformBuffer(&UniformBufferValue,TBufferStruct::StaticStructMetadata.GetLayout(),UniformBuffer_SingleDraw)
-			);
+			RHICreateUniformBuffer(&UniformBufferValue, &TBufferStruct::StaticStructMetadata.GetLayout(), UniformBuffer_SingleDraw)
+		);
 	}
 }

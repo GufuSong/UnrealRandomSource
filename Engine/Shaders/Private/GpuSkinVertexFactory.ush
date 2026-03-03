@@ -8,6 +8,7 @@
 #include "VertexFactoryCommon.ush"
 #include "GpuSkinCommon.ush"
 
+// Whether the material supports morph targets
 #ifndef GPUSKIN_MORPH_BLEND
 #define GPUSKIN_MORPH_BLEND 0
 #endif
@@ -15,9 +16,12 @@
 #ifndef GPUSKIN_APEX_CLOTH
 #define GPUSKIN_APEX_CLOTH 0
 #endif
+#ifndef GPUSKIN_APEX_CLOTH_PREVIOUS
+#define GPUSKIN_APEX_CLOTH_PREVIOUS 0
+#endif
 
 #ifndef GPUSKIN_LIMIT_2BONE_INFLUENCES
-#define GPUSKIN_LIMIT_2BONE_INFLUENCES	0 // default is 4 bones
+#define GPUSKIN_LIMIT_2BONE_INFLUENCES	0 // default is 4 bones 
 #endif
 
 #ifndef GPUSKIN_UNLIMITED_BONE_INFLUENCE
@@ -25,16 +29,27 @@
 #endif
 
 #ifndef GPUSKIN_USE_BONES_SRV_BUFFER
-#define GPUSKIN_USE_BONES_SRV_BUFFER	0	// Use a Buffer<float4> if 1, otherwise a uniform buffer  
-#endif
-
-#ifndef GPUSKIN_MULTIPLE_CLOTH_INFLUENCES
-#define GPUSKIN_MULTIPLE_CLOTH_INFLUENCES 0
+#define GPUSKIN_USE_BONES_SRV_BUFFER	0	// Use a Buffer<float4> if 1, otherwise a uniform buffer   
 #endif
 
 #define MAX_INFLUENCES_PER_STREAM	4
 
 #define FIXED_VERTEX_INDEX 0xFFFF
+
+// Whether this is a morph target
+#if GPUSKIN_MORPH_BLEND
+uint bIsMorphTarget;
+#endif
+
+bool IsMorphTarget()
+{
+#if GPUSKIN_MORPH_BLEND
+	return bIsMorphTarget;
+#else
+	// When Morph targets are not supported on the material, always return false so the associated shader code can be compiled out.
+	return false;
+#endif
+}
 
 // if the per bone motion blur is enabled for this draw call
 uint PerBoneMotionBlur;
@@ -43,15 +58,15 @@ uint NumBoneInfluencesParam;
 
 #if GPUSKIN_APEX_CLOTH
 /** Vertex buffer from which to read simulated positions of clothing. */
-#if FEATURE_LEVEL >= FEATURE_LEVEL_SM4
 Buffer<float2> ClothSimulVertsPositionsNormals;
-Buffer<float2> PreviousClothSimulVertsPositionsNormals;
-/** Transform to apply when positions/normals are loaded */
-float4x4 ClothLocalToWorld;
-float4x4 PreviousClothLocalToWorld;
-#endif // #if FEATURE_LEVEL >= FEATURE_LEVEL_SM4
+/** Transform from cloth space (relative to cloth root bone) to local(component) space */
+float4x4 ClothToLocal;
 /** blend weight between simulated positions and original key-framed animation */
 float ClothBlendWeight;
+#if GPUSKIN_APEX_CLOTH_PREVIOUS
+Buffer<float2> PreviousClothSimulVertsPositionsNormals;
+float4x4 PreviousClothToLocal;
+#endif //GPUSKIN_APEX_CLOTH_PREVIOUS
 #endif// #if GPUSKIN_APEX_CLOTH
 
 #if GPUSKIN_UNLIMITED_BONE_INFLUENCE
@@ -63,10 +78,10 @@ struct FVertexFactoryInput
 {
 	float4	Position		: ATTRIBUTE0;
 	// 0..1
-	half3	TangentX		: ATTRIBUTE1;
+	HALF3_TYPE	TangentX		: ATTRIBUTE1;
 	// 0..1
 	// TangentZ.w contains sign of tangent basis determinant
-	half4	TangentZ		: ATTRIBUTE2;	
+	HALF4_TYPE	TangentZ		: ATTRIBUTE2;	
 
 #if GPUSKIN_UNLIMITED_BONE_INFLUENCE
 	uint	BlendOffsetCount	: ATTRIBUTE3;
@@ -77,15 +92,23 @@ struct FVertexFactoryInput
 	float4	BlendWeightsExtra	: ATTRIBUTE15;
 #endif // GPUSKIN_UNLIMITED_BONE_INFLUENCE
 
-
 #if NUM_MATERIAL_TEXCOORDS_VERTEX
-	// If this changes make sure to update LocalVertexFactory.usf
-	float2	TexCoords[NUM_MATERIAL_TEXCOORDS_VERTEX] : ATTRIBUTE5;
+#if NUM_MATERIAL_TEXCOORDS_VERTEX > 1
+	float4	TexCoords0 : ATTRIBUTE5;
+#elif NUM_MATERIAL_TEXCOORDS_VERTEX == 1
+	float2	TexCoords0 : ATTRIBUTE5;
+#endif
+
+#if NUM_MATERIAL_TEXCOORDS_VERTEX > 3
+	float4	TexCoords1 : ATTRIBUTE6;
+#elif NUM_MATERIAL_TEXCOORDS_VERTEX == 3
+	float2	TexCoords1 : ATTRIBUTE6;
+#endif
 
 	#if NUM_MATERIAL_TEXCOORDS_VERTEX > 4
 		#error Too many texture coordinate sets defined on GPUSkin vertex input. Max: 4.
 	#endif
-#endif
+#endif // NUM_MATERIAL_TEXCOORDS_VERTEX
 
 #if GPUSKIN_MORPH_BLEND
 	// NOTE: TEXCOORD6,TEXCOORD7 used instead of POSITION1,NORMAL1 since those semantics are not supported by Cg 
@@ -95,28 +118,27 @@ struct FVertexFactoryInput
 	float3	DeltaTangentZ	: ATTRIBUTE10;	//NORMAL1;
 #endif
 
-	float3 PreSkinOffset : ATTRIBUTE11;
-	float3 PostSkinOffset : ATTRIBUTE12;
-
-#if GPUSKIN_APEX_CLOTH
-	uint ClothVertexID : SV_VertexID;
+#if GPUSKIN_MORPH_BLEND || GPUSKIN_APEX_CLOTH
+	uint VertexID : SV_VertexID;
 #endif
 
 	/** Per vertex color */
 	float4 Color : ATTRIBUTE13;
+
+	// Dynamic instancing related attributes with InstanceIdOffset : ATTRIBUTE16
+	VF_GPUSCENE_DECLARE_INPUT_BLOCK(16)
+	VF_INSTANCED_STEREO_DECLARE_INPUT_BLOCK()
 };
 
-#if !GPUSKIN_MORPH_BLEND && GPUSKIN_APEX_CLOTH
+#if GPUSKIN_APEX_CLOTH
 // .x = Draw Index Buffer offset, .y = Offset into Cloth Vertex Buffer
 uint2 GPUSkinApexClothStartIndexOffset;
 
-#if GPUSKIN_MULTIPLE_CLOTH_INFLUENCES
 // This must match NUM_INFLUENCES_PER_VERTEX in ClothingMeshUtils.cpp and GpuSkinCacheComputeShader.usf
+// It represents the maximum number of influences so perhaps should be renamed. Right now we are keeping the name matching for easy search.
 // TODO: Make this easier to change in without messing things up
 #define NUM_INFLUENCES_PER_VERTEX 5
-#else
-#define NUM_INFLUENCES_PER_VERTEX 1
-#endif
+uint ClothNumInfluencesPerVertex;
 
 struct FClothVertex
 {
@@ -149,11 +171,14 @@ Buffer<float4> GPUSkinApexCloth;
 
 void SetupClothVertex(uint VertexIndex, out FClothVertex ClothVertexInfluences[NUM_INFLUENCES_PER_VERTEX])
 {
-    VertexIndex = VertexIndex + GPUSkinApexClothStartIndexOffset.y - GPUSkinApexClothStartIndexOffset.x;
+	const uint MinVertexIndex = GPUSkinApexClothStartIndexOffset.x;
+	const uint ClothIndexOffset = GPUSkinApexClothStartIndexOffset.y;
+    VertexIndex = ClothNumInfluencesPerVertex * (VertexIndex - MinVertexIndex) + ClothIndexOffset;
 
-    for (int i = 0; i < NUM_INFLUENCES_PER_VERTEX; ++i )
+    UNROLL_N(NUM_INFLUENCES_PER_VERTEX)
+	for (int i = 0; i < ClothNumInfluencesPerVertex; ++i )
     {
-        uint Offset = (NUM_INFLUENCES_PER_VERTEX * VertexIndex + i) * NUM_FLOAT4S_PER_VERTEX_INFLUENCE;
+        const uint Offset = (VertexIndex + i) * NUM_FLOAT4S_PER_VERTEX_INFLUENCE;
 
         ClothVertexInfluences[i].BaryCoordPos = GPUSkinApexCloth[Offset];
         ClothVertexInfluences[i].BaryCoordNormal = GPUSkinApexCloth[Offset + 1];
@@ -177,18 +202,44 @@ struct FVertexFactoryInterpolantsVSToPS
 #endif
 
 #if NUM_TEX_COORD_INTERPOLATORS
-	float2	TexCoords[NUM_TEX_COORD_INTERPOLATORS]	: TEXCOORD0;
+	// Pack interpolators to reduce the number of semantics used
+	float4	TexCoords[(NUM_TEX_COORD_INTERPOLATORS+1)/2]	: TEXCOORD0;
 #endif
 
 #if INSTANCED_STEREO
 	nointerpolation uint EyeIndex : PACKED_EYE_INDEX;
 #endif
+
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	nointerpolation uint PrimitiveId : PRIMITIVE_ID;
+#endif
 };
 
-struct FVertexFactoryInterpolantsVSToDS
+struct FVertexFactoryRayTracingInterpolants
 {
 	FVertexFactoryInterpolantsVSToPS InterpolantsVSToPS;
 };
+
+#if NUM_TEX_COORD_INTERPOLATORS
+float2 GetUV(FVertexFactoryInterpolantsVSToPS Interpolants, int UVIndex)
+{
+	float4 UVVector = Interpolants.TexCoords[UVIndex / 2];
+	return UVIndex % 2 ? UVVector.zw : UVVector.xy;
+}
+
+void SetUV(inout FVertexFactoryInterpolantsVSToPS Interpolants, int UVIndex, float2 InValue)
+{
+	FLATTEN
+	if (UVIndex % 2)
+	{
+		Interpolants.TexCoords[UVIndex / 2].zw = InValue;
+	}
+	else
+	{
+		Interpolants.TexCoords[UVIndex / 2].xy = InValue;
+	}
+}
+#endif
 
 /** Converts from vertex factory specific interpolants to a FMaterialPixelParameters, which is used by material inputs. */
 FMaterialPixelParameters GetMaterialPixelParameters(FVertexFactoryInterpolantsVSToPS Interpolants, float4 SvPosition)
@@ -196,11 +247,11 @@ FMaterialPixelParameters GetMaterialPixelParameters(FVertexFactoryInterpolantsVS
 	// GetMaterialPixelParameters is responsible for fully initializing the result
 	FMaterialPixelParameters Result = MakeInitializedMaterialPixelParameters();
 
-#if NUM_TEX_COORD_INTERPOLATORS	
+#if NUM_TEX_COORD_INTERPOLATORS
 	UNROLL
 	for(int CoordinateIndex = 0;CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS;CoordinateIndex++)
 	{
-		Result.TexCoords[CoordinateIndex] = Interpolants.TexCoords[CoordinateIndex];
+		Result.TexCoords[CoordinateIndex] = GetUV(Interpolants, CoordinateIndex);
 	}
 #endif
 
@@ -217,6 +268,11 @@ FMaterialPixelParameters GetMaterialPixelParameters(FVertexFactoryInterpolantsVS
 	Result.VertexColor = 0;
 #endif
 	Result.TwoSidedSign = 1;
+
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	Result.PrimitiveId = Interpolants.PrimitiveId;
+#endif
+
 	return Result;
 }
 
@@ -234,6 +290,13 @@ STRONG_TYPE Buffer<float4> PreviousBoneMatrices;
 // Cache data to avoid multiple calculation 
 struct FVertexFactoryIntermediates
 {
+	float3 InvNonUniformScale;
+	float DeterminantSign;
+
+	FLWCMatrix LocalToWorld;
+	FLWCInverseMatrix WorldToLocal;
+	FLWCMatrix PrevLocalToWorld;
+
 	// Blend Matrix (used for position/tangents)
 	FBoneMatrix BlendMatrix;
 
@@ -248,37 +311,57 @@ struct FVertexFactoryIntermediates
 
 #if GPUSKIN_APEX_CLOTH
 	// in world space (non translated)
-	float3 SimulatedPosition;
+	float4 SimulatedPosition;
 	// in world space (non translated)
-	float3 PreviousSimulatedPosition;
+	float4 PreviousSimulatedPosition;
 	
 	FClothVertex ClothVertexInfluences[NUM_INFLUENCES_PER_VERTEX];
 #endif
-
+	/** Cached primitive and instance data */
+	FSceneDataIntermediates SceneData;
 };
+
+FPrimitiveSceneData GetPrimitiveData(FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.SceneData.Primitive;
+}
+
+FInstanceSceneData GetInstanceData(FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.SceneData.InstanceData;
+}
 
 /** Converts from vertex factory specific input to a FMaterialVertexParameters, which is used by vertex shader material inputs. */
 FMaterialVertexParameters GetMaterialVertexParameters(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float3 WorldPosition, float3x3 TangentToLocal)
 {
 	FMaterialVertexParameters Result = (FMaterialVertexParameters)0;
+	Result.SceneData = Intermediates.SceneData;
 	Result.WorldPosition = WorldPosition;
 	Result.VertexColor = Intermediates.Color;
-	Result.TangentToWorld = mul(TangentToLocal, GetLocalToWorld3x3());
+	Result.TangentToWorld = mul(TangentToLocal, LWCToFloat3x3(Intermediates.LocalToWorld));
 	Result.PreSkinnedPosition = Intermediates.UnpackedPosition.xyz;
 	Result.PreSkinnedNormal = Input.TangentZ.xyz;
 
-	Result.PreSkinOffset = Input.PreSkinOffset;
-	Result.PostSkinOffset = Input.PostSkinOffset;
-
 	// Assumes no instacing
-	Result.PrevFrameLocalToWorld = Primitive.PreviousLocalToWorld;
+	Result.PrevFrameLocalToWorld = Intermediates.PrevLocalToWorld;
 
 #if NUM_MATERIAL_TEXCOORDS_VERTEX
-	for(int CoordinateIndex = 0; CoordinateIndex < NUM_MATERIAL_TEXCOORDS_VERTEX; CoordinateIndex++)
-	{
-		Result.TexCoords[CoordinateIndex] = Input.TexCoords[CoordinateIndex];
-	}
+
+#if NUM_MATERIAL_TEXCOORDS_VERTEX > 0
+	Result.TexCoords[0] = Input.TexCoords0.xy;
 #endif
+#if NUM_MATERIAL_TEXCOORDS_VERTEX > 1
+	Result.TexCoords[1] = Input.TexCoords0.zw;
+#endif
+#if NUM_MATERIAL_TEXCOORDS_VERTEX > 2
+	Result.TexCoords[2] = Input.TexCoords1.xy;
+#endif
+#if NUM_MATERIAL_TEXCOORDS_VERTEX > 3
+	Result.TexCoords[3] = Input.TexCoords1.zw;
+#endif
+
+#endif
+
 	return Result;
 }
 
@@ -290,53 +373,54 @@ bool IsSimulatedVertex(FClothVertex Input)
 	return (Input.SimulIndices.w < FIXED_VERTEX_INDEX);
 }
 
+float GetClothSimulWeight(uint StaticAlpha)
+{
+	return 1.0f - (StaticAlpha / 65535.0f);
+}
+
 float3 GetClothSimulPosition(int Index, bool bPrevious)
 {
-#if FEATURE_LEVEL >= FEATURE_LEVEL_SM4
 	float3 Position;
+#if GPUSKIN_APEX_CLOTH_PREVIOUS
 	if(bPrevious)
 	{
-		Position = float3(PreviousClothSimulVertsPositionsNormals[Index * 3], PreviousClothSimulVertsPositionsNormals[Index * 3 + 1].x);
-		return float3(mul(float4(Position, 1), PreviousClothLocalToWorld).xyz);
+		return float3(PreviousClothSimulVertsPositionsNormals[Index * 3], PreviousClothSimulVertsPositionsNormals[Index * 3 + 1].x);
 	}
 	else
+#endif
 	{
-		Position = float3(ClothSimulVertsPositionsNormals[Index * 3], ClothSimulVertsPositionsNormals[Index * 3 + 1].x);
-		return float3(mul(float4(Position, 1), ClothLocalToWorld).xyz);
+		return float3(ClothSimulVertsPositionsNormals[Index * 3], ClothSimulVertsPositionsNormals[Index * 3 + 1].x);
 	}
-	
-#endif //FEATURE_LEVEL >= FEATURE_LEVEL_SM4
 }
 
 float3 GetClothSimulNormal(int Index, bool bPrevious)
 {
-#if FEATURE_LEVEL >= FEATURE_LEVEL_SM4
 	float3 Normal;
+#if GPUSKIN_APEX_CLOTH_PREVIOUS
 	if(bPrevious)
 	{
-		Normal = float3(PreviousClothSimulVertsPositionsNormals[Index * 3 + 1].y, PreviousClothSimulVertsPositionsNormals[Index * 3 + 2]);
-		return float3(mul(float4(Normal, 0), PreviousClothLocalToWorld).xyz);
+		return float3(PreviousClothSimulVertsPositionsNormals[Index * 3 + 1].y, PreviousClothSimulVertsPositionsNormals[Index * 3 + 2]);
 	}
 	else
+#endif
 	{
-		Normal = float3(ClothSimulVertsPositionsNormals[Index * 3 + 1].y, ClothSimulVertsPositionsNormals[Index * 3 + 2]);
-		return float3(mul(float4(Normal, 0), ClothLocalToWorld).xyz);
+		return float3(ClothSimulVertsPositionsNormals[Index * 3 + 1].y, ClothSimulVertsPositionsNormals[Index * 3 + 2]);
 	}
-	
-#endif //FEATURE_LEVEL >= FEATURE_LEVEL_SM4
 }
 
-float3 ClothingPosition(FClothVertex ClothVertexInfluences[NUM_INFLUENCES_PER_VERTEX], bool bPrevious)
+float4 ClothingPosition(FClothVertex ClothVertexInfluences[NUM_INFLUENCES_PER_VERTEX], bool bPrevious)
 {
 	int NumInfluences = 0;
 	float SumWeights = 0.0f;
+	float SimulWeight = 0.0f; 
 	float3 AveragedSimulatedPosition = float3(0, 0, 0);
-	
-    for (int i = 0; i < NUM_INFLUENCES_PER_VERTEX; ++i )
+
+	UNROLL_N(NUM_INFLUENCES_PER_VERTEX)
+    for (int i = 0; i < ClothNumInfluencesPerVertex; ++i )
     {
         const FClothVertex Influence = ClothVertexInfluences[i];
 
-	    if( Influence.SimulIndices.w < 0xFFFF )
+	    if( IsSimulatedVertex(Influence) )
 	    { 
             ++NumInfluences;
 
@@ -348,10 +432,11 @@ float3 ClothingPosition(FClothVertex ClothVertexInfluences[NUM_INFLUENCES_PER_VE
 		    float3 NB = GetClothSimulNormal(Influence.SimulIndices.y, bPrevious);
 		    float3 NC = GetClothSimulNormal(Influence.SimulIndices.z, bPrevious);
 
+	    	SimulWeight += GetClothSimulWeight(Influence.SimulIndices.w);
+	    	
 			float Weight = 1.0f;
-			if ( NUM_INFLUENCES_PER_VERTEX > 1 )
+			if ( ClothNumInfluencesPerVertex > 1 )
 			{
-				// Weight is packed in the last coordinate
 				Weight = Influence.Weight;
 				SumWeights += Weight;
 			}
@@ -382,9 +467,15 @@ float3 ClothingPosition(FClothVertex ClothVertexInfluences[NUM_INFLUENCES_PER_VE
 	else
 	{
 		AveragedSimulatedPosition = float3(0, 0, 0);
+		SimulWeight = 0.0f;			// Fall back to skinned vertex position by setting this lerp param to zero
 	}
 
-	return AveragedSimulatedPosition;
+	if (ClothNumInfluencesPerVertex > 1)
+	{
+		SimulWeight /= ClothNumInfluencesPerVertex;
+	}
+
+	return float4(AveragedSimulatedPosition, SimulWeight);
 }
 
 #endif //#if GPUSKIN_APEX_CLOTH
@@ -398,6 +489,10 @@ float3 UnpackedPosition( FVertexFactoryInput Input )
 }
 
 #if GPUSKIN_MORPH_BLEND
+#if GPUSKIN_MORPH_USE_PREVIOUS
+Buffer<float> PreviousMorphBuffer;
+#endif
+
 /** 
 * Adds the delta position from the combined morph targets to the vertex position 
 */
@@ -405,7 +500,24 @@ float3 MorphPosition( FVertexFactoryInput Input, FVertexFactoryIntermediates Int
 {
 	return Intermediates.UnpackedPosition + Input.DeltaPosition;
 }
+
+float3 MorphPreviousPosition( FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates )
+{
+#if GPUSKIN_MORPH_USE_PREVIOUS
+	// 3 + 3 floats because of the format defined in InitMorphVertexFactoryComponents / FMorphGPUSkinVertex
+	uint Offset = Input.VertexID * (3 + 3);
+
+	float3 PreviousDeltaPosition = float3(
+		PreviousMorphBuffer[Offset + 0],
+		PreviousMorphBuffer[Offset + 1],
+		PreviousMorphBuffer[Offset + 2]);
+
+	return Intermediates.UnpackedPosition + PreviousDeltaPosition;
+#else
+	return Intermediates.UnpackedPosition + Input.DeltaPosition;
 #endif
+}
+#endif // GPUSKIN_MORPH_BLEND
 
 FBoneMatrix GetBoneMatrix(int Index)
 {
@@ -524,19 +636,21 @@ FBoneMatrix CalcPreviousBoneMatrix( FVertexFactoryInput Input )
 /** transform position by weighted sum of skinning matrices */
 float3 SkinPosition( FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates )
 {
-#if GPUSKIN_MORPH_BLEND
-	float3 Position = MorphPosition(Input, Intermediates);
-#else
-	float3 Position = Intermediates.UnpackedPosition;
-#endif
-
-	Position += Input.PreSkinOffset;
+	float3 Position;
+	if (IsMorphTarget())
+	{
+	#if GPUSKIN_MORPH_BLEND
+		Position = MorphPosition(Input, Intermediates);
+	#endif
+	}
+	else
+	{
+		Position = Intermediates.UnpackedPosition;
+	}
 
 	// Note the use of mul(Matrix,Vector), bone matrices are stored transposed
 	// for tighter packing.
 	Position = mul(Intermediates.BlendMatrix, float4(Position, 1));
-
-	Position += Input.PostSkinOffset;
 
 	return Position;
 }
@@ -544,11 +658,17 @@ float3 SkinPosition( FVertexFactoryInput Input, FVertexFactoryIntermediates Inte
 /** transform position by weighted sum of skinning matrices */
 float3 SkinPreviousPosition( FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates )
 {
-#if GPUSKIN_MORPH_BLEND
-	float3 Position = MorphPosition(Input, Intermediates);
-#else
-	float3 Position = Intermediates.UnpackedPosition;
-#endif
+	float3 Position;
+	if (IsMorphTarget())
+	{
+	#if GPUSKIN_MORPH_BLEND
+		Position = MorphPreviousPosition(Input, Intermediates);
+	#endif
+	}
+	else
+	{
+		Position = Intermediates.UnpackedPosition;
+	}
 
 	FBoneMatrix BlendMatrix = Intermediates.BlendMatrix;
 	
@@ -559,13 +679,9 @@ float3 SkinPreviousPosition( FVertexFactoryInput Input, FVertexFactoryIntermedia
 		BlendMatrix = CalcPreviousBoneMatrix( Input );
 	}
 
-	Position += Input.PreSkinOffset;
-
 	// Note the use of mul(Matrix,Vector), bone matrices are stored transposed
 	// for tighter packing.
 	Position = mul(BlendMatrix, float4(Position, 1));
-
-	Position += Input.PostSkinOffset;
 
 	return Position;
 }
@@ -580,15 +696,7 @@ float3x3 SkinTangents( FVertexFactoryInput Input, FVertexFactoryIntermediates In
 	// -1..1 .xyz:normal, .w:contains sign of tangent basis determinant (left or right handed)
 	half4 LocalTangentZ = Input.TangentZ;
 
-#if GPUSKIN_MORPH_BLEND
-	// calc new normal by offseting it with the delta
-	LocalTangentZ.xyz = normalize(LocalTangentZ.xyz + Input.DeltaTangentZ);
-	// derive the new tangent by orthonormalizing the new normal against
-	// the base tangent vector (assuming these are normalized)
-	LocalTangentX = normalize(LocalTangentX - dot(LocalTangentX, LocalTangentZ.xyz) * LocalTangentZ.xyz);
-#else
-	#if GPUSKIN_APEX_CLOTH
-
+#if GPUSKIN_APEX_CLOTH
 	float3x3 ClothTangent = float3x3(1,0,0, 0,1,0, 0,0,1);
 	float TempClothBlendWeight = 0.0f;
 
@@ -601,12 +709,13 @@ float3x3 SkinTangents( FVertexFactoryInput Input, FVertexFactoryIntermediates In
         float3 TangentPosition = float3(0,0,0);
         int NumInfluences = 0;
 	    float SumWeights = 0.0;
+		float SimulWeight = 0.0;
 
-        for (int i = 0; i < NUM_INFLUENCES_PER_VERTEX; ++i )
+        for (int i = 0; i < ClothNumInfluencesPerVertex; ++i )
         {
             const FClothVertex Influence = Intermediates.ClothVertexInfluences[i];
 
-	        if( Influence.SimulIndices.w < 0xFFFF )
+	        if( IsSimulatedVertex(Influence) )
 	        { 
                 ++NumInfluences;
 		        TempClothBlendWeight = ClothBlendWeight;
@@ -619,8 +728,10 @@ float3x3 SkinTangents( FVertexFactoryInput Input, FVertexFactoryIntermediates In
 		        float3 NB = GetClothSimulNormal(Influence.SimulIndices.y, bPrevious);
 		        float3 NC = GetClothSimulNormal(Influence.SimulIndices.z, bPrevious);
 
+	        	SimulWeight += GetClothSimulWeight(Influence.SimulIndices.w);
+	        	
 			    float Weight = 1.0f;
-			    if ( NUM_INFLUENCES_PER_VERTEX > 1 )
+			    if ( ClothNumInfluencesPerVertex > 1 )
 			    {
 				    // Weight is packed in the last coordinate
 				    Weight = Influence.Weight;
@@ -643,43 +754,59 @@ float3x3 SkinTangents( FVertexFactoryInput Input, FVertexFactoryIntermediates In
 	        }
         }
 
+		if (ClothNumInfluencesPerVertex > 1)
+		{
+			SimulWeight /= ClothNumInfluencesPerVertex;
+		}
+	
         if ( NumInfluences > 0 && SumWeights > 1e-4f )
         {
 		    float InvWeight = 1.0f / SumWeights; 
             TangentPosition *= InvWeight;
             NormalPosition *= InvWeight;
 
-		    TangentToLocal[0] = normalize(TangentPosition - Intermediates.SimulatedPosition);
-		    TangentToLocal[2] = normalize(NormalPosition - Intermediates.SimulatedPosition);
+		    TangentToLocal[0] = normalize(TangentPosition - Intermediates.SimulatedPosition.xyz);
+		    TangentToLocal[2] = normalize(NormalPosition - Intermediates.SimulatedPosition.xyz);
 
-		    // cloth data are all in world space so need to change into local space
-		    TangentToLocal[0] = mul(TangentToLocal[0], (half3x3)Primitive.WorldToLocal);
-		    TangentToLocal[2] = mul(TangentToLocal[2], (half3x3)Primitive.WorldToLocal);
+			// Simulated cloth data are in cloth space so need to change into local space
+			TangentToLocal[0] = mul(float4(TangentToLocal[0], 0.0f), ClothToLocal).xyz;
+			TangentToLocal[2] = mul(float4(TangentToLocal[2], 0.0f), ClothToLocal).xyz;
+	
+			// derive the new binormal by getting the cross product of the normal and tangent
+			// and flip vector based on sign of tangent basis determinant
+			TangentToLocal[1] = cross(TangentToLocal[2], TangentToLocal[0]) * LocalTangentZ.w;
+	
+			ClothTangent = TangentToLocal;
         }
 	    else
 	    {
-		    Intermediates.SimulatedPosition = float3(0, 0, 0);
-		    TempClothBlendWeight = 0.0f;
+		    SimulWeight = 0.0f;			// Fall back to skinned data by setting this lerp param to zero
 	    }
 
-		// derive the new binormal by getting the cross product of the normal and tangent
-		// and flip vector based on sign of tangent basis determinant
-		TangentToLocal[1] = cross(TangentToLocal[2], TangentToLocal[0]) * LocalTangentZ.w;
-	
-		ClothTangent = TangentToLocal;
+		TempClothBlendWeight *= SimulWeight;
 	}
-	#endif // GPUSKIN_APEX_CLOTH
+#else
+	if (IsMorphTarget())
+	{
+#if GPUSKIN_MORPH_BLEND
+		// calc new normal by offseting it with the delta
+		LocalTangentZ.xyz = normalize(LocalTangentZ.xyz + Input.DeltaTangentZ);
+		// derive the new tangent by orthonormalizing the new normal against
+		// the base tangent vector (assuming these are normalized)
+		LocalTangentX = normalize(LocalTangentX - dot(LocalTangentX, LocalTangentZ.xyz) * LocalTangentZ.xyz);
+#endif
+	}
+#endif // GPUSKIN_APEX_CLOTH
 
-#endif // GPUSKIN_MORPH_BLEND
 
 	// Note the use of mul(Matrix,Vector), bone matrices are stored transposed
 	// for tighter packing.
-	TangentToLocal[0] = mul( Intermediates.BlendMatrix, float4(LocalTangentX, 0) );
-	TangentToLocal[2] = mul( Intermediates.BlendMatrix, float4(LocalTangentZ.xyz, 0) );
+	TangentToLocal[0] = normalize(mul( Intermediates.BlendMatrix, float4(LocalTangentX, 0) ));
+	TangentToLocal[2] = normalize(mul( Intermediates.BlendMatrix, float4(LocalTangentZ.xyz, 0) ));
 
 	// derive the new binormal by getting the cross product of the normal and tangent
 	// and flip vector based on sign of tangent basis determinant
-	TangentToLocal[1] = cross(TangentToLocal[2], TangentToLocal[0]) * LocalTangentZ.w;
+	 TangentToLocal[1] = normalize(cross(TangentToLocal[2], TangentToLocal[0]) * LocalTangentZ.w);
 
 #if GPUSKIN_APEX_CLOTH
 	return ClothTangent * TempClothBlendWeight + TangentToLocal * (1.0f - TempClothBlendWeight);
@@ -691,18 +818,28 @@ float3x3 SkinTangents( FVertexFactoryInput Input, FVertexFactoryIntermediates In
 FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput Input)
 {
 	FVertexFactoryIntermediates Intermediates;
-	
-	Intermediates.UnpackedPosition = UnpackedPosition(Input);
+	Intermediates.SceneData				= VF_GPUSCENE_GET_INTERMEDIATES(Input);
+	Intermediates.InvNonUniformScale	= GetInstanceData(Intermediates).InvNonUniformScale;
+	Intermediates.DeterminantSign		= GetInstanceData(Intermediates).DeterminantSign;
+	Intermediates.LocalToWorld			= GetInstanceData(Intermediates).LocalToWorld;
+	Intermediates.WorldToLocal			= GetInstanceData(Intermediates).WorldToLocal;
+	Intermediates.PrevLocalToWorld		= GetInstanceData(Intermediates).PrevLocalToWorld;
+	Intermediates.UnpackedPosition		= UnpackedPosition(Input);
+
 #if GPUSKIN_APEX_CLOTH
-	SetupClothVertex(Input.ClothVertexID, Intermediates.ClothVertexInfluences);
+	SetupClothVertex(Input.VertexID, Intermediates.ClothVertexInfluences);
 	if( IsSimulatedVertex(Intermediates.ClothVertexInfluences[0]) )
 	{
-		Intermediates.PreviousSimulatedPosition = ClothingPosition(Intermediates.ClothVertexInfluences, true);
 		Intermediates.SimulatedPosition = ClothingPosition(Intermediates.ClothVertexInfluences, false);
+#if GPUSKIN_APEX_CLOTH_PREVIOUS
+		Intermediates.PreviousSimulatedPosition = ClothingPosition(Intermediates.ClothVertexInfluences, true);
+#else
+		Intermediates.PreviousSimulatedPosition = Intermediates.SimulatedPosition;
+#endif
 	}
 	else
 	{
-		Intermediates.PreviousSimulatedPosition = Intermediates.SimulatedPosition = Intermediates.UnpackedPosition;
+		Intermediates.PreviousSimulatedPosition = Intermediates.SimulatedPosition = float4(Intermediates.UnpackedPosition, 0.0f);
 	}
 	
 #endif
@@ -720,22 +857,16 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 
 float4 CalcWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
 {
+	float3 SkinnedPosition = SkinPosition(Input, Intermediates);
 #if GPUSKIN_APEX_CLOTH
 	if (IsSimulatedVertex(Intermediates.ClothVertexInfluences[0]))
 	{
-		// skinned positions
-		float4 SkinnedPosition = float4(SkinPosition(Input, Intermediates), 1);
-		float4 TransformedSkinPos = mul(SkinnedPosition, Primitive.LocalToWorld);
-
-		// Intermediates.SimulatedPosition is a clothing position in world coord
-		float3 BlendedPos = lerp(TransformedSkinPos.xyz, Intermediates.SimulatedPosition, ClothBlendWeight);
-		return float4(BlendedPos + ResolvedView.PreViewTranslation, 1);
+		// Transform simulated position from cloth space into local space and blend with skinned position
+		float4 TransformedSimulatedPos = mul(float4(Intermediates.SimulatedPosition.xyz, 1), ClothToLocal);
+		SkinnedPosition = lerp(SkinnedPosition, TransformedSimulatedPos.xyz, ClothBlendWeight * Intermediates.SimulatedPosition.w);
 	}
-	else
 #endif
-	{
-		return TransformLocalToTranslatedWorld(SkinPosition(Input, Intermediates));
-	}
+	return TransformLocalToTranslatedWorld(SkinnedPosition, Intermediates.LocalToWorld);
 }
 
 /**
@@ -766,10 +897,10 @@ float3 VertexFactoryGetPositionForVertexLighting(FVertexFactoryInput Input, FVer
 
 void CalcTangentToWorld(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, out float3 TangentToWorld0, out float4 TangentToWorld2)
 {
-	float3x3 LocalToWorld = GetLocalToWorld3x3();
+	float3x3 LocalToWorld = LWCToFloat3x3(Intermediates.LocalToWorld);
 
 	// Remove scaling.
-	half3 InvScale = Primitive.InvNonUniformScaleAndDeterminantSign.xyz;
+	half3 InvScale = Intermediates.InvNonUniformScale;
 	LocalToWorld[0] *= InvScale.x;
 	LocalToWorld[1] *= InvScale.y;
 	LocalToWorld[2] *= InvScale.z;
@@ -777,7 +908,7 @@ void CalcTangentToWorld(FVertexFactoryInput Input, FVertexFactoryIntermediates I
 	float3x3 TangentToWorld = mul(Intermediates.TangentToLocal, LocalToWorld);
 
 	TangentToWorld0 = TangentToWorld[0];
-	TangentToWorld2 = float4(TangentToWorld[2], Input.TangentZ.w * Primitive.InvNonUniformScaleAndDeterminantSign.w);
+	TangentToWorld2 = float4(TangentToWorld[2], Input.TangentZ.w * Intermediates.DeterminantSign);
 }
 
 float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
@@ -792,16 +923,21 @@ float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input, FVertexFactoryInte
 FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FMaterialVertexParameters VertexParameters)
 {
 	FVertexFactoryInterpolantsVSToPS Interpolants;
+	Interpolants = (FVertexFactoryInterpolantsVSToPS)0;	// compiling the SetUV loop will fail if not completely initialized
 
 #if NUM_TEX_COORD_INTERPOLATORS
-	float2 CustomizedUVs[NUM_TEX_COORD_INTERPOLATORS];
+	float2 CustomizedUVs[NUM_TEX_COORD_INTERPOLATORS]; // = (float2[NUM_TEX_COORD_INTERPOLATORS])0; <- our FHlslParser used for RemoveUnusedOutputs doesn't seem to like this, so zero-initialize manually below.
+	// Why zero-initialize? Because material translator stores interpolants in an array of float2, packing them, but the material may have an odd number of interpolants (e.g. float3).
+	// In such a case GetCustomInterpolators() will omit writing the last component, leaving it uninitialized, hence the initialization below.
+	CustomizedUVs[NUM_TEX_COORD_INTERPOLATORS - 1] = float2(0, 0);	
+
 	GetMaterialCustomizedUVs(VertexParameters, CustomizedUVs);
 	GetCustomInterpolators(VertexParameters, CustomizedUVs);
 
 	UNROLL
 	for (int CoordinateIndex = 0; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; CoordinateIndex++)
 	{
-		Interpolants.TexCoords[CoordinateIndex] = CustomizedUVs[CoordinateIndex];
+		SetUV(Interpolants, CoordinateIndex, CustomizedUVs[CoordinateIndex]);
 	}
 #endif
 
@@ -819,34 +955,33 @@ FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(FVertexFacto
 	Interpolants.EyeIndex = 0;
 #endif
 
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	Interpolants.PrimitiveId = Intermediates.SceneData.PrimitiveId;
+#endif
+
 	return Interpolants;
 }
 
 // @return previous translated world position
 float4 VertexFactoryGetPreviousWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
-{
-	float4x4 PreviousLocalToWorldTranslated = Primitive.PreviousLocalToWorld;
-
-	PreviousLocalToWorldTranslated[3][0] += ResolvedView.PrevPreViewTranslation.x;
-	PreviousLocalToWorldTranslated[3][1] += ResolvedView.PrevPreViewTranslation.y;
-	PreviousLocalToWorldTranslated[3][2] += ResolvedView.PrevPreViewTranslation.z;
-
-	float4 PrevSkinPosInWorld = mul(float4(SkinPreviousPosition(Input, Intermediates),1), PreviousLocalToWorldTranslated);
+{	
+	float3 PrevSkinnedPosition = SkinPreviousPosition(Input, Intermediates);
 #if GPUSKIN_APEX_CLOTH
+#if GPUSKIN_APEX_CLOTH_PREVIOUS
 	if (IsSimulatedVertex(Intermediates.ClothVertexInfluences[0]))
 	{
-		float3 PrevSimulatedPos = Intermediates.PreviousSimulatedPosition + ResolvedView.PrevPreViewTranslation;
-		float3 BlendedPrevPos = lerp(PrevSkinPosInWorld.xyz, PrevSimulatedPos.xyz, ClothBlendWeight);
-		return float4(BlendedPrevPos, 1);
+		// Transform simulated position from cloth space into local space and blend with skinned position
+		float4 PrevTransformedSimulatedPos = mul(float4(Intermediates.PreviousSimulatedPosition.xyz, 1), PreviousClothToLocal);
+		PrevSkinnedPosition = lerp(PrevSkinnedPosition, PrevTransformedSimulatedPos.xyz, ClothBlendWeight * Intermediates.PreviousSimulatedPosition.w);
 	}
+#endif // GPUSKIN_APEX_CLOTH_PREVIOUS
 #endif // GPUSKIN_APEX_CLOTH
-
-	return PrevSkinPosInWorld;
+	return TransformPreviousLocalPositionToTranslatedWorld(PrevSkinnedPosition, Intermediates.PrevLocalToWorld);
 }
 
 
-#if USING_TESSELLATION
-float2 VertexFactoryGetTextureCoordinateDS( FVertexFactoryInterpolantsVSToDS Interpolants )
+#if NEEDS_VERTEX_FACTORY_INTERPOLATION
+float2 VertexFactoryGetRayTracingTextureCoordinate( FVertexFactoryRayTracingInterpolants Interpolants )
 {
 #if NUM_MATERIAL_TEXCOORDS
 	return Interpolants.InterpolantsVSToPS.TexCoords[0].xy;
@@ -855,87 +990,49 @@ float2 VertexFactoryGetTextureCoordinateDS( FVertexFactoryInterpolantsVSToDS Int
 #endif // #if NUM_MATERIAL_TEXCOORDS
 }
 
-FVertexFactoryInterpolantsVSToPS VertexFactoryAssignInterpolants(FVertexFactoryInterpolantsVSToDS Input)
+FVertexFactoryInterpolantsVSToPS VertexFactoryAssignInterpolants(FVertexFactoryRayTracingInterpolants Input)
 {
 	return Input.InterpolantsVSToPS;
 }
 
-FVertexFactoryInterpolantsVSToDS VertexFactoryGetInterpolantsVSToDS(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FMaterialVertexParameters VertexParameters)
+FVertexFactoryRayTracingInterpolants VertexFactoryGetRayTracingInterpolants(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FMaterialVertexParameters VertexParameters)
 {
-	FVertexFactoryInterpolantsVSToDS Interpolants;
+	FVertexFactoryRayTracingInterpolants Interpolants;
 	
 	Interpolants.InterpolantsVSToPS = VertexFactoryGetInterpolantsVSToPS(Input, Intermediates, VertexParameters);
 	
 	return Interpolants;
 }
 
-/** Converts from vertex factory specific interpolants to a FMaterialTessellationParameters, which is used by material inputs. */
-FMaterialTessellationParameters GetMaterialTessellationParameters(FVertexFactoryInterpolantsVSToDS Interpolants, float3 CameraLocalWorldPosition)
-{
-	FMaterialTessellationParameters	Result;
-#if NUM_TEX_COORD_INTERPOLATORS
-	UNROLL
-	for (int CoordinateIndex = 0;CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS;CoordinateIndex++)
-	{
-		Result.TexCoords[CoordinateIndex] = Interpolants.InterpolantsVSToPS.TexCoords[CoordinateIndex];
-	}
-#endif
-
-	half3 TangentToWorld0 = Interpolants.InterpolantsVSToPS.TangentToWorld0.xyz;
-	half4 TangentToWorld2 = Interpolants.InterpolantsVSToPS.TangentToWorld2;
-
-#if INTERPOLATE_VERTEX_COLOR
-	Result.VertexColor = Interpolants.InterpolantsVSToPS.Color;
-#endif
-
-	Result.TangentToWorld = AssembleTangentToWorld( TangentToWorld0, TangentToWorld2 );
-
-	Result.TangentToWorldPreScale = 1;
-
-
-	Result.WorldPosition = CameraLocalWorldPosition + ResolvedView.WorldCameraOrigin;
-
-	return Result;
-}
-
-FVertexFactoryInterpolantsVSToDS VertexFactoryInterpolate(FVertexFactoryInterpolantsVSToDS a, float aInterp, FVertexFactoryInterpolantsVSToDS b, float bInterp)
+FVertexFactoryRayTracingInterpolants VertexFactoryInterpolate(FVertexFactoryRayTracingInterpolants a, float aInterp, FVertexFactoryRayTracingInterpolants b, float bInterp)
 {
 	// Default initialize. Otherwise, some graphics pipelines that
 	// couple tessellation with geometry shaders won't write to all TEXCOORD semantics,
-	// but read from them when <FVertexFactoryInterpolantsVSToDS> is being copied as a whole.
-	FVertexFactoryInterpolantsVSToDS O = (FVertexFactoryInterpolantsVSToDS)0;
+	// but read from them when <FVertexFactoryRayTracingInterpolants> is being copied as a whole.
+	FVertexFactoryRayTracingInterpolants O = (FVertexFactoryRayTracingInterpolants)0;
 
-	TESSELLATION_INTERPOLATE_MEMBER(InterpolantsVSToPS.TangentToWorld0.xyz);
-	TESSELLATION_INTERPOLATE_MEMBER(InterpolantsVSToPS.TangentToWorld2);
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.TangentToWorld0.xyz);
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.TangentToWorld2);
 #if INTERPOLATE_VERTEX_COLOR
-	TESSELLATION_INTERPOLATE_MEMBER(InterpolantsVSToPS.Color);
+	INTERPOLATE_MEMBER(InterpolantsVSToPS.Color);
 #endif
 
 #if NUM_TEX_COORD_INTERPOLATORS
 	UNROLL
-	for(int tc = 0; tc < NUM_TEX_COORD_INTERPOLATORS; ++tc)
+	// TexCoords in VSToPS are a float4 array with 2 coords packed together
+	for(int tc = 0; tc < (NUM_TEX_COORD_INTERPOLATORS+1)/2; ++tc)
 	{
-		TESSELLATION_INTERPOLATE_MEMBER(InterpolantsVSToPS.TexCoords[tc]);
+		INTERPOLATE_MEMBER(InterpolantsVSToPS.TexCoords[tc]);
 	}
+#endif
+
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	O.InterpolantsVSToPS.PrimitiveId = a.InterpolantsVSToPS.PrimitiveId;
 #endif
 
 	return O;
 }
-
-float3x3 VertexFactoryGetTangentToLocalDS(FVertexFactoryInterpolantsVSToDS Interpolants)
-{
-	// This duplicates stuff already going on in GetMaterialTessellationParameters(), so
-	// maybe the hull shader could leverage that instead?
-
-	half3 TangentToWorld0 = Interpolants.InterpolantsVSToPS.TangentToWorld0.xyz;
-	half4 TangentToWorld2 = Interpolants.InterpolantsVSToPS.TangentToWorld2;
-
-	float3x3 TangentToWorld = AssembleTangentToWorld( TangentToWorld0, TangentToWorld2 );
-	
-	return TangentToWorld;
-}
-
-#endif // #if USING_TESSELLATION
+#endif // #if NEEDS_VERTEX_FACTORY_INTERPOLATION
 
 float4 VertexFactoryGetTranslatedPrimitiveVolumeBounds(FVertexFactoryInterpolantsVSToPS Interpolants)
 {
@@ -944,5 +1041,11 @@ float4 VertexFactoryGetTranslatedPrimitiveVolumeBounds(FVertexFactoryInterpolant
 
 uint VertexFactoryGetPrimitiveId(FVertexFactoryInterpolantsVSToPS Interpolants)
 {
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	return Interpolants.PrimitiveId;
+#else // VF_USE_PRIMITIVE_SCENE_DATA
 	return 0;
+#endif // VF_USE_PRIMITIVE_SCENE_DATA
 }
+
+#include "VertexFactoryDefaultInterface.ush"

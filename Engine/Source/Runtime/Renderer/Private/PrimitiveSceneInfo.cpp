@@ -19,6 +19,36 @@
 #include "GPUScene.h"
 #include "Async/ParallelFor.h"
 #include "ProfilingDebugging/ExternalProfiler.h"
+#include "Nanite/Nanite.h"
+#include "Nanite/NaniteRayTracing.h"
+#include "Rendering/NaniteResources.h"
+#include "NaniteSceneProxy.h"
+#include "Lumen/LumenSceneRendering.h"
+#include "RayTracingDefinitions.h"
+
+extern int32 GGPUSceneInstanceClearList;
+extern int32 GGPUSceneInstanceBVH;
+
+static int32 GMeshDrawCommandsCacheMultithreaded = 1;
+static FAutoConsoleVariableRef CVarDrawCommandsCacheMultithreaded(
+	TEXT("r.MeshDrawCommands.CacheMultithreaded"),
+	GMeshDrawCommandsCacheMultithreaded,
+	TEXT("Enable multithreading of draw command caching for static meshes. 0=disabled, 1=enabled (default)"),
+	ECVF_RenderThreadSafe);
+
+static int32 GNaniteDrawCommandCacheMultithreaded = 1;
+static FAutoConsoleVariableRef CVarNaniteDrawCommandCacheMultithreaded(
+	TEXT("r.Nanite.MeshDrawCommands.CacheMultithreaded"),
+	GNaniteDrawCommandCacheMultithreaded,
+	TEXT("Enable multithreading of draw command caching for Nanite materials. 0=disabled, 1=enabled (default)"),
+	ECVF_RenderThreadSafe);
+
+static int32 GRayTracingPrimitiveCacheMultithreaded = 1;
+static FAutoConsoleVariableRef CVarRayTracingPrimitiveCacheMultithreaded(
+	TEXT("r.RayTracing.MeshDrawCommands.CacheMultithreaded"),
+	GRayTracingPrimitiveCacheMultithreaded,
+	TEXT("Enable multithreading of raytracing primitive mesh command caching. 0=disabled, 1=enabled (default)"),
+	ECVF_RenderThreadSafe);
 
 /** An implementation of FStaticPrimitiveDrawInterface that stores the drawn elements for the rendering thread to use. */
 class FBatchingSPDI : public FStaticPrimitiveDrawInterface
@@ -49,14 +79,8 @@ public:
 
 	virtual void ReserveMemoryForMeshes(int32 MeshNum)
 	{
-		if (PrimitiveSceneInfo->StaticMeshRelevances.GetSlack() < MeshNum)
-		{
-			PrimitiveSceneInfo->StaticMeshRelevances.Reserve(PrimitiveSceneInfo->StaticMeshRelevances.Max() + MeshNum);
-		}
-		if (PrimitiveSceneInfo->StaticMeshes.GetSlack() < MeshNum)
-		{
-			PrimitiveSceneInfo->StaticMeshes.Reserve(PrimitiveSceneInfo->StaticMeshes.Max() + MeshNum);
-		}
+		PrimitiveSceneInfo->StaticMeshRelevances.Reserve(PrimitiveSceneInfo->StaticMeshRelevances.Num() + MeshNum);
+		PrimitiveSceneInfo->StaticMeshes.Reserve(PrimitiveSceneInfo->StaticMeshes.Num() + MeshNum);
 	}
 
 	virtual void DrawMesh(const FMeshBatch& Mesh, float ScreenSize) final override
@@ -83,11 +107,12 @@ public:
 			// Volumetric self shadow mesh commands need to be generated every frame, as they depend on single frame uniform buffers with self shadow data.
 			const bool bSupportsCachingMeshDrawCommands = SupportsCachingMeshDrawCommands(*StaticMesh, FeatureLevel) && !PrimitiveSceneProxy->CastsVolumetricTranslucentShadow();
 
-			const FMaterial* Material = Mesh.MaterialRenderProxy->GetMaterial(FeatureLevel);
-
-			bool bUseSkyMaterial = Mesh.MaterialRenderProxy->GetMaterial(FeatureLevel)->IsSky();
-			bool bUseSingleLayerWaterMaterial = Material->GetShadingModels().HasShadingModel(MSM_SingleLayerWater);
-			bool bUseAnisotropy = Material->GetShadingModels().HasAnyShadingModel({MSM_DefaultLit, MSM_ClearCoat}) && Material->MaterialUsesAnisotropy_RenderThread();
+			const FMaterial& Material = Mesh.MaterialRenderProxy->GetIncompleteMaterialWithFallback(FeatureLevel);
+			bool bUseSkyMaterial = Material.IsSky();
+			bool bUseSingleLayerWaterMaterial = Material.GetShadingModels().HasShadingModel(MSM_SingleLayerWater);
+			bool bUseAnisotropy = Material.GetShadingModels().HasAnyShadingModel({MSM_DefaultLit, MSM_ClearCoat}) && Material.MaterialUsesAnisotropy_RenderThread();
+			bool bSupportsNaniteRendering = SupportsNaniteRendering(StaticMesh->VertexFactory, PrimitiveSceneProxy, Mesh.MaterialRenderProxy, FeatureLevel);
+			bool bSupportsGPUScene = StaticMesh->VertexFactory->SupportsGPUScene(FeatureLevel);
 
 			FStaticMeshBatchRelevance* StaticMeshRelevance = new(PrimitiveSceneInfo->StaticMeshRelevances) FStaticMeshBatchRelevance(
 				*StaticMesh, 
@@ -96,6 +121,8 @@ public:
 				bUseSkyMaterial,
 				bUseSingleLayerWaterMaterial,
 				bUseAnisotropy,
+				bSupportsNaniteRendering,
+				bSupportsGPUScene,
 				FeatureLevel
 				);
 		}
@@ -106,10 +133,15 @@ private:
 	TRefCountPtr<HHitProxy> CurrentHitProxy;
 };
 
+FPrimitiveSceneInfo::FPrimitiveSceneInfoEvent FPrimitiveSceneInfo::OnGPUSceneInstancesAllocated;
+FPrimitiveSceneInfo::FPrimitiveSceneInfoEvent FPrimitiveSceneInfo::OnGPUSceneInstancesFreed;
+
 FPrimitiveFlagsCompact::FPrimitiveFlagsCompact(const FPrimitiveSceneProxy* Proxy)
 	: bCastDynamicShadow(Proxy->CastsDynamicShadow())
 	, bStaticLighting(Proxy->HasStaticLighting())
 	, bCastStaticShadow(Proxy->CastsStaticShadow())
+	, bIsNaniteMesh(Proxy->IsNaniteMesh())
+	, bSupportsGPUScene(Proxy->SupportsGPUScene())
 {}
 
 FPrimitiveSceneInfoCompact::FPrimitiveSceneInfoCompact(FPrimitiveSceneInfo* InPrimitiveSceneInfo) :
@@ -117,7 +149,7 @@ FPrimitiveSceneInfoCompact::FPrimitiveSceneInfoCompact(FPrimitiveSceneInfo* InPr
 {
 	PrimitiveSceneInfo = InPrimitiveSceneInfo;
 	Proxy = PrimitiveSceneInfo->Proxy;
-	Bounds = PrimitiveSceneInfo->Proxy->GetBounds();
+	Bounds = FCompactBoxSphereBounds(PrimitiveSceneInfo->Proxy->GetBounds());
 	MinDrawDistance = PrimitiveSceneInfo->Proxy->GetMinDrawDistance();
 	MaxDrawDistance = PrimitiveSceneInfo->Proxy->GetMaxDrawDistance();
 
@@ -127,6 +159,7 @@ FPrimitiveSceneInfoCompact::FPrimitiveSceneInfoCompact(FPrimitiveSceneInfo* InPr
 FPrimitiveSceneInfo::FPrimitiveSceneInfo(UPrimitiveComponent* InComponent,FScene* InScene):
 	Proxy(InComponent->SceneProxy),
 	PrimitiveComponentId(InComponent->ComponentId),
+	RegistrationSerialNumber(InComponent->RegistrationSerialNumber),
 	OwnerLastRenderTime(FActorLastRenderTime::GetPtr(InComponent->GetOwner())),
 	IndirectLightingCacheAllocation(NULL),
 	CachedPlanarReflectionProxy(NULL),
@@ -136,22 +169,33 @@ FPrimitiveSceneInfo::FPrimitiveSceneInfo(UPrimitiveComponent* InComponent,FScene
 	LightList(NULL),
 	LastRenderTime(-FLT_MAX),
 	Scene(InScene),
-	NumMobileMovablePointLights(0),
+	NumMobileDynamicLocalLights(0),
 	bShouldRenderInMainPass(InComponent->SceneProxy->ShouldRenderInMainPass()),
 	bVisibleInRealTimeSkyCapture(InComponent->SceneProxy->IsVisibleInRealTimeSkyCaptures()),
 #if RHI_RAYTRACING
 	bDrawInGame(Proxy->IsDrawnInGame()),
-	bIsVisibleInReflectionCaptures(InComponent->SceneProxy->IsVisibleInReflectionCaptures()),
+	bRayTracingFarField(Proxy->IsRayTracingFarField()),
+	bIsVisibleInSceneCaptures(!InComponent->SceneProxy->IsHiddenInSceneCapture()),
+	bIsVisibleInSceneCapturesOnly(InComponent->SceneProxy->IsVisibleInSceneCaptureOnly()),
 	bIsRayTracingRelevant(InComponent->SceneProxy->IsRayTracingRelevant()),
 	bIsRayTracingStaticRelevant(InComponent->SceneProxy->IsRayTracingStaticRelevant()),
 	bIsVisibleInRayTracing(InComponent->SceneProxy->IsVisibleInRayTracing()),
+	CoarseMeshStreamingHandle(INDEX_NONE),
 #endif
 	PackedIndex(INDEX_NONE),
+	PersistentIndex(FPersistentPrimitiveIndex{ INDEX_NONE }),
 	ComponentForDebuggingOnly(InComponent),
 	bNeedsStaticMeshUpdateWithoutVisibilityCheck(false),
 	bNeedsUniformBufferUpdate(false),
 	bIndirectLightingCacheBufferDirty(false),
 	bRegisteredVirtualTextureProducerCallback(false),
+	bRegisteredWithVelocityData(false),
+	bCacheShadowAsStatic(InComponent->Mobility != EComponentMobility::Movable),
+	LevelUpdateNotificationIndex(INDEX_NONE),
+	InstanceSceneDataOffset(INDEX_NONE),
+	NumInstanceSceneDataEntries(0),
+	InstancePayloadDataOffset(INDEX_NONE),
+	InstancePayloadDataStride(0),
 	LightmapDataOffset(INDEX_NONE),
 	NumLightmapDataEntries(0)
 {
@@ -205,7 +249,20 @@ FRHIRayTracingGeometry* FPrimitiveSceneInfo::GetStaticRayTracingGeometryInstance
 {
 	if (RayTracingGeometries.Num() > LodLevel)
 	{
-		return RayTracingGeometries[LodLevel]->RayTracingGeometryRHI;
+		// TODO: Select different LOD, when build is still pending for this LOD?
+		if (RayTracingGeometries[LodLevel]->HasPendingBuildRequest())
+		{
+			RayTracingGeometries[LodLevel]->BoostBuildPriority();
+			return nullptr;
+		}
+		else if (RayTracingGeometries[LodLevel]->IsValid())
+		{
+			return RayTracingGeometries[LodLevel]->RayTracingGeometryRHI;
+		}
+		else
+		{
+			return nullptr;
+		}
 	}
 	else
 	{
@@ -221,14 +278,14 @@ void FPrimitiveSceneInfo::CacheMeshDrawCommands(FRHICommandListImmediate& RHICmd
 	FMaterialRenderProxy::UpdateDeferredCachedUniformExpressions();
 
 	SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_CacheMeshDrawCommands, FColor::Emerald);
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(FPrimitiveSceneInfo_CacheMeshDrawCommands);
 
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_CacheMeshDrawCommands);
-	FMemMark Mark(FMemStack::Get());
 
 	static constexpr int BATCH_SIZE = 64;
 	const int NumBatches = (SceneInfos.Num() + BATCH_SIZE - 1) / BATCH_SIZE;
 
-	auto DoWorkLambda = [Scene, SceneInfos](int32 Index)
+	auto DoWorkLambda = [Scene, SceneInfos](FCachedPassMeshDrawListContext& DrawListContext, int32 Index)
 	{
 		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_CacheMeshDrawCommand, FColor::Green);
 
@@ -238,7 +295,7 @@ void FPrimitiveSceneInfo::CacheMeshDrawCommands(FRHICommandListImmediate& RHICmd
 			int32 MeshIndex;
 		};
 
-		TArray<FMeshInfoAndIndex, TMemStackAllocator<>> MeshBatches;
+		TArray<FMeshInfoAndIndex, SceneRenderingAllocator> MeshBatches;
 		MeshBatches.Reserve(3 * BATCH_SIZE);
 
 		int LocalNum = FMath::Min((Index * BATCH_SIZE) + BATCH_SIZE, SceneInfos.Num());
@@ -270,15 +327,9 @@ void FPrimitiveSceneInfo::CacheMeshDrawCommands(FRHICommandListImmediate& RHICmd
 
 			if ((FPassProcessorManager::GetPassFlags(ShadingPath, PassType) & EMeshPassFlags::CachedMeshCommands) != EMeshPassFlags::None)
 			{
-				FCachedMeshDrawCommandInfo CommandInfo(PassType);
+				FCachedPassMeshDrawListContext::FMeshPassScope MeshPassScope(DrawListContext, PassType);
 
-				FCriticalSection& CachedMeshDrawCommandLock = Scene->CachedMeshDrawCommandLock[PassType];
-				FCachedPassMeshDrawList& SceneDrawList = Scene->CachedDrawLists[PassType];
-				FStateBucketMap& CachedMeshDrawCommandStateBuckets = Scene->CachedMeshDrawCommandStateBuckets[PassType];
-				FCachedPassMeshDrawListContext CachedPassMeshDrawListContext(CommandInfo, CachedMeshDrawCommandLock, SceneDrawList, CachedMeshDrawCommandStateBuckets, *Scene);
-
-				PassProcessorCreateFunction CreateFunction = FPassProcessorManager::GetCreateFunction(ShadingPath, PassType);
-				FMeshPassProcessor* PassMeshProcessor = CreateFunction(Scene, nullptr, &CachedPassMeshDrawListContext);
+				FMeshPassProcessor* PassMeshProcessor = FPassProcessorManager::CreateMeshPassProcessor(ShadingPath, PassType, Scene->GetFeatureLevel(), Scene, nullptr, &DrawListContext);
 
 				if (PassMeshProcessor != nullptr)
 				{
@@ -286,15 +337,16 @@ void FPrimitiveSceneInfo::CacheMeshDrawCommands(FRHICommandListImmediate& RHICmd
 					{
 						FPrimitiveSceneInfo* SceneInfo = SceneInfos[MeshAndInfo.InfoIndex];
 						FStaticMeshBatch& Mesh = SceneInfo->StaticMeshes[MeshAndInfo.MeshIndex];
-						
-						CommandInfo = FCachedMeshDrawCommandInfo(PassType);
+
 						FStaticMeshBatchRelevance& MeshRelevance = SceneInfo->StaticMeshRelevances[MeshAndInfo.MeshIndex];
 
 						check(!MeshRelevance.CommandInfosMask.Get(PassType));
 
 						uint64 BatchElementMask = ~0ull;
+						// NOTE: AddMeshBatch calls FCachedPassMeshDrawListContext::FinalizeCommand
 						PassMeshProcessor->AddMeshBatch(Mesh, BatchElementMask, SceneInfo->Proxy);
 
+						FCachedMeshDrawCommandInfo CommandInfo = DrawListContext.GetCommandInfoAndReset();
 						if (CommandInfo.CommandIndex != -1 || CommandInfo.StateBucketId != -1)
 						{
 							static_assert(sizeof(MeshRelevance.CommandInfosMask) * 8 >= EMeshPass::Num, "CommandInfosMask is too small to contain all mesh passes.");
@@ -302,44 +354,22 @@ void FPrimitiveSceneInfo::CacheMeshDrawCommands(FRHICommandListImmediate& RHICmd
 							MeshRelevance.CommandInfosBase++;
 
 							int CommandInfoIndex = MeshAndInfo.MeshIndex * EMeshPass::Num + PassType;
-							check(SceneInfo->StaticMeshCommandInfos[CommandInfoIndex].MeshPass == EMeshPass::Num);
-							SceneInfo->StaticMeshCommandInfos[CommandInfoIndex] = CommandInfo;
-#if DO_GUARD_SLOW
-							if (ShadingPath == EShadingPath::Deferred)
-							{
-								FScopeLock Lock(&CachedMeshDrawCommandLock);
-								const FMeshDrawCommand* MeshDrawCommand = CommandInfo.StateBucketId >= 0
-									? &Scene->CachedMeshDrawCommandStateBuckets[PassType].GetByElementId(CommandInfo.StateBucketId).Key
-									: &SceneDrawList.MeshDrawCommands[CommandInfo.CommandIndex];
-
-								ensureMsgf(MeshDrawCommand->VertexStreams.GetAllocatedSize() == 0, TEXT("Cached Mesh Draw command overflows VertexStreams.  VertexStream inline size should be tweaked."));
-
-								if (PassType == EMeshPass::BasePass || PassType == EMeshPass::DepthPass || PassType == EMeshPass::CSMShadowDepth)
-								{
-									TArray<EShaderFrequency, TInlineAllocator<SF_NumFrequencies>> ShaderFrequencies;
-									MeshDrawCommand->ShaderBindings.GetShaderFrequencies(ShaderFrequencies);
-								
-									int32 DataOffset = 0;
-									for (int32 i = 0; i < ShaderFrequencies.Num(); i++)
-									{
-										FMeshDrawSingleShaderBindings SingleShaderBindings = const_cast<FMeshDrawCommand*>(MeshDrawCommand)->ShaderBindings.GetSingleShaderBindings(ShaderFrequencies[i], DataOffset);
-										ensureMsgf(SingleShaderBindings.GetParameterMapInfo().LooseParameterBuffers.Num() == 0, TEXT("Cached Mesh Draw command uses loose parameters.  This will break dynamic instancing in performance critical pass.  Use Uniform Buffers instead."));
-										ensureMsgf(SingleShaderBindings.GetParameterMapInfo().SRVs.Num() == 0, TEXT("Cached Mesh Draw command uses individual SRVs.  This will break dynamic instancing in performance critical pass.  Use Uniform Buffers instead."));
-										ensureMsgf(SingleShaderBindings.GetParameterMapInfo().TextureSamplers.Num() == 0, TEXT("Cached Mesh Draw command uses individual Texture Samplers.  This will break dynamic instancing in performance critical pass.  Use Uniform Buffers instead."));
-									}
-								}
-							}
-#endif
+							FCachedMeshDrawCommandInfo& CurrentCommandInfo = SceneInfo->StaticMeshCommandInfos[CommandInfoIndex];
+							checkf(CurrentCommandInfo.MeshPass == EMeshPass::Num,
+								TEXT("SceneInfo->StaticMeshCommandInfos[%d] is not expected to be initialized yet. MeshPass is %d, but expected EMeshPass::Num (%d)."),
+								CommandInfoIndex, (int32)EMeshPass::Num, CurrentCommandInfo.MeshPass);
+							CurrentCommandInfo = CommandInfo;
 						}
 					}
-					PassMeshProcessor->~FMeshPassProcessor();
+
+					delete PassMeshProcessor;
 				}
 			}
 		}
 
 		for (int LocalIndex = (Index * BATCH_SIZE); LocalIndex < LocalNum; LocalIndex++)
 		{
-			FPrimitiveSceneInfo* SceneInfo = SceneInfos[LocalIndex];	
+			FPrimitiveSceneInfo* SceneInfo = SceneInfos[LocalIndex];
 			int PrefixSum = 0;
 			for (int32 MeshIndex = 0; MeshIndex < SceneInfo->StaticMeshes.Num(); MeshIndex++)
 			{
@@ -382,62 +412,64 @@ void FPrimitiveSceneInfo::CacheMeshDrawCommands(FRHICommandListImmediate& RHICmd
 		}
 	};
 
-	if (FApp::ShouldUseThreadingForPerformance())
+	bool bAnyLooseParameterBuffers = false;
+	if (GMeshDrawCommandsCacheMultithreaded && FApp::ShouldUseThreadingForPerformance())
 	{
-		ParallelForTemplate(NumBatches, DoWorkLambda, EParallelForFlags::PumpRenderingThread);
-	}
-	else
-	{
-		for (int Idx = 0; Idx < NumBatches; Idx++)
+		TArray<FCachedPassMeshDrawListContextDeferred, SceneRenderingAllocator> DrawListContexts;
+		DrawListContexts.Reserve(NumBatches);
+		for(int32 ContextIndex = 0; ContextIndex < NumBatches; ++ContextIndex)
 		{
-			DoWorkLambda(Idx);
+			DrawListContexts.Emplace(*Scene);
 		}
-	}
 
-	if (!RHISupportsMultithreadedShaderCreation(GMaxRHIShaderPlatform))
-	{
-		FGraphicsMinimalPipelineStateId::InitializePersistentIds();
-	}
-
-#if RHI_RAYTRACING
-	if (IsRayTracingEnabled() && !(Scene->World->WorldType == EWorldType::EditorPreview || Scene->World->WorldType == EWorldType::GamePreview))
-	{
-		checkf(RHISupportsMultithreadedShaderCreation(GMaxRHIShaderPlatform), TEXT("Raytracing code needs the ability to create shaders from task threads."));
-
-		FCachedRayTracingMeshCommandContext CommandContext(Scene->CachedRayTracingMeshCommands);
-		FMeshPassProcessorRenderState PassDrawRenderState(Scene->UniformBuffers.ViewUniformBuffer);
-		FRayTracingMeshProcessor RayTracingMeshProcessor(&CommandContext, Scene, nullptr, PassDrawRenderState);
-
-		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
-		{
-			if (SceneInfo->RayTracingGeometries.Num() > 0 && SceneInfo->StaticMeshes.Num() > 0)
+		ParallelForTemplate(
+			NumBatches, 
+			[&DrawListContexts, &DoWorkLambda](int32 Index)
 			{
-				int32 MaxLOD = -1;
-				for (int32 MeshIndex = 0; MeshIndex < SceneInfo->StaticMeshes.Num(); MeshIndex++)
-				{
-					FStaticMeshBatch& Mesh = SceneInfo->StaticMeshes[MeshIndex];
-					MaxLOD = MaxLOD < Mesh.LODIndex ? Mesh.LODIndex : MaxLOD;
-				}
+				FTaskTagScope Scope(ETaskTag::EParallelRenderingThread);
+				DoWorkLambda(DrawListContexts[Index], Index);
+			},
+			EParallelForFlags::PumpRenderingThread | EParallelForFlags::Unbalanced
+		);
 
-				SceneInfo->CachedRayTracingMeshCommandIndicesPerLOD.Empty(MaxLOD + 1);
-				SceneInfo->CachedRayTracingMeshCommandIndicesPerLOD.AddDefaulted(MaxLOD + 1);
+		if (NumBatches > 0)
+		{
+			SCOPED_NAMED_EVENT(DeferredFinalizeMeshDrawCommands, FColor::Emerald);
 
-				for (int32 MeshIndex = 0; MeshIndex < SceneInfo->StaticMeshes.Num(); MeshIndex++)
-				{
-					FStaticMeshBatch& Mesh = SceneInfo->StaticMeshes[MeshIndex];
-
-					RayTracingMeshProcessor.AddMeshBatch(Mesh, ~0ull, SceneInfo->Proxy);
-
-					if (CommandContext.CommandIndex >= 0)
-					{
-						SceneInfo->CachedRayTracingMeshCommandIndicesPerLOD[Mesh.LODIndex].Add(CommandContext.CommandIndex);
-						CommandContext.CommandIndex = -1;
-					}
-				}
+			for (int32 Index = 0; Index < NumBatches; ++Index)
+			{
+				FCachedPassMeshDrawListContextDeferred& DrawListContext = DrawListContexts[Index];
+				const int32 Start = Index * BATCH_SIZE;
+				const int32 End = FMath::Min((Index * BATCH_SIZE) + BATCH_SIZE, SceneInfos.Num());
+				DrawListContext.DeferredFinalizeMeshDrawCommands(SceneInfos, Start, End);
+				bAnyLooseParameterBuffers |= DrawListContext.HasAnyLooseParameterBuffers();
 			}
 		}
 	}
+	else
+	{
+		FCachedPassMeshDrawListContextImmediate DrawListContext(*Scene);
+		for (int Idx = 0; Idx < NumBatches; Idx++)
+		{
+			DoWorkLambda(DrawListContext, Idx);
+		}
+		bAnyLooseParameterBuffers = DrawListContext.HasAnyLooseParameterBuffers();
+	}
+
+#if DO_GUARD_SLOW
+	{
+		static int32 LogCount = 0;
+		if (bAnyLooseParameterBuffers && (LogCount++ % 1000) == 0)
+		{
+			UE_LOG(LogRenderer, Warning, TEXT("One or more Cached Mesh Draw commands use loose parameters. This causes overhead and will break dynamic instancing, potentially reducing performance further. Use Uniform Buffers instead."));
+		}
+	}
 #endif
+
+	if (!FParallelMeshDrawCommandPass::IsOnDemandShaderCreationEnabled())
+	{
+		FGraphicsMinimalPipelineStateId::InitializePersistentIds();
+	}
 }
 
 void FPrimitiveSceneInfo::RemoveCachedMeshDrawCommands()
@@ -451,16 +483,26 @@ void FPrimitiveSceneInfo::RemoveCachedMeshDrawCommands()
 		if (CachedCommand.StateBucketId != INDEX_NONE)
 		{
 			EMeshPass::Type PassIndex = CachedCommand.MeshPass;
-			FScopeLock Lock(&Scene->CachedMeshDrawCommandLock[PassIndex]);
+			FGraphicsMinimalPipelineStateId CachedPipelineId;
 
-			FGraphicsMinimalPipelineStateId CachedPipelineId = Scene->CachedMeshDrawCommandStateBuckets[PassIndex].GetByElementId(CachedCommand.StateBucketId).Key.CachedPipelineId;
-
-			FMeshDrawCommandCount& StateBucketCount = Scene->CachedMeshDrawCommandStateBuckets[PassIndex].GetByElementId(CachedCommand.StateBucketId).Value;
-			check(StateBucketCount.Num > 0);
-			StateBucketCount.Num--;
-			if (StateBucketCount.Num == 0)
 			{
-				Scene->CachedMeshDrawCommandStateBuckets[PassIndex].RemoveByElementId(CachedCommand.StateBucketId);
+				auto& ElementKVP = Scene->CachedMeshDrawCommandStateBuckets[PassIndex].GetByElementId(CachedCommand.StateBucketId);
+				CachedPipelineId = ElementKVP.Key.CachedPipelineId;
+
+				FMeshDrawCommandCount& StateBucketCount = ElementKVP.Value;
+				check(StateBucketCount.Num > 0);
+				StateBucketCount.Num--;
+				if (StateBucketCount.Num == 0)
+				{
+					Scene->CachedMeshDrawCommandStateBuckets[PassIndex].RemoveByElementId(CachedCommand.StateBucketId);
+				}
+
+				// shrink MDC AuxData array in sync with MDC StateBuckets 
+				int32 StateBucketsNum = Scene->CachedMeshDrawCommandStateBuckets[PassIndex].GetMaxIndex() + 1;
+				if (Scene->CachedStateBucketsAuxData[PassIndex].Num() > StateBucketsNum) 
+				{
+					Scene->CachedStateBucketsAuxData[PassIndex].SetNum(StateBucketsNum, true);
+				}
 			}
 
 			FGraphicsMinimalPipelineStateId::RemovePersistentId(CachedPipelineId);
@@ -469,7 +511,7 @@ void FPrimitiveSceneInfo::RemoveCachedMeshDrawCommands()
 		{
 			FCachedPassMeshDrawList& PassDrawList = Scene->CachedDrawLists[CachedCommand.MeshPass];
 			FGraphicsMinimalPipelineStateId CachedPipelineId = PassDrawList.MeshDrawCommands[CachedCommand.CommandIndex].CachedPipelineId;
-			
+
 			PassDrawList.MeshDrawCommands.RemoveAt(CachedCommand.CommandIndex);
 			FGraphicsMinimalPipelineStateId::RemovePersistentId(CachedPipelineId);
 
@@ -487,8 +529,500 @@ void FPrimitiveSceneInfo::RemoveCachedMeshDrawCommands()
 	}
 
 	StaticMeshCommandInfos.Empty();
+}
+
+static void BuildNaniteDrawCommands(FRHICommandListImmediate& RHICmdList, FScene* Scene, FPrimitiveSceneInfo* PrimitiveSceneInfo, FNaniteDrawListContext& DrawListContext);
+
+void FPrimitiveSceneInfo::CacheNaniteDrawCommands(FRHICommandListImmediate& RHICmdList, FScene* Scene, const TArrayView<FPrimitiveSceneInfo*>& SceneInfos)
+{
+	SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_CacheNaniteDrawCommands, FColor::Emerald);
+	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(FPrimitiveSceneInfo_CacheNaniteDrawCommands);
+	QUICK_SCOPE_CYCLE_COUNTER(STAT_CacheNaniteDrawCommands);
+
+	FMaterialRenderProxy::UpdateDeferredCachedUniformExpressions();
+
+	const bool bNaniteEnabled = DoesPlatformSupportNanite(GMaxRHIShaderPlatform);
+	if (bNaniteEnabled)
+	{
+		TArray<FNaniteDrawListContext, TInlineAllocator<1>> DrawListContexts;
+
+		if (GNaniteDrawCommandCacheMultithreaded && FApp::ShouldUseThreadingForPerformance())
+		{
+			ParallelForWithTaskContext(
+				DrawListContexts,
+				SceneInfos.Num(),
+				[&RHICmdList, Scene, &SceneInfos](FNaniteDrawListContext& Context, int32 Index)
+				{
+					FTaskTagScope Scope(ETaskTag::EParallelRenderingThread);
+					BuildNaniteDrawCommands(RHICmdList, Scene, SceneInfos[Index], Context);
+				}
+			);
+		}
+		else
+		{
+			FNaniteDrawListContext& DrawListContext = DrawListContexts.AddDefaulted_GetRef();
+			for (FPrimitiveSceneInfo* PrimitiveSceneInfo : SceneInfos)
+			{
+				BuildNaniteDrawCommands(RHICmdList, Scene, PrimitiveSceneInfo, DrawListContext);
+			}
+		}
+
+		if (DrawListContexts.Num() > 0)
+		{
+			SCOPED_NAMED_EVENT(NaniteDrawListApply, FColor::Emerald);
+			for (FNaniteDrawListContext& Context : DrawListContexts)
+			{
+				Context.Apply(*Scene);
+			}
+		}
+	}
+}
+
+void BuildNaniteDrawCommands(FRHICommandListImmediate& RHICmdList, FScene* Scene, FPrimitiveSceneInfo* PrimitiveSceneInfo, FNaniteDrawListContext& DrawListContext)
+{
+	static const auto AllowComputeMaterials = IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("r.Nanite.AllowComputeMaterial"));
+	static const bool bAllowComputeMaterials = (AllowComputeMaterials && AllowComputeMaterials->GetValueOnAnyThread() != 0);
+
+	FPrimitiveSceneProxy* Proxy = PrimitiveSceneInfo->Proxy;
+	if (Proxy->IsNaniteMesh())
+	{
+		Nanite::FSceneProxyBase* NaniteProxy = static_cast<Nanite::FSceneProxyBase*>(Proxy);
+		{
+			FNaniteDrawListContext::FPrimitiveSceneInfoScope PrimInfoScope(DrawListContext, *PrimitiveSceneInfo);
+	
+			auto PassBody = [PrimitiveSceneInfo, NaniteProxy, &DrawListContext](ENaniteMeshPass::Type MeshPass, FMeshPassProcessor* const NaniteMeshProcessor)
+			{
+				FNaniteDrawListContext::FMeshPassScope MeshPassScope(DrawListContext, MeshPass);
+
+				int32 StaticMeshesCount = PrimitiveSceneInfo->StaticMeshes.Num();
+				for (int32 MeshIndex = 0; MeshIndex < StaticMeshesCount; ++MeshIndex)
+				{
+					FStaticMeshBatchRelevance& MeshRelevance = PrimitiveSceneInfo->StaticMeshRelevances[MeshIndex];
+					FStaticMeshBatch& Mesh = PrimitiveSceneInfo->StaticMeshes[MeshIndex];
+
+					if (MeshRelevance.bSupportsNaniteRendering && Mesh.bUseForMaterial)
+					{
+						uint64 BatchElementMask = ~0ull;
+						NaniteMeshProcessor->AddMeshBatch(Mesh, BatchElementMask, NaniteProxy);
+					}
+				}
+
+				TArray<Nanite::FSceneProxyBase::FMaterialSection>& NaniteMaterialSections = NaniteProxy->GetMaterialSections();
+				if (NaniteMaterialSections.Num() > 0)
+				{
+					FNaniteDrawListContext::FDeferredPipelines& PipelinesCommand = DrawListContext.DeferredPipelines[MeshPass].Emplace_GetRef();
+					PipelinesCommand.PrimitiveSceneInfo = PrimitiveSceneInfo;
+					for (int32 MaterialSectionIndex = 0; MaterialSectionIndex < NaniteMaterialSections.Num(); ++MaterialSectionIndex)
+					{
+						Nanite::FSceneProxyBase::FMaterialSection& MaterialSection = NaniteMaterialSections[MaterialSectionIndex];
+						check(MaterialSection.RasterMaterialProxy != nullptr);
+						check(MaterialSection.ShadingMaterialProxy != nullptr);
+
+						FNaniteRasterPipeline& RasterPipeline = PipelinesCommand.RasterPipelines.Emplace_GetRef();
+						RasterPipeline.RasterMaterial = MaterialSection.RasterMaterialProxy;
+						RasterPipeline.bIsTwoSided = !!MaterialSection.MaterialRelevance.bTwoSided;
+						RasterPipeline.bPerPixelEval = MaterialSection.MaterialRelevance.bMasked ||
+													   MaterialSection.MaterialRelevance.bUsesPixelDepthOffset;
+
+						float WPODisableDistance;
+						RasterPipeline.bWPODisableDistance =
+							MaterialSection.MaterialRelevance.bUsesWorldPositionOffset &&
+							NaniteProxy->GetInstanceWorldPositionOffsetDisableDistance(WPODisableDistance);
+
+						if (bAllowComputeMaterials)
+						{
+							FNaniteShadingPipeline& ShadingPipeline = PipelinesCommand.ShadingPipelines.Emplace_GetRef();
+							ShadingPipeline.ShadingMaterial = MaterialSection.ShadingMaterialProxy;
+							ShadingPipeline.bIsTwoSided = !!MaterialSection.MaterialRelevance.bTwoSided;
+							ShadingPipeline.bIsMasked = MaterialSection.MaterialRelevance.bMasked;
+						}
+					}
+				}
+			};
+
+			// ENaniteMeshPass::BasePass
+			{
+				FMeshPassProcessor* NaniteMeshProcessor = CreateNaniteMeshProcessor(Scene->GetFeatureLevel(), Scene, nullptr, &DrawListContext);
+				PassBody(ENaniteMeshPass::BasePass, NaniteMeshProcessor);
+				delete NaniteMeshProcessor;
+			}
+
+			// ENaniteMeshPass::LumenCardCapture
+			if (Lumen::HasPrimitiveNaniteMeshBatches(Proxy) && DoesPlatformSupportLumenGI(GetFeatureLevelShaderPlatform(Scene->GetFeatureLevel())))
+			{
+				FMeshPassProcessor* NaniteMeshProcessor = CreateLumenCardNaniteMeshProcessor(Scene->GetFeatureLevel(), Scene, nullptr, &DrawListContext);
+				PassBody(ENaniteMeshPass::LumenCardCapture, NaniteMeshProcessor);
+				delete NaniteMeshProcessor;
+			}
+
+			static_assert(ENaniteMeshPass::Num == 2, "Change BuildNaniteDrawCommands() to account for more Nanite mesh passes");
+		}
+	}
+}
+
+void FPrimitiveSceneInfo::RemoveCachedNaniteDrawCommands()
+{
+	checkSlow(IsInRenderingThread());
+
+	if (!Proxy->IsNaniteMesh())
+	{
+		return;
+	}
+
+	QUICK_SCOPE_CYCLE_COUNTER(STAT_RemoveCachedNaniteDrawCommands);
+
+	for (int32 NaniteMeshPassIndex = 0; NaniteMeshPassIndex < ENaniteMeshPass::Num; ++NaniteMeshPassIndex)
+	{
+		FNaniteMaterialCommands& ShadingCommands = Scene->NaniteMaterials[NaniteMeshPassIndex];
+		FNaniteRasterPipelines& RasterPipelines = Scene->NaniteRasterPipelines[NaniteMeshPassIndex];
+		FNaniteShadingPipelines& ShadingPipelines = Scene->NaniteShadingPipelines[NaniteMeshPassIndex];
+		FNaniteVisibility& Visibility = Scene->NaniteVisibility[NaniteMeshPassIndex];
+
+		TArray<FNaniteCommandInfo>& NanitePassCommandInfo = NaniteCommandInfos[NaniteMeshPassIndex];
+		for (int32 CommandIndex = 0; CommandIndex < NanitePassCommandInfo.Num(); ++CommandIndex)
+		{
+			const FNaniteCommandInfo& CommandInfo = NanitePassCommandInfo[CommandIndex];
+			ShadingCommands.Unregister(CommandInfo);
+		}
+
+		TArray<FNaniteRasterBin>& NanitePassRasterBins = NaniteRasterBins[NaniteMeshPassIndex];
+		for (int32 RasterBinIndex = 0; RasterBinIndex < NanitePassRasterBins.Num(); ++RasterBinIndex)
+		{
+			const FNaniteRasterBin& RasterBin = NanitePassRasterBins[RasterBinIndex];
+			RasterPipelines.Unregister(RasterBin);
+		}
+
+		TArray<FNaniteShadingBin>& NanitePassShadingBins = NaniteShadingBins[NaniteMeshPassIndex];
+		for (int32 ShadingBinIndex = 0; ShadingBinIndex < NanitePassShadingBins.Num(); ++ShadingBinIndex)
+		{
+			const FNaniteShadingBin& ShadingBin = NanitePassShadingBins[ShadingBinIndex];
+			ShadingPipelines.Unregister(ShadingBin);
+		}
+
+		Visibility.RemoveReferences(this);
+
+		NanitePassRasterBins.Reset();
+		NanitePassShadingBins.Reset();
+		NanitePassCommandInfo.Reset();
+		NaniteMaterialSlots[NaniteMeshPassIndex].Reset();
+	}
+
+#if WITH_EDITOR
+	NaniteHitProxyIds.Reset();
+#endif
+}
 
 #if RHI_RAYTRACING
+void FScene::RefreshRayTracingMeshCommandCache()
+{
+	// Get rid of all existing cached commands
+	CachedRayTracingMeshCommands.Empty(CachedRayTracingMeshCommands.Num());
+
+	// Re-cache all current primitives
+	FPrimitiveSceneInfo::CacheRayTracingPrimitives(this, Primitives);
+}
+
+void FScene::RefreshRayTracingInstances()
+{
+	// Re-cache all current primitives
+	FPrimitiveSceneInfo::UpdateCachedRayTracingInstances(this, Primitives);
+}
+
+void FScene::UpdateRayTracedLights()
+{
+	// Whether a light can use ray traced shadows depends on CVars that may be changed at runtime.
+	// It is not enough to check the light shadow mode when light is added to the scene. This must be done during rendering.
+
+	bHasRayTracedLights = false;
+
+	if (!IsRayTracingEnabled())
+	{
+		return;
+	}
+
+	// We currently don't need a full list of RT lights, only whether there are any RT lights at all.
+	for (const FLightSceneInfoCompact& LightSceneInfoCompact : Lights)
+	{
+		if (ShouldRenderRayTracingShadowsForLight(LightSceneInfoCompact))
+		{
+			bHasRayTracedLights = true;
+			break;
+		}
+	}
+}
+
+void FPrimitiveSceneInfo::UpdateCachedRayTracingInstances(FScene* Scene, const TArrayView<FPrimitiveSceneInfo*>& SceneInfos)
+{
+	if (IsRayTracingEnabled())
+	{
+		checkf(GRHISupportsMultithreadedShaderCreation, TEXT("Raytracing code needs the ability to create shaders from task threads."));
+
+		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+		{
+			// Write group id
+			const int32 RayTracingGroupId = SceneInfo->Proxy->GetRayTracingGroupId();
+			if (RayTracingGroupId != -1)
+			{
+				Scene->PrimitiveRayTracingGroupIds[SceneInfo->GetIndex()] = Scene->PrimitiveRayTracingGroups.FindId(RayTracingGroupId);
+			}
+
+			FRayTracingInstance CachedRayTracingInstance;
+			ERayTracingPrimitiveFlags& Flags = Scene->PrimitiveRayTracingFlags[SceneInfo->GetIndex()];
+
+			// Cache the coarse mesh streaming handle
+			SceneInfo->CoarseMeshStreamingHandle = SceneInfo->Proxy->GetCoarseMeshStreamingHandle();
+
+			// Write flags
+			Flags = SceneInfo->Proxy->GetCachedRayTracingInstance(CachedRayTracingInstance);
+			UpdateCachedRayTracingInstance(SceneInfo, CachedRayTracingInstance, Flags);
+		}
+	}
+}
+
+struct DeferredMeshLODCommandIndex
+{
+	FPrimitiveSceneInfo* SceneInfo;
+	int8 MeshLODIndex;
+	int32 CommandIndex;
+};
+
+template<class T>
+class FCacheRayTracingPrimitivesContext
+{
+public:
+	FCacheRayTracingPrimitivesContext(FScene* Scene)
+		: CommandContext(Commands)
+		, RayTracingMeshProcessor(&CommandContext, Scene, nullptr, PassDrawRenderState, Scene->CachedRayTracingMeshCommandsMode)
+	{ }
+
+	FTempRayTracingMeshCommandStorage Commands;
+	FCachedRayTracingMeshCommandContext<T> CommandContext;
+	FMeshPassProcessorRenderState PassDrawRenderState;
+	FRayTracingMeshProcessor RayTracingMeshProcessor;
+	TArray<DeferredMeshLODCommandIndex> DeferredMeshLODCommandIndices;
+};
+
+template<bool bDeferLODCommandIndices, class T>
+void CacheRayTracingPrimitive(
+	FScene* Scene, 
+	FPrimitiveSceneInfo* SceneInfo,
+	T& Commands,
+	FCachedRayTracingMeshCommandContext<T>& CommandContext,
+	FRayTracingMeshProcessor& RayTracingMeshProcessor,
+	TArray<DeferredMeshLODCommandIndex>* DeferredMeshLODCommandIndices,
+	FRayTracingInstance& CachedRayTracingInstance, 
+	ERayTracingPrimitiveFlags& Flags)
+{
+	if (SceneInfo->GetRayTracingGeometryNum() > 0 && SceneInfo->StaticMeshes.Num() > 0)
+	{
+		int32 MaxLOD = -1;
+		for (const FStaticMeshBatch& Mesh : SceneInfo->StaticMeshes)
+		{
+			MaxLOD = MaxLOD < Mesh.LODIndex ? Mesh.LODIndex : MaxLOD;
+		}
+
+		SceneInfo->CachedRayTracingMeshCommandIndicesPerLOD.Empty(MaxLOD + 1);
+		SceneInfo->CachedRayTracingMeshCommandIndicesPerLOD.AddDefaulted(MaxLOD + 1);
+
+		SceneInfo->CachedRayTracingMeshCommandsHashPerLOD.Empty(MaxLOD + 1);
+		SceneInfo->CachedRayTracingMeshCommandsHashPerLOD.AddZeroed(MaxLOD + 1);
+
+		for (const FStaticMeshBatch& Mesh : SceneInfo->StaticMeshes)
+		{
+			// Why do we pass a full mask here when the dynamic case only uses a mask of 1?
+			// Also note that the code below assumes only a single command was generated per batch (see SupportsCachingMeshDrawCommands(...))
+			const uint64 BatchElementMask = ~0ull;
+			RayTracingMeshProcessor.AddMeshBatch(Mesh, BatchElementMask, SceneInfo->Proxy);
+
+			if (CommandContext.CommandIndex >= 0)
+			{
+				uint64& Hash = SceneInfo->CachedRayTracingMeshCommandsHashPerLOD[Mesh.LODIndex];
+				Hash <<= 1;
+				Hash ^= Commands[CommandContext.CommandIndex].ShaderBindings.GetDynamicInstancingHash();
+
+				if (bDeferLODCommandIndices)
+				{
+					DeferredMeshLODCommandIndices->Add({ SceneInfo,Mesh.LODIndex, CommandContext.CommandIndex });
+				}
+				else
+				{
+					SceneInfo->CachedRayTracingMeshCommandIndicesPerLOD[Mesh.LODIndex].Add(CommandContext.CommandIndex);
+				}
+
+				CommandContext.CommandIndex = -1;
+			}
+		}
+	}
+
+	// This path is mutually exclusive with the old path (used by normal static meshes) and is only used by Nanite proxies now.
+	// TODO: move normal static meshes to this path, but needs testing to not break FN
+
+	// Write group id
+	const int32 RayTracingGroupId = SceneInfo->Proxy->GetRayTracingGroupId();
+	if (RayTracingGroupId != -1)
+	{
+		Scene->PrimitiveRayTracingGroupIds[SceneInfo->GetIndex()] = Scene->PrimitiveRayTracingGroups.FindId(RayTracingGroupId);
+	}
+
+	// Write flags
+	Flags = SceneInfo->Proxy->GetCachedRayTracingInstance(CachedRayTracingInstance);
+
+	// Cache the coarse mesh streaming handle
+	SceneInfo->CoarseMeshStreamingHandle = SceneInfo->Proxy->GetCoarseMeshStreamingHandle();
+
+	if (EnumHasAnyFlags(Flags, ERayTracingPrimitiveFlags::CacheMeshCommands))
+	{
+		// TODO: LOD w/ screen size support. Probably needs another array parallel to OutRayTracingInstances
+		// We assume it is exactly 1 LOD now (true for Nanite proxies)
+		SceneInfo->CachedRayTracingMeshCommandIndicesPerLOD.Empty(1);
+		SceneInfo->CachedRayTracingMeshCommandIndicesPerLOD.AddDefaulted(1);
+
+		SceneInfo->CachedRayTracingMeshCommandsHashPerLOD.Empty(1);
+		SceneInfo->CachedRayTracingMeshCommandsHashPerLOD.AddZeroed(1);
+
+		for (const FMeshBatch& Mesh : CachedRayTracingInstance.Materials)
+		{
+			// Why do we pass a full mask here when the dynamic case only uses a mask of 1?
+			// Also note that the code below assumes only a single command was generated per batch (see SupportsCachingMeshDrawCommands(...))
+			const uint64 BatchElementMask = ~0ull;
+			RayTracingMeshProcessor.AddMeshBatch(Mesh, BatchElementMask, SceneInfo->Proxy);
+
+			// The material section must emit a command. Otherwise, it should have been excluded earlier
+			check(CommandContext.CommandIndex >= 0);
+			
+			uint64& Hash = SceneInfo->CachedRayTracingMeshCommandsHashPerLOD[Mesh.LODIndex];
+			Hash <<= 1;
+			Hash ^= Commands[CommandContext.CommandIndex].ShaderBindings.GetDynamicInstancingHash();
+
+			if (bDeferLODCommandIndices)
+			{
+				DeferredMeshLODCommandIndices->Add({ SceneInfo,Mesh.LODIndex, CommandContext.CommandIndex });
+			}
+			else
+			{
+				SceneInfo->CachedRayTracingMeshCommandIndicesPerLOD[Mesh.LODIndex].Add(CommandContext.CommandIndex);
+			}
+
+			CommandContext.CommandIndex = -1;
+		}
+	}
+}
+
+void FPrimitiveSceneInfo::CacheRayTracingPrimitives(FScene* Scene, const TArrayView<FPrimitiveSceneInfo*>& SceneInfos)
+{
+	if (IsRayTracingEnabled(Scene->GetShaderPlatform()))
+	{
+		CSV_SCOPED_TIMING_STAT_EXCLUSIVE(FPrimitiveSceneInfo_CacheRayTracingPrimitives)
+		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_CacheRayTracingPrimitives, FColor::Emerald);
+
+		checkf(GRHISupportsMultithreadedShaderCreation, TEXT("Raytracing code needs the ability to create shaders from task threads."));
+		
+		FCachedRayTracingMeshCommandStorage& CachedRayTracingMeshCommands = Scene->CachedRayTracingMeshCommands;
+
+		if (GRayTracingPrimitiveCacheMultithreaded && FApp::ShouldUseThreadingForPerformance())
+		{
+			TArray<FCacheRayTracingPrimitivesContext<FTempRayTracingMeshCommandStorage>> Contexts;
+			ParallelForWithTaskContext(
+				Contexts,
+				SceneInfos.Num(),
+				[Scene](int32 ContextIndex, int32 NumContexts) { return Scene; },
+				[Scene, &SceneInfos](FCacheRayTracingPrimitivesContext<FTempRayTracingMeshCommandStorage>& Context, int32 Index)
+				{
+					FOptionalTaskTagScope Scope(ETaskTag::EParallelRenderingThread);
+
+					FPrimitiveSceneInfo* SceneInfo = SceneInfos[Index];
+					FRayTracingInstance CachedInstance;
+					ERayTracingPrimitiveFlags& Flags = Scene->PrimitiveRayTracingFlags[SceneInfo->GetIndex()];
+					CacheRayTracingPrimitive<true>(Scene, SceneInfo, Context.Commands, Context.CommandContext, Context.RayTracingMeshProcessor, &Context.DeferredMeshLODCommandIndices, CachedInstance, Flags);
+					UpdateCachedRayTracingInstance(SceneInfo, CachedInstance, Flags);
+				}
+			);
+
+			if (Contexts.Num() > 0)
+			{
+				CSV_SCOPED_TIMING_STAT_EXCLUSIVE(FPrimitiveSceneInfo_CacheRayTracingPrimitives_Merge)
+				SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_CacheRayTracingPrimitives_Merge, FColor::Emerald);
+
+				// copy commands generated by multiple threads to the sparse array in FScene
+				// and set each mesh LOD command index
+				for (const auto& Context : Contexts)
+				{
+					for (const DeferredMeshLODCommandIndex& Entry : Context.DeferredMeshLODCommandIndices)
+					{
+						int32 CommandIndex = CachedRayTracingMeshCommands.Add(Context.Commands[Entry.CommandIndex]);
+						Entry.SceneInfo->CachedRayTracingMeshCommandIndicesPerLOD[Entry.MeshLODIndex].Add(CommandIndex);
+					}
+				}
+			}
+		}
+		else
+		{
+			FCachedRayTracingMeshCommandContext CommandContext(CachedRayTracingMeshCommands);
+			FMeshPassProcessorRenderState PassDrawRenderState;
+			FRayTracingMeshProcessor RayTracingMeshProcessor(&CommandContext, Scene, nullptr, PassDrawRenderState, Scene->CachedRayTracingMeshCommandsMode);
+
+			for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+			{
+				FRayTracingInstance CachedRayTracingInstance;
+				ERayTracingPrimitiveFlags& Flags = Scene->PrimitiveRayTracingFlags[SceneInfo->GetIndex()];
+				CacheRayTracingPrimitive<false>(Scene, SceneInfo, CachedRayTracingMeshCommands, CommandContext, RayTracingMeshProcessor, nullptr, CachedRayTracingInstance, Flags);
+				UpdateCachedRayTracingInstance(SceneInfo, CachedRayTracingInstance, Flags);
+			}
+		}
+	}
+}
+
+void FPrimitiveSceneInfo::UpdateCachedRayTracingInstance(FPrimitiveSceneInfo* SceneInfo, const FRayTracingInstance& CachedRayTracingInstance, const ERayTracingPrimitiveFlags Flags)
+{
+	if (EnumHasAnyFlags(Flags, ERayTracingPrimitiveFlags::CacheInstances))
+	{
+		checkf(CachedRayTracingInstance.InstanceTransforms.IsEmpty() && CachedRayTracingInstance.InstanceTransformsView.IsEmpty(),
+			TEXT("Primitives with ERayTracingPrimitiveFlags::CacheInstances get instances transforms from GPUScene"));
+
+		FPrimitiveSceneProxy* SceneProxy = SceneInfo->Proxy;
+
+		// TODO: allocate from FRayTracingScene & do better low-level caching
+		SceneInfo->CachedRayTracingInstance.NumTransforms = CachedRayTracingInstance.NumTransforms;
+		SceneInfo->CachedRayTracingInstance.BaseInstanceSceneDataOffset = SceneInfo->GetInstanceSceneDataOffset();
+
+		SceneInfo->CachedRayTracingInstanceWorldBounds.Empty();
+		SceneInfo->CachedRayTracingInstanceWorldBounds.AddUninitialized(CachedRayTracingInstance.NumTransforms);
+
+		SceneInfo->UpdateCachedRayTracingInstanceWorldBounds(SceneProxy->GetLocalToWorld());
+
+		SceneInfo->CachedRayTracingInstance.GeometryRHI = CachedRayTracingInstance.Geometry->RayTracingGeometryRHI;
+
+		if (Nanite::GetRayTracingMode() != Nanite::ERayTracingMode::Fallback && SceneProxy->IsNaniteMesh())
+		{
+			FRHIRayTracingGeometry* NaniteRayTracingGeometry = Nanite::GRayTracingManager.GetRayTracingGeometry(SceneInfo);
+
+			if (NaniteRayTracingGeometry != nullptr)
+			{
+				SceneInfo->CachedRayTracingInstance.GeometryRHI = NaniteRayTracingGeometry;
+			}
+		}
+
+		// At this point (in AddToScene()) PrimitiveIndex has been set
+		check(SceneInfo->GetIndex() != INDEX_NONE);
+		SceneInfo->CachedRayTracingInstance.DefaultUserData = (uint32)SceneInfo->GetIndex();
+		SceneInfo->CachedRayTracingInstance.Mask = CachedRayTracingInstance.Mask; // When no cached command is found, InstanceMask == 0 and the instance is effectively filtered out
+
+		SceneInfo->CachedRayTracingInstance.bApplyLocalBoundsTransform = CachedRayTracingInstance.bApplyLocalBoundsTransform;
+
+		if (CachedRayTracingInstance.bForceOpaque)
+		{
+			SceneInfo->CachedRayTracingInstance.Flags |= ERayTracingInstanceFlags::ForceOpaque;
+		}
+
+		if (CachedRayTracingInstance.bDoubleSided)
+		{
+			SceneInfo->CachedRayTracingInstance.Flags |= ERayTracingInstanceFlags::TriangleCullDisable;
+		}
+	}
+}
+
+void FPrimitiveSceneInfo::RemoveCachedRayTracingPrimitives()
+{
 	if (IsRayTracingEnabled())
 	{
 		for (auto& CachedRayTracingMeshCommandIndices : CachedRayTracingMeshCommandIndicesPerLOD)
@@ -497,15 +1031,37 @@ void FPrimitiveSceneInfo::RemoveCachedMeshDrawCommands()
 			{
 				if (CommandIndex >= 0)
 				{
-					Scene->CachedRayTracingMeshCommands.RayTracingMeshCommands.RemoveAt(CommandIndex);
+					Scene->CachedRayTracingMeshCommands.RemoveAt(CommandIndex);
 				}
 			}
 		}
 
 		CachedRayTracingMeshCommandIndicesPerLOD.Empty();
+
+		CachedRayTracingMeshCommandsHashPerLOD.Empty();
 	}
-#endif
 }
+
+void FPrimitiveSceneInfo::UpdateCachedRayTracingInstanceWorldBounds(const FMatrix& NewPrimitiveLocalToWorld)
+{
+	QUICK_SCOPE_CYCLE_COUNTER(STAT_UpdateCachedRayTracingInstanceWorldBounds);
+	TRACE_CPUPROFILER_EVENT_SCOPE(UpdateCachedRayTracingInstanceWorldBounds);
+
+	TConstArrayView<FPrimitiveInstance> InstanceSceneData = Proxy->GetInstanceSceneData();
+	
+	SmallestRayTracingInstanceWorldBoundsIndex = 0;
+
+	for (int32 Index = 0; Index < CachedRayTracingInstanceWorldBounds.Num(); Index++)
+	{
+		const FRenderBounds& LocalBoundingBox = Proxy->GetInstanceLocalBounds(Index);
+
+		FMatrix LocalTransform = InstanceSceneData[Index].LocalToPrimitive.ToMatrix();
+
+		CachedRayTracingInstanceWorldBounds[Index] = LocalBoundingBox.TransformBy(LocalTransform * NewPrimitiveLocalToWorld).ToBoxSphereBounds();
+		SmallestRayTracingInstanceWorldBoundsIndex = CachedRayTracingInstanceWorldBounds[Index].SphereRadius < CachedRayTracingInstanceWorldBounds[SmallestRayTracingInstanceWorldBoundsIndex].SphereRadius ? Index : SmallestRayTracingInstanceWorldBoundsIndex;
+	}
+}
+#endif
 
 void FPrimitiveSceneInfo::AddStaticMeshes(FRHICommandListImmediate& RHICmdList, FScene* Scene, const TArrayView<FPrimitiveSceneInfo*>& SceneInfos, bool bAddToStaticDrawLists)
 {
@@ -514,6 +1070,7 @@ void FPrimitiveSceneInfo::AddStaticMeshes(FRHICommandListImmediate& RHICmdList, 
 	{
 		ParallelForTemplate(SceneInfos.Num(), [Scene, &SceneInfos](int32 Index)
 		{
+			FOptionalTaskTagScope Scope(ETaskTag::EParallelRenderingThread);
 			SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddStaticMeshes_DrawStaticElements, FColor::Magenta);
 			FPrimitiveSceneInfo* SceneInfo = SceneInfos[Index];
 			// Cache the primitive's static mesh elements.
@@ -528,9 +1085,14 @@ void FPrimitiveSceneInfo::AddStaticMeshes(FRHICommandListImmediate& RHICmdList, 
 	}
 
 	{
+		const ERHIFeatureLevel::Type FeatureLevel = Scene->GetFeatureLevel();
+
 		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddStaticMeshes_UpdateSceneArrays, FColor::Blue);
 		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
 		{
+			// Allocate OIT index buffer where needed
+			const bool bAllocateSortedTriangles = OIT::IsEnabled(EOITSortingType::SortedTriangles, GMaxRHIShaderPlatform) && SceneInfo->Proxy->SupportsSortedTriangles();
+
 			for (int32 MeshIndex = 0; MeshIndex < SceneInfo->StaticMeshes.Num(); MeshIndex++)
 			{
 				FStaticMeshBatchRelevance& MeshRelevance = SceneInfo->StaticMeshRelevances[MeshIndex];
@@ -541,6 +1103,12 @@ void FPrimitiveSceneInfo::AddStaticMeshes(FRHICommandListImmediate& RHICmdList, 
 				Scene->StaticMeshes[SceneArrayAllocation.Index] = &Mesh;
 				Mesh.Id = SceneArrayAllocation.Index;
 				MeshRelevance.Id = SceneArrayAllocation.Index;
+
+				if (bAllocateSortedTriangles && OIT::IsCompatible(Mesh, FeatureLevel))
+				{
+					FSortedTriangleData Allocation = Scene->OITSceneData.Allocate(Mesh.Elements[0].IndexBuffer, EPrimitiveType(Mesh.Type), Mesh.Elements[0].FirstIndex, Mesh.Elements[0].NumPrimitives);
+					OIT::ConvertSortedIndexToDynamicIndex(&Allocation, &Mesh.Elements[0].DynamicIndexBuffer);
+				}
 			}
 		}
 	}
@@ -548,6 +1116,10 @@ void FPrimitiveSceneInfo::AddStaticMeshes(FRHICommandListImmediate& RHICmdList, 
 	if (bAddToStaticDrawLists)
 	{
 		CacheMeshDrawCommands(RHICmdList, Scene, SceneInfos);
+		CacheNaniteDrawCommands(RHICmdList, Scene, SceneInfos);
+	#if RHI_RAYTRACING
+		CacheRayTracingPrimitives(Scene, SceneInfos);
+	#endif
 	}
 }
 
@@ -559,7 +1131,7 @@ static void OnVirtualTextureDestroyed(const FVirtualTextureProducerHandle& InHan
 	PrimitiveSceneInfo->UpdateStaticLightingBuffer();
 
 	// Also need to update lightmap data inside GPUScene, if that's enabled
-	AddPrimitiveToUpdateGPU(*PrimitiveSceneInfo->Scene, PrimitiveSceneInfo->GetIndex());
+	PrimitiveSceneInfo->Scene->GPUScene.AddPrimitiveToUpdate(PrimitiveSceneInfo->GetIndex(), EPrimitiveDirtyState::ChangedStaticLighting);
 }
 
 static void GetRuntimeVirtualTextureLODRange(TArray<class FStaticMeshBatchRelevance> const& MeshRelevances, int8& OutMinLOD, int8& OutMaxLOD)
@@ -615,6 +1187,130 @@ int32 FPrimitiveSceneInfo::UpdateStaticLightingBuffer()
 	return LCIs.Num();
 }
 
+void FPrimitiveSceneInfo::AllocateGPUSceneInstances(FScene* Scene, const TArrayView<FPrimitiveSceneInfo*>& SceneInfos)
+{
+	if (Scene->GPUScene.IsEnabled())
+	{
+		SCOPE_CYCLE_COUNTER(STAT_UpdateGPUSceneTime);
+		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+		{
+			check
+			(
+				SceneInfo->InstanceSceneDataOffset == INDEX_NONE &&
+				SceneInfo->NumInstanceSceneDataEntries == 0 &&
+				SceneInfo->InstancePayloadDataOffset == INDEX_NONE &&
+				SceneInfo->InstancePayloadDataStride == 0
+			);
+
+			if (SceneInfo->Proxy->SupportsInstanceDataBuffer())
+			{
+				const TConstArrayView<FPrimitiveInstance> InstanceSceneData = SceneInfo->Proxy->GetInstanceSceneData();
+
+				SceneInfo->NumInstanceSceneDataEntries = InstanceSceneData.Num();
+				if (SceneInfo->NumInstanceSceneDataEntries > 0)
+				{
+					SceneInfo->InstanceSceneDataOffset = Scene->GPUScene.AllocateInstanceSceneDataSlots(SceneInfo->NumInstanceSceneDataEntries);
+
+					SceneInfo->InstancePayloadDataStride = SceneInfo->Proxy->GetPayloadDataStride(); // Returns number of float4 optional data values
+					if (SceneInfo->InstancePayloadDataStride > 0)
+					{
+						const uint32 TotalFloat4Count = SceneInfo->NumInstanceSceneDataEntries * SceneInfo->InstancePayloadDataStride;
+						SceneInfo->InstancePayloadDataOffset = Scene->GPUScene.AllocateInstancePayloadDataSlots(TotalFloat4Count);
+					}
+
+					if (GGPUSceneInstanceBVH)
+					{
+						// TODO: Replace Instance BVH FBounds with FRenderBounds
+						for (int32 InstanceIndex = 0; InstanceIndex < SceneInfo->NumInstanceSceneDataEntries; ++InstanceIndex)
+						{
+							const FPrimitiveInstance& PrimitiveInstance = InstanceSceneData[InstanceIndex];
+							FRenderBounds WorldBounds = SceneInfo->Proxy->GetInstanceLocalBounds(InstanceIndex);
+							WorldBounds.TransformBy(PrimitiveInstance.ComputeLocalToWorld(SceneInfo->Proxy->GetLocalToWorld()));
+							Scene->InstanceBVH.Add(FBounds3f({ WorldBounds.GetMin(), WorldBounds.GetMax() }), SceneInfo->InstanceSceneDataOffset + InstanceIndex);
+						}
+					}
+				}
+			}
+			else
+			{
+				// Allocate a single 'dummy/fallback' instance for the primitive that gets automatically populated with the data from the primitive
+				SceneInfo->InstanceSceneDataOffset = Scene->GPUScene.AllocateInstanceSceneDataSlots(1);
+				SceneInfo->NumInstanceSceneDataEntries = 1;
+				
+				// TODO: Hook up for dummy instances?
+				SceneInfo->InstancePayloadDataOffset = INDEX_NONE;
+				SceneInfo->InstancePayloadDataStride = 0;
+			}
+
+			// Force a primitive update in the GPU scene, 
+			// NOTE: does not set Added as this is handled elsewhere.
+			Scene->GPUScene.AddPrimitiveToUpdate(SceneInfo->PackedIndex, EPrimitiveDirtyState::ChangedAll);
+
+			// Force a primitive update in the Lumen scene(s)
+			for (FLumenSceneDataIterator LumenSceneData = Scene->GetLumenSceneDataIterator(); LumenSceneData; ++LumenSceneData)
+			{
+				LumenSceneData->UpdatePrimitiveInstanceOffset(SceneInfo->PackedIndex);
+			}
+		}
+
+		OnGPUSceneInstancesAllocated.Broadcast();
+	}
+}
+
+void FPrimitiveSceneInfo::ReallocateGPUSceneInstances(FScene* Scene, const TArrayView<FPrimitiveSceneInfo*>& SceneInfos)
+{
+	SCOPED_NAMED_EVENT(ReallocateGPUSceneInstances, FColor::Emerald);
+
+	// Free each scene info.
+	for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+	{
+		SceneInfo->FreeGPUSceneInstances();
+	}
+
+	// Allocate them all.
+	AllocateGPUSceneInstances(Scene, SceneInfos);
+}
+
+void FPrimitiveSceneInfo::FreeGPUSceneInstances()
+{
+	if (!Scene->GPUScene.IsEnabled())
+	{
+		return;
+	}
+
+	// Release all instance data slots associated with this primitive.
+	if (InstanceSceneDataOffset != INDEX_NONE)
+	{
+		SCOPE_CYCLE_COUNTER(STAT_UpdateGPUSceneTime);
+
+		check(Proxy->SupportsInstanceDataBuffer() || NumInstanceSceneDataEntries == 1);
+		if (GGPUSceneInstanceBVH)
+		{
+			for (int32 InstanceIndex = 0; InstanceIndex < NumInstanceSceneDataEntries; InstanceIndex++)
+			{
+				Scene->InstanceBVH.Remove(InstanceSceneDataOffset + InstanceIndex);
+			}
+		}
+
+		// Release all instance payload data slots associated with this primitive.
+		if (InstancePayloadDataOffset != INDEX_NONE)
+		{
+			check(InstancePayloadDataStride > 0);
+
+			const uint32 TotalFloat4Count = NumInstanceSceneDataEntries * InstancePayloadDataStride;
+			Scene->GPUScene.FreeInstancePayloadDataSlots(InstancePayloadDataOffset, TotalFloat4Count);
+			InstancePayloadDataOffset = INDEX_NONE;
+			InstancePayloadDataStride = 0;
+		}
+
+		Scene->GPUScene.FreeInstanceSceneDataSlots(InstanceSceneDataOffset, NumInstanceSceneDataEntries);
+		InstanceSceneDataOffset = INDEX_NONE;
+		NumInstanceSceneDataEntries = 0;
+
+		OnGPUSceneInstancesFreed.Broadcast();
+	}
+}
+
 void FPrimitiveSceneInfo::AddToScene(FRHICommandListImmediate& RHICmdList, FScene* Scene, const TArrayView<FPrimitiveSceneInfo*>& SceneInfos, bool bUpdateStaticDrawLists, bool bAddToStaticDrawLists, bool bAsyncCreateLPIs)
 {
 	check(IsInRenderingThread());
@@ -647,7 +1343,7 @@ void FPrimitiveSceneInfo::AddToScene(FRHICommandListImmediate& RHICmdList, FScen
 			}
 		}
 	}
-	
+
 	{
 		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_IndirectLightingCacheAllocation, FColor::Orange);
 		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
@@ -692,6 +1388,7 @@ void FPrimitiveSceneInfo::AddToScene(FRHICommandListImmediate& RHICmdList, FScen
 			}
 		}
 	}
+
 
 	{
 		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_ReflectionCaptures, FColor::Yellow);
@@ -746,7 +1443,7 @@ void FPrimitiveSceneInfo::AddToScene(FRHICommandListImmediate& RHICmdList, FScen
 			FPrimitiveBounds& PrimitiveBounds = Scene->PrimitiveBounds[PackedIndex];
 			FBoxSphereBounds BoxSphereBounds = Proxy->GetBounds();
 			PrimitiveBounds.BoxSphereBounds = BoxSphereBounds;
-			PrimitiveBounds.MinDrawDistanceSq = FMath::Square(Proxy->GetMinDrawDistance());
+			PrimitiveBounds.MinDrawDistance = Proxy->GetMinDrawDistance();
 			PrimitiveBounds.MaxDrawDistance = Proxy->GetMaxDrawDistance();
 			PrimitiveBounds.MaxCullDistance = PrimitiveBounds.MaxDrawDistance;
 
@@ -779,7 +1476,7 @@ void FPrimitiveSceneInfo::AddToScene(FRHICommandListImmediate& RHICmdList, FScen
 				OcclusionFlags |= EOcclusionFlags::HasPrecomputedVisibility;
 			}
 			Scene->PrimitiveOcclusionFlags[PackedIndex] = OcclusionFlags;
-	
+
 			// Store occlusion bounds.
 			FBoxSphereBounds OcclusionBounds = BoxSphereBounds;
 			if (Proxy->HasCustomOcclusionBounds())
@@ -794,6 +1491,15 @@ void FPrimitiveSceneInfo::AddToScene(FRHICommandListImmediate& RHICmdList, FScen
 
 			// Store the component.
 			Scene->PrimitiveComponentIds[PackedIndex] = SceneInfo->PrimitiveComponentId;
+
+#if RHI_RAYTRACING
+			// Set group id
+			const int32 RayTracingGroupId = SceneInfo->Proxy->GetRayTracingGroupId();
+			if (RayTracingGroupId != -1)
+			{
+				Scene->PrimitiveRayTracingGroupIds[PackedIndex] = Scene->PrimitiveRayTracingGroups.FindId(RayTracingGroupId);
+			}
+#endif
 		}
 	}
 
@@ -830,14 +1536,44 @@ void FPrimitiveSceneInfo::AddToScene(FRHICommandListImmediate& RHICmdList, FScen
 		FPrimitiveSceneProxy* Proxy = SceneInfo->Proxy;
 		INC_MEMORY_STAT_BY(STAT_PrimitiveInfoMemory, sizeof(*SceneInfo) + SceneInfo->StaticMeshes.GetAllocatedSize() + SceneInfo->StaticMeshRelevances.GetAllocatedSize() + Proxy->GetMemoryFootprint());
 	}
+
+	{
+		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_LevelNotifyPrimitives, FColor::Blue);
+		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+		{
+			if (SceneInfo->Proxy->ShouldNotifyOnWorldAddRemove())
+			{
+				TArray<FPrimitiveSceneInfo*>& LevelNotifyPrimitives = Scene->PrimitivesNeedingLevelUpdateNotification.FindOrAdd(SceneInfo->Proxy->GetLevelName());
+				SceneInfo->LevelUpdateNotificationIndex = LevelNotifyPrimitives.Num();
+				LevelNotifyPrimitives.Add(SceneInfo);
+			}
+		}
+	}
 }
 
 void FPrimitiveSceneInfo::RemoveStaticMeshes()
 {
+	// Deallocate potential OIT dynamic index buffer
+	if (OIT::IsEnabled(EOITSortingType::SortedTriangles, GMaxRHIShaderPlatform))
+	{
+		for (int32 MeshIndex = 0; MeshIndex < StaticMeshes.Num(); MeshIndex++)
+		{
+			FStaticMeshBatch& Mesh = StaticMeshes[MeshIndex];
+			if (Mesh.Elements.Num() > 0 && Mesh.Elements[0].DynamicIndexBuffer.IsValid())
+			{
+				Scene->OITSceneData.Deallocate(Mesh.Elements[0].DynamicIndexBuffer.IndexBuffer);
+			}
+		}
+	}
+
 	// Remove static meshes from the scene.
 	StaticMeshes.Empty();
 	StaticMeshRelevances.Empty();
 	RemoveCachedMeshDrawCommands();
+	RemoveCachedNaniteDrawCommands();
+#if RHI_RAYTRACING
+	RemoveCachedRayTracingPrimitives();
+#endif
 }
 
 void FPrimitiveSceneInfo::RemoveFromScene(bool bUpdateStaticDrawLists)
@@ -845,11 +1581,11 @@ void FPrimitiveSceneInfo::RemoveFromScene(bool bUpdateStaticDrawLists)
 	check(IsInRenderingThread());
 
 	// implicit linked list. The destruction will update this "head" pointer to the next item in the list.
-	while(LightList)
+	while (LightList)
 	{
 		FLightPrimitiveInteraction::Destroy(LightList);
 	}
-	
+
 	// Remove the primitive from the octree.
 	check(OctreeId.IsValidId());
 	check(Scene->PrimitiveOctree.GetElementById(OctreeId).PrimitiveSceneInfo == this);
@@ -860,7 +1596,7 @@ void FPrimitiveSceneInfo::RemoveFromScene(bool bUpdateStaticDrawLists)
 	{
 		Scene->GPUScene.LightmapDataAllocator.Free(LightmapDataOffset, NumLightmapDataEntries);
 	}
-	
+
 	if (Proxy->CastsDynamicIndirectShadow())
 	{
 		Scene->DynamicIndirectCasterPrimitives.RemoveSingleSwap(this);
@@ -901,6 +1637,25 @@ void FPrimitiveSceneInfo::RemoveFromScene(bool bUpdateStaticDrawLists)
 		FVirtualTextureSystem::Get().RemoveAllProducerDestroyedCallbacks(this);
 		bRegisteredVirtualTextureProducerCallback = false;
 	}
+
+	if (Proxy->ShouldNotifyOnWorldAddRemove())
+	{
+		TArray<FPrimitiveSceneInfo*>* LevelNotifyPrimitives = Scene->PrimitivesNeedingLevelUpdateNotification.Find(Proxy->GetLevelName());
+		if (LevelNotifyPrimitives != nullptr)
+		{
+			checkSlow(LevelUpdateNotificationIndex != INDEX_NONE);
+			LevelNotifyPrimitives->RemoveAtSwap(LevelUpdateNotificationIndex, 1, false);
+			if (LevelNotifyPrimitives->Num() == 0)
+			{
+				Scene->PrimitivesNeedingLevelUpdateNotification.Remove(Proxy->GetLevelName());
+			}
+			else if (LevelUpdateNotificationIndex < LevelNotifyPrimitives->Num())
+			{
+				// Update swapped element's LevelUpdateNotificationIndex
+				((*LevelNotifyPrimitives)[LevelUpdateNotificationIndex])->LevelUpdateNotificationIndex = LevelUpdateNotificationIndex;
+			}
+		}
+	}
 }
 
 void FPrimitiveSceneInfo::UpdateRuntimeVirtualTextureFlags()
@@ -910,11 +1665,11 @@ void FPrimitiveSceneInfo::UpdateRuntimeVirtualTextureFlags()
 
 	if (Proxy->WritesVirtualTexture())
 	{
-		if (StaticMeshes.Num() == 0)
+		if (Proxy->IsNaniteMesh())
 		{
-			UE_LOG(LogRenderer, Warning, TEXT("Rendering a primitive in a runtime virtual texture implies that there is a mesh to render. Please disable this option on primitive component : %s"), *Proxy->GetOwnerName().ToString());
+			UE_LOG(LogRenderer, Warning, TEXT("Rendering a nanite mesh to a runtime virtual texture isn't yet supported. Please disable this option on primitive component : %s"), *Proxy->GetOwnerName().ToString());
 		}
-		else
+		else if (StaticMeshes.Num() > 0)
 		{
 			RuntimeVirtualTextureFlags.bRenderToVirtualTexture = true;
 
@@ -940,13 +1695,17 @@ bool FPrimitiveSceneInfo::NeedsUpdateStaticMeshes()
 	return Scene->PrimitivesNeedingStaticMeshUpdate[PackedIndex];
 }
 
-void FPrimitiveSceneInfo::UpdateStaticMeshes(FRHICommandListImmediate& RHICmdList, FScene* Scene, const TArrayView<FPrimitiveSceneInfo*>& SceneInfos, bool bReAddToDrawLists)
+void FPrimitiveSceneInfo::UpdateStaticMeshes(FRHICommandListImmediate& RHICmdList, FScene* Scene, const TArrayView<FPrimitiveSceneInfo*>& SceneInfos, EUpdateStaticMeshFlags UpdateFlags, bool bReAddToDrawLists)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_FPrimitiveSceneInfo_UpdateStaticMeshes);
+	TRACE_CPUPROFILER_EVENT_SCOPE(FPrimitiveSceneInfo_UpdateStaticMeshes);
 
-	const bool bNeedsStaticMeshUpdate = !bReAddToDrawLists;
+	const bool bUpdateRayTracingCommands = EnumHasAnyFlags(UpdateFlags, EUpdateStaticMeshFlags::RayTracingCommands) || !IsRayTracingEnabled();
+	const bool bUpdateAllCommands = EnumHasAnyFlags(UpdateFlags, EUpdateStaticMeshFlags::RasterCommands) && bUpdateRayTracingCommands;
 
-	for (int Index = 0; Index < SceneInfos.Num(); Index++)
+	const bool bNeedsStaticMeshUpdate = !(bReAddToDrawLists && bUpdateAllCommands);
+
+	for (int32 Index = 0; Index < SceneInfos.Num(); Index++)
 	{
 		FPrimitiveSceneInfo* SceneInfo = SceneInfos[Index];
 		Scene->PrimitivesNeedingStaticMeshUpdate[SceneInfo->PackedIndex] = bNeedsStaticMeshUpdate;
@@ -958,21 +1717,70 @@ void FPrimitiveSceneInfo::UpdateStaticMeshes(FRHICommandListImmediate& RHICmdLis
 			SceneInfo->bNeedsStaticMeshUpdateWithoutVisibilityCheck = false;
 		}
 
-		SceneInfo->RemoveCachedMeshDrawCommands();
+		if (EnumHasAnyFlags(UpdateFlags, EUpdateStaticMeshFlags::RasterCommands))
+		{
+			SceneInfo->RemoveCachedMeshDrawCommands();
+			SceneInfo->RemoveCachedNaniteDrawCommands();
+		}
+
+	#if RHI_RAYTRACING
+		if (EnumHasAnyFlags(UpdateFlags, EUpdateStaticMeshFlags::RayTracingCommands))
+		{
+			SceneInfo->RemoveCachedRayTracingPrimitives();
+		}
+	#endif
+
+		if (SceneInfo->Proxy && SceneInfo->Proxy->IsNaniteMesh())
+		{
+			// Make sure material table indirections are kept in sync with GPU Scene and cached Nanite MDCs
+			SceneInfo->RequestGPUSceneUpdate(EPrimitiveDirtyState::ChangedOther);
+		}
 	}
 
 	if (bReAddToDrawLists)
 	{
-		CacheMeshDrawCommands(RHICmdList, Scene, SceneInfos);
+		if (EnumHasAnyFlags(UpdateFlags, EUpdateStaticMeshFlags::RasterCommands))
+		{
+			CacheMeshDrawCommands(RHICmdList, Scene, SceneInfos);
+			CacheNaniteDrawCommands(RHICmdList, Scene, SceneInfos);
+		}
+
+	#if RHI_RAYTRACING
+		if (EnumHasAnyFlags(UpdateFlags, EUpdateStaticMeshFlags::RayTracingCommands))
+		{
+			CacheRayTracingPrimitives(Scene, SceneInfos);
+		}
+	#endif
 	}
 }
+
+#if RHI_RAYTRACING
+void FPrimitiveSceneInfo::UpdateCachedRaytracingData(FScene* Scene, const TArrayView<FPrimitiveSceneInfo*>& SceneInfos)
+{
+	if (SceneInfos.Num() > 0)
+	{
+		for (int32 Index = 0; Index < SceneInfos.Num(); Index++)
+		{
+			FPrimitiveSceneInfo* SceneInfo = SceneInfos[Index]; 
+			// should have been marked dirty by calling UpdateCachedRayTracingState on the scene before
+			// scene info is being updated here
+			check(SceneInfo->bCachedRaytracingDataDirty);
+			SceneInfo->RemoveCachedRayTracingPrimitives();
+			SceneInfo->bCachedRaytracingDataDirty = false;
+		}
+
+		CacheRayTracingPrimitives(Scene, SceneInfos);
+	}
+}
+#endif //RHI_RAYTRACING
 
 void FPrimitiveSceneInfo::UpdateUniformBuffer(FRHICommandListImmediate& RHICmdList)
 {
 	checkSlow(bNeedsUniformBufferUpdate);
 	bNeedsUniformBufferUpdate = false;
 	Proxy->UpdateUniformBuffer();
-	AddPrimitiveToUpdateGPU(*Scene, PackedIndex);
+	// TODO: Figure out when and why this is called
+	Scene->GPUScene.AddPrimitiveToUpdate(PackedIndex, EPrimitiveDirtyState::ChangedAll);
 }
 
 void FPrimitiveSceneInfo::BeginDeferredUpdateStaticMeshes()
@@ -1081,10 +1889,21 @@ void FPrimitiveSceneInfo::UnlinkAttachmentGroup()
 			if (AttachmentGroup->Primitives.Num() == 0)
 			{
 				// If this was the owner and the group is empty, remove it (otherwise the above will remove when the last attached goes).
-				Scene->AttachmentGroups.Remove(LightingAttachmentRoot);
+				Scene->AttachmentGroups.Remove(PrimitiveComponentId);
 			}
 		}
 	}
+}
+
+bool FPrimitiveSceneInfo::RequestGPUSceneUpdate(EPrimitiveDirtyState PrimitiveDirtyState)
+{
+	if (Scene && IsIndexValid())
+	{
+		Scene->GPUScene.AddPrimitiveToUpdate(GetIndex(), PrimitiveDirtyState);
+		return true;
+	}
+
+	return false;
 }
 
 void FPrimitiveSceneInfo::GatherLightingAttachmentGroupPrimitives(TArray<FPrimitiveSceneInfo*, SceneRenderingAllocator>& OutChildSceneInfos)
@@ -1223,8 +2042,7 @@ void FPrimitiveSceneInfo::UpdateIndirectLightingCacheBuffer(
 
 void FPrimitiveSceneInfo::UpdateIndirectLightingCacheBuffer()
 {
-	// The update is invalid if the lighting cache allocation was not in a functional state.
-	if (bIndirectLightingCacheBufferDirty && (!IndirectLightingCacheAllocation || (Scene->IndirectLightingCache.IsInitialized() && IndirectLightingCacheAllocation->bHasEverUpdatedSingleSample)))
+	if (bIndirectLightingCacheBufferDirty)
 	{
 		QUICK_SCOPE_CYCLE_COUNTER(STAT_UpdateIndirectLightingCacheBuffer);
 
@@ -1240,7 +2058,8 @@ void FPrimitiveSceneInfo::UpdateIndirectLightingCacheBuffer()
 				Scene->GetFrameNumber(),
 				&Scene->VolumetricLightmapSceneData);
 		}
-		else if (IndirectLightingCacheAllocation)
+		// The update is invalid if the lighting cache allocation was not in a functional state.
+		else if (IndirectLightingCacheAllocation && (Scene->IndirectLightingCache.IsInitialized() && IndirectLightingCacheAllocation->bHasEverUpdatedSingleSample))
 		{
 			UpdateIndirectLightingCacheBuffer(
 				&Scene->IndirectLightingCache,
@@ -1323,5 +2142,34 @@ void FPrimitiveSceneInfo::UpdateComponentLastRenderTime(float CurrentWorldTime, 
 	if (OwnerLastRenderTime)
 	{
 		*OwnerLastRenderTime = CurrentWorldTime; // Sets OwningActor->LastRenderTime
+	}
+}
+
+void FPrimitiveOctreeSemantics::SetOctreeNodeIndex(const FPrimitiveSceneInfoCompact& Element, FOctreeElementId2 Id)
+{
+	// When a Primitive is removed from the renderer, it's index will be invalidated.  Only update if the primitive still
+	// has a valid index.
+	if (Element.PrimitiveSceneInfo->IsIndexValid())
+	{
+		Element.PrimitiveSceneInfo->Scene->PrimitiveOctreeIndex[Element.PrimitiveSceneInfo->GetIndex()] = Id.GetNodeIndex();
+	}
+}
+
+FString FPrimitiveSceneInfo::GetFullnameForDebuggingOnly() const
+{
+	// This is not correct to access component from rendering thread, but this is for debugging only
+	if (ComponentForDebuggingOnly)
+	{	
+		return ComponentForDebuggingOnly->GetFullGroupName(false);
+	}
+	return FString(TEXT("Unknown Object"));
+}
+
+void FPrimitiveSceneInfo::SetCacheShadowAsStatic(bool bStatic)
+{
+	if (bCacheShadowAsStatic != bStatic)
+	{
+		bCacheShadowAsStatic = bStatic;
+		RequestGPUSceneUpdate(EPrimitiveDirtyState::ChangedOther);
 	}
 }

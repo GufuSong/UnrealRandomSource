@@ -5,13 +5,21 @@
 =============================================================================*/
 
 #include "RHI.h"
+#include "RHITransientResourceAllocator.h"
 #include "Modules/ModuleManager.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/MessageDialog.h"
 #include "RHIShaderFormatDefinitions.inl"
 #include "ProfilingDebugging/CsvProfiler.h"
+#include "String/Find.h"
 #include "String/LexFromString.h"
 #include "String/ParseTokens.h"
+#include "Misc/BufferedOutputDevice.h"
+#include "Misc/OutputDeviceFile.h"
+
+#if RHI_ENABLE_RESOURCE_INFO
+#include "HAL/FileManager.h"
+#endif
 
 IMPLEMENT_MODULE(FDefaultModuleImpl, RHI);
 
@@ -40,23 +48,16 @@ DEFINE_STAT(STAT_TextureMemoryCube);
 DEFINE_STAT(STAT_UniformBufferMemory);
 DEFINE_STAT(STAT_IndexBufferMemory);
 DEFINE_STAT(STAT_VertexBufferMemory);
+DEFINE_STAT(STAT_RTAccelerationStructureMemory);
 DEFINE_STAT(STAT_StructuredBufferMemory);
 DEFINE_STAT(STAT_PixelBufferMemory);
 
-IMPLEMENT_TYPE_LAYOUT(FRHIUniformBufferLayout);
-IMPLEMENT_TYPE_LAYOUT(FRHIUniformBufferLayout::FResourceParameter);
+IMPLEMENT_TYPE_LAYOUT(FRHIUniformBufferLayoutInitializer);
+IMPLEMENT_TYPE_LAYOUT(FRHIUniformBufferResource);
 
 #if !defined(RHIRESOURCE_NUM_FRAMES_TO_EXPIRE)
 	#define RHIRESOURCE_NUM_FRAMES_TO_EXPIRE 3
 #endif
-
-static FAutoConsoleVariable CVarUseVulkanRealUBs(
-	TEXT("r.Vulkan.UseRealUBs"),
-	1,
-	TEXT("0: Emulate uniform buffers on Vulkan SM4/SM5 (debugging ONLY)\n")
-	TEXT("1: Use real uniform buffers [default]"),
-	ECVF_ReadOnly
-	);
 
 static TAutoConsoleVariable<int32> CVarDisableEngineAndAppRegistration(
 	TEXT("r.DisableEngineAndAppRegistration"),
@@ -112,15 +113,6 @@ inline FString BuildEnumNameBitList(EnumType Value, const TCHAR*(*GetEnumName)(E
 
 FString GetRHIAccessName(ERHIAccess Access)
 {
-	switch (Access)
-	{
-		// Cases for legacy resource state, to make the huge bit combinations easier to read...
-	case ERHIAccess::EReadable:  return TEXT("EReadable");
-	case ERHIAccess::EWritable:  return TEXT("EWritable");
-	case ERHIAccess::ERWBarrier: return TEXT("ERWBarrier");
-
-		// All other states are built as a logic OR of state bits.
-	default:
 		return BuildEnumNameBitList<ERHIAccess>(Access, [](ERHIAccess AccessBit)
 		{
 			switch (AccessBit)
@@ -142,9 +134,12 @@ FString GetRHIAccessName(ERHIAccess Access)
 			case ERHIAccess::CopyDest:            return TEXT("CopyDest");
 			case ERHIAccess::ResolveDst:          return TEXT("ResolveDst");
 			case ERHIAccess::DSVWrite:            return TEXT("DSVWrite");
+			case ERHIAccess::ShadingRateSource:	  return TEXT("ShadingRateSource");
+			case ERHIAccess::BVHRead:             return TEXT("BVHRead");
+			case ERHIAccess::BVHWrite:            return TEXT("BVHWrite");
+			case ERHIAccess::Discard:             return TEXT("Discard");
 			}
 		});
-	}
 }
 
 FString GetResourceTransitionFlagsName(EResourceTransitionFlags Flags)
@@ -156,6 +151,8 @@ FString GetResourceTransitionFlagsName(EResourceTransitionFlags Flags)
 		default: checkNoEntry(); // fall through
 		case EResourceTransitionFlags::None:                return TEXT("None");
 		case EResourceTransitionFlags::MaintainCompression: return TEXT("MaintainCompression");
+		case EResourceTransitionFlags::Discard:				return TEXT("Discard");
+		case EResourceTransitionFlags::Clear:				return TEXT("Clear");
 		}
 	});
 }
@@ -175,6 +172,80 @@ FString GetRHIPipelineName(ERHIPipeline Pipeline)
 	});
 }
 
+FString GetBufferUsageFlagsName(EBufferUsageFlags BufferUsage)
+{
+	return BuildEnumNameBitList<EBufferUsageFlags>(BufferUsage, [](EBufferUsageFlags BufferUsage)
+	{
+		switch (BufferUsage)
+		{
+		default: checkNoEntry(); // fall through
+		case BUF_None:					return TEXT("BUF_None");
+		case BUF_Static:				return TEXT("BUF_Static");
+		case BUF_Dynamic:				return TEXT("BUF_Dynamic");
+		case BUF_Volatile:				return TEXT("BUF_Volitile");
+		case BUF_UnorderedAccess:		return TEXT("BUF_UnorderedAccess");
+		case BUF_ByteAddressBuffer:		return TEXT("BUF_ByteAddressBuffer");
+		case BUF_SourceCopy:			return TEXT("BUF_SourceCopy");
+		case BUF_StreamOutput:			return TEXT("BUF_StreamOutput");
+		case BUF_DrawIndirect:			return TEXT("BUF_DrawIndirect");
+		case BUF_ShaderResource:		return TEXT("BUF_ShaderResource");
+		case BUF_KeepCPUAccessible:		return TEXT("BUF_KeepCPUAccessible");
+		case BUF_FastVRAM:				return TEXT("BUF_FastVRAM");
+		case BUF_Shared:				return TEXT("BUF_Shared");
+		case BUF_AccelerationStructure:	return TEXT("BUF_AccelerationStructure");
+		case BUF_RayTracingScratch:		return TEXT("BUF_RayTracingScratch");
+		case BUF_VertexBuffer:			return TEXT("BUF_VertexBuffer");
+		case BUF_IndexBuffer:			return TEXT("BUF_IndexBuffer");
+		case BUF_StructuredBuffer:		return TEXT("BUF_StructuredBuffer");
+		}
+	});
+}
+
+FString GetTextureCreateFlagsName(ETextureCreateFlags TextureCreateFlags)
+{
+	return BuildEnumNameBitList<ETextureCreateFlags>(TextureCreateFlags, [](ETextureCreateFlags TextureCreateFlags)
+	{
+		switch (TextureCreateFlags)
+		{
+		default: checkNoEntry(); // fall through
+		case TexCreate_None:							return TEXT("TexCreate_None");
+		case TexCreate_RenderTargetable:				return TEXT("TexCreate_RenderTargetable");
+		case TexCreate_ResolveTargetable:				return TEXT("TexCreate_ResolveTargetable");
+		case TexCreate_DepthStencilTargetable:			return TEXT("TexCreate_DepthStencilTargetable");
+		case TexCreate_ShaderResource:					return TEXT("TexCreate_ShaderResource");
+		case TexCreate_SRGB:							return TEXT("TexCreate_SRGB");
+		case TexCreate_CPUWritable:						return TEXT("TexCreate_CPUWritable");
+		case TexCreate_NoTiling:						return TEXT("TexCreate_NoTiling");
+		case TexCreate_VideoDecode:						return TEXT("TexCreate_VideoDecode");
+		case TexCreate_Dynamic:							return TEXT("TexCreate_Dynamic");
+		case TexCreate_InputAttachmentRead:				return TEXT("TexCreate_InputAttachmentRead");
+		case TexCreate_Foveation:						return TEXT("TexCreate_Foveation");
+		case TexCreate_3DTiling:						return TEXT("TexCreate_3DTiling");
+		case TexCreate_Memoryless:						return TEXT("TexCreate_Memoryless");
+		case TexCreate_GenerateMipCapable:				return TEXT("TexCreate_GenerateMipCapable");
+		case TexCreate_FastVRAMPartialAlloc:			return TEXT("TexCreate_FastVRAMPartialAlloc");
+		case TexCreate_DisableSRVCreation:				return TEXT("TexCreate_DisableSRVCreation");
+		case TexCreate_DisableDCC:						return TEXT("TexCreate_DisableDCC");
+		case TexCreate_UAV:								return TEXT("TexCreate_UAV");
+		case TexCreate_Presentable:						return TEXT("TexCreate_Presentable");
+		case TexCreate_CPUReadback:						return TEXT("TexCreate_CPUReadback");
+		case TexCreate_OfflineProcessed:				return TEXT("TexCreate_OfflineProcessed");
+		case TexCreate_FastVRAM:						return TEXT("TexCreate_FastVRAM");
+		case TexCreate_HideInVisualizeTexture:			return TEXT("TexCreate_HideInVisualizeTexture");
+		case TexCreate_Virtual:							return TEXT("TexCreate_Virtual");
+		case TexCreate_TargetArraySlicesIndependently:	return TEXT("TexCreate_TargetArraySlicesIndependently");
+		case TexCreate_Shared:							return TEXT("TexCreate_Shared");
+		case TexCreate_NoFastClear:						return TEXT("TexCreate_NoFastClear");
+		case TexCreate_DepthStencilResolveTarget:		return TEXT("TexCreate_DepthStencilResolveTarget");
+		case TexCreate_Streamable:						return TEXT("TexCreate_Streamable");
+		case TexCreate_NoFastClearFinalize:				return TEXT("TexCreate_NoFastClearFinalize");
+		case TexCreate_AFRManual:						return TEXT("TexCreate_AFRManual");
+		case TexCreate_ReduceMemoryWithTilingMode:		return TEXT("TexCreate_ReduceMemoryWithTilingMode");
+		case TexCreate_AtomicCompatible:				return TEXT("TexCreate_AtomicCompatible");
+		case TexCreate_External:						return TEXT("TexCreate_External");
+		}
+	});
+}
 
 #if STATS
 #include "Stats/StatsData.h"
@@ -221,13 +292,15 @@ const FClearValueBinding FClearValueBinding::Green(FLinearColor(0.0f, 1.0f, 0.0f
 // Note: this is used as the default normal for DBuffer decals.  It must decode to a value of 0 in DecodeDBufferData.
 const FClearValueBinding FClearValueBinding::DefaultNormal8Bit(FLinearColor(128.0f / 255.0f, 128.0f / 255.0f, 128.0f / 255.0f, 1.0f));
 
-TLockFreePointerListUnordered<FRHIResource, PLATFORM_CACHE_LINE_SIZE> FRHIResource::PendingDeletes;
+std::atomic<TClosableMpscQueue<FRHIResource*>*> FRHIResource::PendingDeletes { new TClosableMpscQueue<FRHIResource*>() };
+FHazardPointerCollection FRHIResource::PendingDeletesHPC;
 FRHIResource* FRHIResource::CurrentlyDeleting = nullptr;
-TArray<FRHIResource::ResourcesToDelete> FRHIResource::DeferredDeletionQueue;
-uint32 FRHIResource::CurrentFrame = 0;
+
 RHI_API FDrawCallCategoryName* FDrawCallCategoryName::Array[FDrawCallCategoryName::MAX_DRAWCALL_CATEGORY];
-RHI_API int32 FDrawCallCategoryName::DisplayCounts[FDrawCallCategoryName::MAX_DRAWCALL_CATEGORY];
+RHI_API int32 FDrawCallCategoryName::DisplayCounts[FDrawCallCategoryName::MAX_DRAWCALL_CATEGORY][MAX_NUM_GPUS];
 RHI_API int32 FDrawCallCategoryName::NumCategory = 0;
+
+TRefCountPtr<FRHITexture> FRHITextureReference::DefaultTexture;
 
 FString FVertexElement::ToString() const
 {
@@ -302,6 +375,7 @@ uint32 GetTypeHash(const FRasterizerStateInitializerRHI& Initializer)
 	Hash = HashCombine(Hash, GetTypeHash(Initializer.CullMode));
 	Hash = HashCombine(Hash, GetTypeHash(Initializer.DepthBias));
 	Hash = HashCombine(Hash, GetTypeHash(Initializer.SlopeScaleDepthBias));
+	Hash = HashCombine(Hash, GetTypeHash(Initializer.DepthClipMode));
 	Hash = HashCombine(Hash, GetTypeHash(Initializer.bAllowMSAA));
 	Hash = HashCombine(Hash, GetTypeHash(Initializer.bEnableLineAA));
 	return Hash;
@@ -313,7 +387,8 @@ bool operator== (const FRasterizerStateInitializerRHI& A, const FRasterizerState
 		A.FillMode == B.FillMode && 
 		A.CullMode == B.CullMode && 
 		A.DepthBias == B.DepthBias && 
-		A.SlopeScaleDepthBias == B.SlopeScaleDepthBias && 
+		A.SlopeScaleDepthBias == B.SlopeScaleDepthBias &&
+		A.DepthClipMode == B.DepthClipMode &&
 		A.bAllowMSAA == B.bAllowMSAA && 
 		A.bEnableLineAA == B.bEnableLineAA;
 	return bSame;
@@ -475,6 +550,7 @@ void FBlendStateInitializerRHI::FromString(const FStringView& InSrc)
 uint32 GetTypeHash(const FBlendStateInitializerRHI& Initializer)
 {
 	uint32 Hash = GetTypeHash(Initializer.bUseIndependentRenderTargetBlendStates);
+	Hash = HashCombine(Hash, Initializer.bUseAlphaToCoverage);
 	for (int32 i = 0; i < MaxSimultaneousRenderTargets; ++i)
 	{
 		Hash = HashCombine(Hash, GetTypeHash(Initializer.RenderTargets[i]));
@@ -486,6 +562,7 @@ uint32 GetTypeHash(const FBlendStateInitializerRHI& Initializer)
 bool operator== (const FBlendStateInitializerRHI& A, const FBlendStateInitializerRHI& B)
 {
 	bool bSame = A.bUseIndependentRenderTargetBlendStates == B.bUseIndependentRenderTargetBlendStates;
+	bSame = bSame && A.bUseAlphaToCoverage == B.bUseAlphaToCoverage;
 	for (int32 i = 0; i < MaxSimultaneousRenderTargets && bSame; ++i)
 	{
 		bSame = bSame && A.RenderTargets[i] == B.RenderTargets[i];
@@ -557,6 +634,576 @@ bool operator==(const FBlendStateInitializerRHI::FRenderTarget& A, const FBlendS
 	return bSame;
 }
 
+#if RHI_ENABLE_RESOURCE_INFO
+
+static FCriticalSection GRHIResourceTrackingCriticalSection;
+static TSet<FRHIResource*> GRHITrackedResources;
+static bool GRHITrackingResources = false;
+
+void FRHIResource::BeginTrackingResource(FRHIResource* InResource)
+{
+	if (GRHITrackingResources)
+	{
+		LLM_SCOPE_BYNAME(TEXT("RHIMisc/ResourceTracking"));
+
+		FScopeLock Lock(&GRHIResourceTrackingCriticalSection);
+
+		InResource->bBeingTracked = true;
+
+		GRHITrackedResources.Add(InResource);
+	}
+}
+
+void FRHIResource::EndTrackingResource(FRHIResource* InResource)
+{
+	if (InResource->bBeingTracked)
+	{
+		FScopeLock Lock(&GRHIResourceTrackingCriticalSection);
+		GRHITrackedResources.Remove(InResource);
+		InResource->bBeingTracked = false;
+	}
+}
+
+void FRHIResource::StartTrackingAllResources()
+{
+	GRHITrackingResources = true;
+}
+
+void FRHIResource::StopTrackingAllResources()
+{
+	FScopeLock Lock(&GRHIResourceTrackingCriticalSection);
+	for (FRHIResource* Resource : GRHITrackedResources)
+	{
+		if (Resource)
+		{
+			Resource->bBeingTracked = false;
+		}
+	}
+	GRHITrackedResources.Empty();
+	GRHITrackingResources = false;
+}
+
+struct FRHIResourceTypeName
+{
+	ERHIResourceType Type;
+	const TCHAR* Name;
+};
+static const FRHIResourceTypeName GRHIResourceTypeNames[] =
+{
+#define RHI_RESOURCE_TYPE_DEF(Name) { RRT_##Name, TEXT(#Name) }
+
+	RHI_RESOURCE_TYPE_DEF(None),
+	RHI_RESOURCE_TYPE_DEF(SamplerState),
+	RHI_RESOURCE_TYPE_DEF(RasterizerState),
+	RHI_RESOURCE_TYPE_DEF(DepthStencilState),
+	RHI_RESOURCE_TYPE_DEF(BlendState),
+	RHI_RESOURCE_TYPE_DEF(VertexDeclaration),
+	RHI_RESOURCE_TYPE_DEF(VertexShader),
+	RHI_RESOURCE_TYPE_DEF(MeshShader),
+	RHI_RESOURCE_TYPE_DEF(AmplificationShader),
+	RHI_RESOURCE_TYPE_DEF(PixelShader),
+	RHI_RESOURCE_TYPE_DEF(GeometryShader),
+	RHI_RESOURCE_TYPE_DEF(RayTracingShader),
+	RHI_RESOURCE_TYPE_DEF(ComputeShader),
+	RHI_RESOURCE_TYPE_DEF(GraphicsPipelineState),
+	RHI_RESOURCE_TYPE_DEF(ComputePipelineState),
+	RHI_RESOURCE_TYPE_DEF(RayTracingPipelineState),
+	RHI_RESOURCE_TYPE_DEF(BoundShaderState),
+	RHI_RESOURCE_TYPE_DEF(UniformBufferLayout),
+	RHI_RESOURCE_TYPE_DEF(UniformBuffer),
+	RHI_RESOURCE_TYPE_DEF(Buffer),
+	RHI_RESOURCE_TYPE_DEF(Texture),
+	RHI_RESOURCE_TYPE_DEF(Texture2D),
+	RHI_RESOURCE_TYPE_DEF(Texture2DArray),
+	RHI_RESOURCE_TYPE_DEF(Texture3D),
+	RHI_RESOURCE_TYPE_DEF(TextureCube),
+	RHI_RESOURCE_TYPE_DEF(TextureReference),
+	RHI_RESOURCE_TYPE_DEF(TimestampCalibrationQuery),
+	RHI_RESOURCE_TYPE_DEF(GPUFence),
+	RHI_RESOURCE_TYPE_DEF(RenderQuery),
+	RHI_RESOURCE_TYPE_DEF(RenderQueryPool),
+	RHI_RESOURCE_TYPE_DEF(ComputeFence),
+	RHI_RESOURCE_TYPE_DEF(Viewport),
+	RHI_RESOURCE_TYPE_DEF(UnorderedAccessView),
+	RHI_RESOURCE_TYPE_DEF(ShaderResourceView),
+	RHI_RESOURCE_TYPE_DEF(RayTracingAccelerationStructure),
+	RHI_RESOURCE_TYPE_DEF(StagingBuffer),
+	RHI_RESOURCE_TYPE_DEF(CustomPresent),
+	RHI_RESOURCE_TYPE_DEF(ShaderLibrary),
+	RHI_RESOURCE_TYPE_DEF(PipelineBinaryLibrary),
+};
+
+static ERHIResourceType RHIResourceTypeFromString(const FString& InString)
+{
+	for (const auto& TypeName : GRHIResourceTypeNames)
+	{
+		if (InString.Equals(TypeName.Name, ESearchCase::IgnoreCase))
+		{
+			return TypeName.Type;
+		}
+	}
+	return RRT_None;
+}
+
+const TCHAR* StringFromRHIResourceType(ERHIResourceType ResourceType)
+{
+	for (const auto& TypeName : GRHIResourceTypeNames)
+	{
+		if (TypeName.Type == ResourceType)
+		{
+			return TypeName.Name;
+		}
+	}
+	return TEXT("<unknown>");
+}
+
+enum class EBooleanFilter
+{
+	No,
+	Yes,
+	All
+};
+
+static EBooleanFilter ParseBooleanFilter(const FString& InText)
+{
+	if (InText.Equals(TEXT("No"), ESearchCase::IgnoreCase))
+	{
+		return EBooleanFilter::No;
+	}
+	if (InText.Equals(TEXT("Yes"), ESearchCase::IgnoreCase))
+	{
+		return EBooleanFilter::Yes;
+	}
+	if (InText.Equals(TEXT("All"), ESearchCase::IgnoreCase))
+	{
+		return EBooleanFilter::All;
+	}
+	return EBooleanFilter::No;
+}
+
+static FAutoConsoleCommandWithWorldArgsAndOutputDevice GDumpRHIResourceCountsCmd(
+	TEXT("rhi.DumpResourceCounts"),
+	TEXT("Dumps RHI resource counts to the log"),
+	FConsoleCommandWithWorldArgsAndOutputDeviceDelegate::CreateStatic([](const TArray<FString>& Args, UWorld*, FOutputDevice& OutputDevice)
+{
+	int32 ResourceCounts[RRT_Num]{};
+	int32 TotalResources{};
+
+	FRHIResourceInfo ResourceInfo;
+
+	{
+		FScopeLock Lock(&GRHIResourceTrackingCriticalSection);
+
+		TotalResources = GRHITrackedResources.Num();
+
+		for (const FRHIResource* Resource : GRHITrackedResources)
+		{
+			if (Resource)
+			{
+				ERHIResourceType ResourceType = Resource->GetType();
+				if (ResourceType > 0 && ResourceType < RRT_Num)
+				{
+					ResourceCounts[ResourceType]++;
+				}
+			}
+		}
+	}
+
+	FBufferedOutputDevice BufferedOutput;
+	FName CategoryName(TEXT("RHIResources"));
+
+	BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("RHIResource Counts"));
+
+	for (int32 Index = 0; Index < RRT_Num; Index++)
+	{
+		const int32 CurrentCount = ResourceCounts[Index];
+		if (CurrentCount > 0)
+		{
+			BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("%s: %d"),
+				StringFromRHIResourceType((ERHIResourceType)Index),
+				CurrentCount);
+		}
+	}
+	BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("Total: %d"), TotalResources);
+
+	BufferedOutput.RedirectTo(OutputDevice);
+}));
+
+void RHIDumpResourceMemory(const FString& NameFilter, ERHIResourceType TypeFilter, EBooleanFilter TransientFilter, int32 NumberOfResourcesToShow, bool bUseCSVOutput, bool bSummaryOutput, bool bOutputToCSVFile, FBufferedOutputDevice& BufferedOutput)
+{	
+	FArchive* CSVFile{ nullptr };
+	if (bOutputToCSVFile)
+	{
+		const FString Filename = FString::Printf(TEXT("%srhiDumpResourceMemory-%s.csv"), *FPaths::ProfilingDir(), *FDateTime::Now().ToString());
+		CSVFile = IFileManager::Get().CreateFileWriter(*Filename, FILEWRITE_AllowRead);
+	}
+
+	TCHAR ResourceNameBuffer[FName::StringBufferSize];
+
+	auto ShouldIncludeResource = [&](const FRHIResource* Resource, const FRHIResourceInfo& ResourceInfo) -> bool
+	{
+		if (!NameFilter.IsEmpty())
+		{
+			if (ResourceInfo.Name.ToString(ResourceNameBuffer) == 0 || UE::String::FindFirst(ResourceNameBuffer, *NameFilter, ESearchCase::IgnoreCase) == INDEX_NONE)
+			{
+				return false;
+			}
+		}
+		if (TypeFilter != RRT_None)
+		{
+			if (TypeFilter == RRT_Texture)
+			{
+				if (ResourceInfo.Type != RRT_Texture2D &&
+					ResourceInfo.Type != RRT_Texture2DArray &&
+					ResourceInfo.Type != RRT_Texture3D &&
+					ResourceInfo.Type != RRT_TextureCube)
+				{
+					return false;
+				}
+			}
+			else if (TypeFilter != ResourceInfo.Type)
+			{
+				return false;
+			}
+		}
+		if (TransientFilter != EBooleanFilter::All)
+		{
+			const bool bAllowedFlag = TransientFilter == EBooleanFilter::Yes ? true : false;
+			if (ResourceInfo.IsTransient != bAllowedFlag)
+			{
+				return false;
+			}
+		}
+		return true;
+	};
+
+	struct FLocalResourceEntry
+	{
+		const FRHIResource* Resource;
+		FRHIResourceInfo ResourceInfo;
+	};
+	TArray<FLocalResourceEntry> Resources;
+
+	FScopeLock Lock(&GRHIResourceTrackingCriticalSection);
+
+	int32 TotalResourcesWithInfo = 0;
+	int32 TotalTrackedResources = 0;
+	int64 TotalTrackedResourceSize = 0;
+	int64 TotalTrackedTransientResourceSize = 0;
+
+	{
+		FRHIResourceInfo ResourceInfo;
+		TotalTrackedResources = GRHITrackedResources.Num();
+
+		for (const FRHIResource* Resource : GRHITrackedResources)
+		{
+			if (Resource && Resource->GetResourceInfo(ResourceInfo))
+			{
+				ResourceInfo.bValid = Resource->IsValid();
+
+				if (ShouldIncludeResource(Resource, ResourceInfo))
+				{
+					Resources.Emplace(FLocalResourceEntry{ Resource, ResourceInfo });
+				}
+
+				TotalResourcesWithInfo++;
+				if (ResourceInfo.IsTransient)
+				{
+					TotalTrackedTransientResourceSize += ResourceInfo.VRamAllocation.AllocationSize;
+				}
+				else
+				{
+					TotalTrackedResourceSize += ResourceInfo.VRamAllocation.AllocationSize;
+				}
+			}
+		}
+	}
+
+	const int32 NumberOfResourcesBeforeNumberFilter = Resources.Num();
+	if (NumberOfResourcesToShow < 0 || NumberOfResourcesToShow > Resources.Num())
+	{
+		NumberOfResourcesToShow = Resources.Num();
+	}
+
+	Resources.Sort([](const FLocalResourceEntry& EntryA, const FLocalResourceEntry& EntryB)
+	{
+		return EntryA.ResourceInfo.VRamAllocation.AllocationSize > EntryB.ResourceInfo.VRamAllocation.AllocationSize;
+	});
+
+	FName CategoryName(TEXT("RHIResources"));
+
+	if (bOutputToCSVFile)
+	{
+		const TCHAR* Header = TEXT("Name,Type,Size,MarkedForDelete,Transient,Streaming,RenderTarget,UAV,\"Raytracing Acceleration Structure\"\n");
+		CSVFile->Serialize(TCHAR_TO_ANSI(Header), FPlatformString::Strlen(Header));
+	}
+	else if (bUseCSVOutput)
+	{
+		BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("Name,Type,Size,MarkedForDelete,Transient,Streaming,RenderTarget,UAV,\"Raytracing Acceleration Structure\""));
+	}
+	else
+	{
+		if (bSummaryOutput == false)
+		{
+			BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("Tracked RHIResources (%d total with info, %d total tracked)"), TotalResourcesWithInfo, TotalTrackedResources);
+		}
+
+		if (NumberOfResourcesToShow != NumberOfResourcesBeforeNumberFilter)
+		{
+			BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("Showing %d of %d matched resources"), NumberOfResourcesToShow, NumberOfResourcesBeforeNumberFilter);
+		}
+	}
+
+	int64 TotalShownResourceSize = 0;
+
+	for (int32 Index = 0; Index < Resources.Num(); Index++)
+	{
+		if (Index < NumberOfResourcesToShow)
+		{
+			const FRHIResourceInfo& ResourceInfo = Resources[Index].ResourceInfo;
+
+			ResourceInfo.Name.ToString(ResourceNameBuffer);
+			const TCHAR* ResourceType = StringFromRHIResourceType(ResourceInfo.Type);
+			const int64 SizeInBytes = ResourceInfo.VRamAllocation.AllocationSize;
+
+			bool bMarkedForDelete = !ResourceInfo.bValid;
+			bool bTransient = ResourceInfo.IsTransient;
+			bool bStreaming = false;
+			bool bRT = false;
+			bool bDS = false;
+			bool bUAV = false;
+			bool bRTAS = false;
+
+			bool bIsTexture = ResourceInfo.Type == RRT_Texture ||
+				ResourceInfo.Type == RRT_Texture2D ||
+				ResourceInfo.Type == RRT_Texture2DArray ||
+				ResourceInfo.Type == RRT_Texture3D ||
+				ResourceInfo.Type == RRT_TextureCube;
+			if (bIsTexture)
+			{
+				FRHITexture* Texture = (FRHITexture*)Resources[Index].Resource;
+				bRT = EnumHasAnyFlags(Texture->GetFlags(), TexCreate_RenderTargetable);
+				bDS = EnumHasAnyFlags(Texture->GetFlags(), TexCreate_DepthStencilTargetable);
+				bUAV = EnumHasAnyFlags(Texture->GetFlags(), TexCreate_UAV);
+				bStreaming = EnumHasAnyFlags(Texture->GetFlags(), TexCreate_Streamable);
+			}
+			else if (ResourceInfo.Type == RRT_Buffer)
+			{
+				FRHIBuffer* Buffer = (FRHIBuffer*)Resources[Index].Resource;
+				bUAV = EnumHasAnyFlags((EBufferUsageFlags)Buffer->GetUsage(), BUF_UnorderedAccess);
+				bRTAS = EnumHasAnyFlags((EBufferUsageFlags)Buffer->GetUsage(), BUF_AccelerationStructure);
+			}
+
+			if (bSummaryOutput == false)
+			{
+				if (bOutputToCSVFile)
+				{					
+					const FString Row = FString::Printf(TEXT("%s,%s,%.9f,%s,%s,%s,%s,%s,%s\n"),
+						ResourceNameBuffer,
+						ResourceType,
+						SizeInBytes / double(1 << 20),
+						bMarkedForDelete ? TEXT("Yes") : TEXT("No"),
+						bTransient ? TEXT("Yes") : TEXT("No"),
+						bStreaming ? TEXT("Yes") : TEXT("No"),
+						(bRT || bDS) ? TEXT("Yes") : TEXT("No"),
+						bUAV ? TEXT("Yes") : TEXT("No"),
+						bRTAS ? TEXT("Yes") : TEXT("No"));
+
+					CSVFile->Serialize(TCHAR_TO_ANSI(*Row), Row.Len());
+				}
+				else if (bUseCSVOutput)
+				{
+					BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("%s,%s,%.9f,%s,%s,%s,%s,%s,%s"),
+						ResourceNameBuffer,
+						ResourceType,
+						SizeInBytes / double(1 << 20),
+						bMarkedForDelete ? TEXT("Yes") : TEXT("No"),
+						bTransient ? TEXT("Yes") : TEXT("No"),
+						bStreaming ? TEXT("Yes") : TEXT("No"),
+						(bRT || bDS) ? TEXT("Yes") : TEXT("No"),
+						bUAV ? TEXT("Yes") : TEXT("No"),
+						bRTAS ? TEXT("Yes") : TEXT("No"));
+				}
+				else
+				{
+					FString ResoureFlags;
+					bool bHasFlag = false;
+					if (bTransient)
+					{
+						ResoureFlags += "Transient";
+						bHasFlag = true;
+					}
+					if (bStreaming)
+					{
+						ResoureFlags += bHasFlag ? "|Streaming" : "Streaming";
+						bHasFlag = true;
+					}
+					if (bRT)
+					{
+						ResoureFlags += bHasFlag ? "|RT" : "RT";
+						bHasFlag = true;
+					}
+					else if (bDS)
+					{
+						ResoureFlags += bHasFlag ? "|DS" : "DS";
+						bHasFlag = true;
+					}
+					if (bUAV)
+					{
+						ResoureFlags += bHasFlag ? "|UAV" : "UAV";
+						bHasFlag = true;
+					}
+					if (bRTAS)
+					{
+						ResoureFlags += bHasFlag ? "|RTAS" : "RTAS";
+						bHasFlag = true;
+
+					}
+
+					BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("Name: %s - Type: %s - Size: %.9f MB - Flags: %s"),
+						ResourceNameBuffer,
+						ResourceType,
+						SizeInBytes / double(1 << 20),
+						bHasFlag ? *ResoureFlags : TEXT("None"));
+				}
+			}
+
+			TotalShownResourceSize += SizeInBytes;
+		}
+	}
+
+	if (bOutputToCSVFile)
+	{
+		delete CSVFile;
+		CSVFile = nullptr;
+	}
+	else if (!bUseCSVOutput)
+	{
+		const double TotalNonTransientSizeF = TotalTrackedResourceSize / double(1 << 20);
+		const double TotalTransientSizeF = TotalTrackedTransientResourceSize / double(1 << 20);
+		const double TotalSizeF = (TotalTrackedResourceSize + TotalTrackedTransientResourceSize) / double(1 << 20);
+		const double ShownSizeF = TotalShownResourceSize / double(1 << 20);
+
+		if (NumberOfResourcesToShow != TotalResourcesWithInfo)
+		{
+			double TotalSizeToUse = 0.0;
+			const TCHAR* ExtraText = TEXT("");
+
+			if (TransientFilter == EBooleanFilter::No)
+			{
+				TotalSizeToUse = TotalNonTransientSizeF;
+				ExtraText = TEXT(" non-transient");
+			}
+			else if (TransientFilter == EBooleanFilter::Yes)
+			{
+				TotalSizeToUse = TotalTransientSizeF;
+				ExtraText = TEXT(" transient");
+			}
+			else
+			{
+				TotalSizeToUse = TotalSizeF;
+				ExtraText = TEXT("");
+			}
+
+			if (TotalSizeToUse == 0.0)
+			{
+				TotalSizeToUse = TotalSizeF;
+			}
+
+			BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("Shown %d entries%s. Size: %.2f/%.2f MB (%.2f%% of total%s)"),
+				NumberOfResourcesToShow, !NameFilter.IsEmpty() ? *FString::Printf(TEXT(" with name %s"), *NameFilter) : TEXT(""), ShownSizeF, TotalSizeToUse, 100.0 * ShownSizeF / TotalSizeToUse, ExtraText);
+		}
+
+		if (bSummaryOutput == false)
+		{
+			BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("Total tracked resource size: %.9f MB"), TotalSizeF);
+			if (TotalTrackedTransientResourceSize > 0)
+			{
+				BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("    Non-Transient: %.9f MB"), TotalNonTransientSizeF);
+				BufferedOutput.CategorizedLogf(CategoryName, ELogVerbosity::Log, TEXT("    Transient: %.9f MB"), TotalTransientSizeF);
+			}
+		}
+	}
+}
+
+static FAutoConsoleCommandWithWorldArgsAndOutputDevice GDumpRHIResourceMemoryCmd(
+	TEXT("rhi.DumpResourceMemory"),
+	TEXT("Dumps RHI resource memory stats to the log\n")
+	TEXT("Usage: rhi.DumpResourceMemory [<Number To Show>] [all] [summary] [Name=<Filter Text>] [Type=<RHI Resource Type>] [Transient=<no, yes, or all> [csv]"),
+	FConsoleCommandWithWorldArgsAndOutputDeviceDelegate::CreateStatic([](const TArray<FString>& Args, UWorld*, FOutputDevice& OutputDevice)
+{
+	FString NameFilter;
+	ERHIResourceType TypeFilter = RRT_None;
+	EBooleanFilter TransientFilter = EBooleanFilter::No;
+	int32 NumberOfResourcesToShow = 50;
+	bool bUseCSVOutput = false;
+	bool bSummaryOutput = false;
+	bool bOutputToCSVFile = false;
+
+	for (const FString& Argument : Args)
+	{
+		if (Argument.Equals(TEXT("all"), ESearchCase::IgnoreCase))
+		{
+			NumberOfResourcesToShow = -1;
+		}
+		else if (Argument.Equals(TEXT("-csv"), ESearchCase::IgnoreCase))
+		{
+			bUseCSVOutput = true;
+		}
+		else if (Argument.Equals(TEXT("-csvfile"), ESearchCase::IgnoreCase))
+		{
+			bOutputToCSVFile = true;
+		}
+		else if (Argument.StartsWith(TEXT("Name="), ESearchCase::IgnoreCase))
+		{
+			NameFilter = Argument.RightChop(5);
+		}
+		else if (Argument.StartsWith(TEXT("Type="), ESearchCase::IgnoreCase))
+		{
+			TypeFilter = RHIResourceTypeFromString(Argument.RightChop(5));
+		}
+		else if (Argument.StartsWith(TEXT("Transient="), ESearchCase::IgnoreCase))
+		{
+			TransientFilter = ParseBooleanFilter(Argument.RightChop(10));
+		}
+		else if (FCString::IsNumeric(*Argument))
+		{
+			LexFromString(NumberOfResourcesToShow, *Argument);
+		}
+		else if (Argument.Equals(TEXT("summary"), ESearchCase::IgnoreCase))
+		{
+			// Respects name, type and transient filters but only reports total sizes.
+			// Does not report a list of individual resources.
+			bSummaryOutput = true;
+			NumberOfResourcesToShow = -1;
+		}
+		else
+		{
+			NameFilter = Argument;
+		}
+	}
+
+	FBufferedOutputDevice BufferedOutput;
+	RHIDumpResourceMemory(NameFilter, TypeFilter, TransientFilter, NumberOfResourcesToShow, bUseCSVOutput, bSummaryOutput, bOutputToCSVFile, BufferedOutput);
+	BufferedOutput.RedirectTo(OutputDevice);
+}));
+
+void RHIDumpResourceMemoryToCSV()
+{
+	FString NameFilter;
+	ERHIResourceType TypeFilter = RRT_None;
+	EBooleanFilter TransientFilter = EBooleanFilter::No;
+	int32 NumberOfResourcesToShow = -1;
+	bool bUseCSVOutput = false;
+	bool bSummaryOutput = false;
+	bool bOutputToCSVFile = true;
+
+	FBufferedOutputDevice BufferedOutput;
+	RHIDumpResourceMemory(NameFilter, TypeFilter, TransientFilter, NumberOfResourcesToShow, bUseCSVOutput, bSummaryOutput, bOutputToCSVFile, BufferedOutput);
+}
+
+#endif // RHI_ENABLE_RESOURCE_INFO
+
 bool FRHIResource::Bypass()
 {
 	return GRHICommandList.Bypass();
@@ -564,112 +1211,40 @@ bool FRHIResource::Bypass()
 
 DECLARE_CYCLE_STAT(TEXT("Delete Resources"), STAT_DeleteResources, STATGROUP_RHICMDLIST);
 
-void FRHIResource::FlushPendingDeletes(bool bFlushDeferredDeletes)
+int32 FRHIResource::FlushPendingDeletes(FRHICommandListImmediate& RHICmdList)
 {
 	SCOPE_CYCLE_COUNTER(STAT_DeleteResources);
 
 	check(IsInRenderingThread());
 
-	FRHICommandListImmediate& RHICmdList = FRHICommandListExecutor::GetImmediateCommandList();
-#if ENABLE_RHI_VALIDATION
-	if (GDynamicRHI)
-	{
-		// Submit all remaining work to the GPU. This also ensures that validation RHI barrier tracking
-		// operations have been flushed before we delete any resources they could be referring to.
-		RHICmdList.SubmitCommandsHint();
-	}
-#endif
-	RHICmdList.ImmediateFlush(EImmediateFlushType::FlushRHIThread);
-	FRHICommandListExecutor::CheckNoOutstandingCmdLists();
-	if (GDynamicRHI)
-	{
-		GDynamicRHI->RHIPerFrameRHIFlushComplete();
-	}
+	TArray<FRHIResource*> DeletedResources;
+	TClosableMpscQueue<FRHIResource*>* PendingDeletesPtr = PendingDeletes.exchange(new TClosableMpscQueue<FRHIResource*>());
+	PendingDeletesPtr->Close([&DeletedResources](FRHIResource* Resource)
+	{	
+		DeletedResources.Push(Resource);
+	});
+	PendingDeletesHPC.Delete(PendingDeletesPtr);
 
-	auto Delete = [](TArray<FRHIResource*>& ToDelete)
+	const int32 NumDeletes = DeletedResources.Num();
+
+	RHICmdList.EnqueueLambda([DeletedResources = MoveTemp(DeletedResources)](FRHICommandListImmediate& RHICmdList) mutable
 	{
-		for (int32 Index = 0; Index < ToDelete.Num(); Index++)
+		if (GDynamicRHI)
 		{
-			FRHIResource* Ref = ToDelete[Index];
-			check(Ref->MarkedForDelete == 1);
-			if (Ref->GetRefCount() == 0) // caches can bring dead objects back to life
+			GDynamicRHI->RHIPerFrameRHIFlushComplete();
+		}
+
+		for (FRHIResource* Resource : DeletedResources)
+		{
+			if (Resource->AtomicFlags.Deleteing())
 			{
-				CurrentlyDeleting = Ref;
-				delete Ref;
-				CurrentlyDeleting = nullptr;
-			}
-			else
-			{
-				Ref->MarkedForDelete = 0;
-				FPlatformMisc::MemoryBarrier();
+				FRHIResource::CurrentlyDeleting = Resource;
+				delete Resource;
 			}
 		}
-	};
+	});
 
-	while (1)
-	{
-		if (PendingDeletes.IsEmpty())
-		{
-			break;
-		}
-		if (PlatformNeedsExtraDeletionLatency())
-		{
-			const int32 Index = DeferredDeletionQueue.AddDefaulted();
-			ResourcesToDelete& ResourceBatch = DeferredDeletionQueue[Index];
-			ResourceBatch.FrameDeleted = CurrentFrame;
-			PendingDeletes.PopAll(ResourceBatch.Resources);
-			check(ResourceBatch.Resources.Num());
-		}
-		else
-		{
-			TArray<FRHIResource*> ToDelete;
-			PendingDeletes.PopAll(ToDelete);
-			check(ToDelete.Num());
-			Delete(ToDelete);
-		}
-	}
-
-	const uint32 NumFramesToExpire = RHIRESOURCE_NUM_FRAMES_TO_EXPIRE;
-
-	if (DeferredDeletionQueue.Num())
-	{
-		if (bFlushDeferredDeletes)
-		{
-			FRHICommandListExecutor::GetImmediateCommandList().BlockUntilGPUIdle();
-
-			for (int32 Idx = 0; Idx < DeferredDeletionQueue.Num(); ++Idx)
-			{
-				ResourcesToDelete& ResourceBatch = DeferredDeletionQueue[Idx];
-				Delete(ResourceBatch.Resources);
-			}
-
-			DeferredDeletionQueue.Empty();
-		}
-		else
-		{
-			int32 DeletedBatchCount = 0;
-			while (DeletedBatchCount < DeferredDeletionQueue.Num())
-			{
-				ResourcesToDelete& ResourceBatch = DeferredDeletionQueue[DeletedBatchCount];
-				if (((ResourceBatch.FrameDeleted + NumFramesToExpire) < CurrentFrame) || !GIsRHIInitialized)
-				{
-					Delete(ResourceBatch.Resources);
-					++DeletedBatchCount;
-				}
-				else
-				{
-					break;
-				}
-			}
-
-			if (DeletedBatchCount)
-			{
-				DeferredDeletionQueue.RemoveAt(0, DeletedBatchCount);
-			}
-		}
-
-		++CurrentFrame;
-	}
+	return NumDeletes;
 }
 
 static_assert(ERHIZBuffer::FarPlane != ERHIZBuffer::NearPlane, "Near and Far planes must be different!");
@@ -716,6 +1291,97 @@ static TAutoConsoleVariable<int32> CVarGPUCrashDebugging(
 	ECVF_ReadOnly
 	);
 
+static TAutoConsoleVariable<int32> CVarGPUCrashDump(
+	TEXT("r.GPUCrashDump"),
+	0,
+	TEXT("Enable vendor specific GPU crash dumps"),
+	ECVF_ReadOnly
+);
+
+static TAutoConsoleVariable<int32> CVarGPUCrashOnOutOfMemory(
+	TEXT("r.GPUCrashOnOutOfMemory"),
+	0,
+	TEXT("Enable crash reporting on GPU OOM"),
+	ECVF_ReadOnly
+);
+
+static TAutoConsoleVariable<int32> CVarGPUCrashDebuggingAftermathMarkers(
+	TEXT("r.GPUCrashDebugging.Aftermath.Markers"),
+	0,
+	TEXT("Enable draw event markers in Aftermath dumps"),
+	ECVF_ReadOnly
+);
+
+static TAutoConsoleVariable<int32> CVarGPUCrashDebuggingAftermathCallstack(
+	TEXT("r.GPUCrashDebugging.Aftermath.Callstack"),
+	0,
+	TEXT("Enable callstack capture in Aftermath dumps"),
+	ECVF_ReadOnly
+);
+
+static TAutoConsoleVariable<int32> CVarGPUCrashDebuggingAftermathResourceTracking(
+	TEXT("r.GPUCrashDebugging.Aftermath.ResourceTracking"),
+	0,
+	TEXT("Enable resource tracking for Aftermath dumps"),
+	ECVF_ReadOnly
+);
+
+static TAutoConsoleVariable<int32> CVarGPUCrashDebuggingAftermathTrackAll(
+	TEXT("r.GPUCrashDebugging.Aftermath.TrackAll"),
+	1,
+	TEXT("Enable maximum tracking for Aftermath dumps"),
+	ECVF_ReadOnly
+);
+
+static FAutoConsoleVariableRef CVarEnableVariableRateShading(
+	TEXT("r.VRS.Enable"),
+	GRHIVariableRateShadingEnabled,
+	TEXT("Toggle to enable Variable Rate Shading."),
+	ECVF_RenderThreadSafe);
+
+static FAutoConsoleVariableRef CVarEnableAttachmentVariableRateShading(
+	TEXT("r.VRS.EnableImage"),
+	GRHIAttachmentVariableRateShadingEnabled,
+	TEXT("Toggle to enable image-based Variable Rate Shading."),
+	ECVF_RenderThreadSafe);
+
+
+int32 GRHIBindlessResourceConfiguration = 0;
+static FAutoConsoleVariableRef CVarEnableBindlessResources(
+	TEXT("rhi.Bindless.Resources"),
+	GRHIBindlessResourceConfiguration,
+	TEXT("Set to 1 to enable for all shader types. Set to 2 to restrict to Raytracing shaders."),
+	ECVF_ReadOnly
+);
+
+int32 GRHIBindlessSamplerConfiguration = 0;
+static FAutoConsoleVariableRef CVarEnableBindlessSamplers(
+	TEXT("rhi.Bindless.Samplers"),
+	GRHIBindlessSamplerConfiguration,
+	TEXT("Set to 1 to enable for all shader types. Set to 2 to restrict to Raytracing shaders."),
+	ECVF_ReadOnly
+);
+
+static ERHIBindlessConfiguration DetermineBindlessConfiguration(EShaderPlatform Platform, int32 BindlessConfigSetting)
+{
+	if (!RHISupportsBindless(Platform) || BindlessConfigSetting == 0)
+	{
+		return ERHIBindlessConfiguration::Disabled;
+	}
+
+	return BindlessConfigSetting == 2 ? ERHIBindlessConfiguration::RayTracingShaders : ERHIBindlessConfiguration::AllShaders;
+}
+
+ERHIBindlessConfiguration RHIGetBindlessResourcesConfiguration(EShaderPlatform Platform)
+{
+	return DetermineBindlessConfiguration(Platform, GRHIBindlessResourceConfiguration);
+}
+
+ERHIBindlessConfiguration RHIGetBindlessSamplersConfiguration(EShaderPlatform Platform)
+{
+	return DetermineBindlessConfiguration(Platform, GRHIBindlessSamplerConfiguration);
+}
+
 namespace RHIConfig
 {
 	bool ShouldSaveScreenshotAfterProfilingGPU()
@@ -739,13 +1405,14 @@ namespace RHIConfig
  */
 
 bool GIsRHIInitialized = false;
+int32 GRHIPersistentThreadGroupCount = 0;
 int32 GMaxTextureMipCount = MAX_TEXTURE_MIP_COUNT;
-bool GRHISupportsCopyToTextureMultipleMips = false;
 bool GSupportsQuadBufferStereo = false;
 FString GRHIAdapterName;
 FString GRHIAdapterInternalDriverVersion;
 FString GRHIAdapterUserDriverVersion;
 FString GRHIAdapterDriverDate;
+bool GRHIAdapterDriverOnDenyList = false;
 uint32 GRHIVendorId = 0;
 uint32 GRHIDeviceId = 0;
 uint32 GRHIDeviceRevision = 0;
@@ -755,6 +1422,8 @@ TRHIGlobal<bool> GSupportsRenderTargetFormat_PF_G8(true);
 TRHIGlobal<bool> GSupportsRenderTargetFormat_PF_FloatRGBA(true);
 bool GSupportsShaderFramebufferFetch = false;
 bool GSupportsShaderDepthStencilFetch = false;
+bool GSupportsShaderMRTFramebufferFetch = false;
+bool GSupportsPixelLocalStorage = false;
 bool GSupportsTimestampRenderQueries = false;
 bool GRHISupportsGPUTimestampBubblesRemoval = false;
 bool GRHISupportsFrameCyclesBubblesRemoval = false;
@@ -764,6 +1433,8 @@ bool GRHISupportsQuadTopology = false;
 bool GRHISupportsRectTopology = false;
 bool GRHISupportsPrimitiveShaders = false;
 bool GRHISupportsAtomicUInt64 = false;
+bool GRHISupportsDX12AtomicUInt64 = false;
+bool GRHISupportsPipelineStateSortKey = false;
 bool GRHISupportsResummarizeHTile = false;
 bool GRHISupportsExplicitHTile = false;
 bool GRHISupportsExplicitFMask = false;
@@ -774,18 +1445,14 @@ int32 GRHIMaximumReccommendedOustandingOcclusionQueries = MAX_int32;
 bool GRHISupportsExactOcclusionQueries = true;
 bool GSupportsVolumeTextureRendering = true;
 bool GSupportsSeparateRenderTargetBlendState = false;
-bool GSupportsDepthRenderTargetWithoutColorRenderTarget = true;
 bool GRHINeedsUnatlasedCSMDepthsWorkaround = false;
 bool GSupportsTexture3D = true;
 bool GSupportsMobileMultiView = false;
 bool GSupportsImageExternal = false;
-bool GSupportsResourceView = true;
 bool GRHISupportsDrawIndirect = true;
 bool GRHISupportsMultithreading = false;
-TRHIGlobal<bool> GSupportsMultipleRenderTargets(true);
+bool GRHISupportsUpdateFromBufferTexture = false;
 bool GSupportsWideMRT = true;
-float GMinClipZ = 0.0f;
-float GProjectionSignY = 1.0f;
 bool GRHINeedsExtraDeletionLatency = false;
 bool GRHIForceNoDeletionLatencyForStreamingTextures = false;
 TRHIGlobal<int32> GMaxComputeDispatchDimension((1 << 16) - 1);
@@ -794,12 +1461,16 @@ bool GRHISupportsLazyShaderCodeLoading = false;
 TRHIGlobal<int32> GMaxShadowDepthBufferSizeX(2048);
 TRHIGlobal<int32> GMaxShadowDepthBufferSizeY(2048);
 TRHIGlobal<int32> GMaxTextureDimensions(2048);
-TRHIGlobal<int64> GMaxBufferDimensions(2<<27);
+TRHIGlobal<int64> GMaxBufferDimensions(1<<27);
+TRHIGlobal<int64> GRHIMaxConstantBufferByteSize(1<<27);
 TRHIGlobal<int64> GMaxComputeSharedMemory(1<<15);
 TRHIGlobal<int32> GMaxVolumeTextureDimensions(2048);
 TRHIGlobal<int32> GMaxCubeTextureDimensions(2048);
 TRHIGlobal<int32> GMaxWorkGroupInvocations(1024);
+bool GRHISupportsRawViewsForAnyBuffer = false;
 bool GRHISupportsRWTextureBuffers = true;
+bool GRHISupportsVRS = false;
+bool GRHISupportsLateVRSUpdate = false;
 int32 GMaxTextureArrayLayers = 256;
 int32 GMaxTextureSamplers = 16;
 bool GUsingNullRHI = false;
@@ -815,10 +1486,18 @@ bool GRHISupportsFirstInstance = false;
 bool GRHISupportsDynamicResolution = false;
 bool GRHISupportsRayTracing = false;
 bool GRHISupportsRayTracingPSOAdditions = false;
+bool GRHISupportsRayTracingDispatchIndirect = false;
 bool GRHISupportsRayTracingAsyncBuildAccelerationStructure = false;
+bool GRHISupportsRayTracingAMDHitToken = false;
+bool GRHISupportsInlineRayTracing = false;
+bool GRHISupportsRayTracingShaders = false;
+uint32 GRHIRayTracingAccelerationStructureAlignment = 0;
+uint32 GRHIRayTracingScratchBufferAlignment = 0;
+uint32 GRHIRayTracingShaderTableAlignment = 0;
+uint32 GRHIRayTracingInstanceDescriptorSize = 0;
 bool GRHISupportsWaveOperations = false;
-int32 GRHIMinimumWaveSize = 4; // Minimum supported value in SM 6.0
-int32 GRHIMaximumWaveSize = 128; // Maximum supported value in SM 6.0
+int32 GRHIMinimumWaveSize = 0;
+int32 GRHIMaximumWaveSize = 0;
 bool GRHISupportsRHIThread = false;
 bool GRHISupportsRHIOnTaskThread = false;
 bool GRHISupportsParallelRHIExecute = false;
@@ -827,27 +1506,64 @@ bool GSupportsTransientResourceAliasing = false;
 bool GRHIRequiresRenderTargetForPixelShaderUAVs = false;
 bool GRHISupportsUAVFormatAliasing = false;
 bool GRHISupportsDirectGPUMemoryLock = false;
+bool GRHISupportsMultithreadedShaderCreation = true;
+bool GRHISupportsMultithreadedResources = false;
 
 bool GRHISupportsMSAADepthSampleAccess = false;
-bool GRHISupportsResolveCubemapFaces = false;
 
 bool GRHISupportsBackBufferWithCustomDepthStencil = true;
 
 bool GRHIIsHDREnabled = false;
 bool GRHISupportsHDROutput = false;
 
-bool GRHISupportsVariableRateShading = false;
-int32 GVariableRateShadingImageTileSize = 0;
-int32 GVariableRateShadingTier = 0;
+bool GRHIVariableRateShadingEnabled = true;
+bool GRHIAttachmentVariableRateShadingEnabled = true;
+bool GRHISupportsPipelineVariableRateShading = false;
+bool GRHISupportsLargerVariableRateShadingSizes = false;
+bool GRHISupportsAttachmentVariableRateShading = false;
+bool GRHISupportsComplexVariableRateShadingCombinerOps = false;
+bool GRHISupportsVariableRateShadingAttachmentArrayTextures = false;
+int32 GRHIVariableRateShadingImageTileMaxWidth = 0;
+int32 GRHIVariableRateShadingImageTileMaxHeight = 0;
+int32 GRHIVariableRateShadingImageTileMinWidth = 0;
+int32 GRHIVariableRateShadingImageTileMinHeight = 0;
+EVRSImageDataType GRHIVariableRateShadingImageDataType = VRSImage_NotSupported;
+EPixelFormat GRHIVariableRateShadingImageFormat = PF_Unknown;
+bool GRHISupportsLateVariableRateShadingUpdate = false;
 
 EPixelFormat GRHIHDRDisplayOutputFormat = PF_FloatRGBA;
+
+FIntVector GRHIMaxDispatchThreadGroupsPerDimension(0, 0, 0);
 
 uint64 GRHIPresentCounter = 1;
 
 bool GRHISupportsArrayIndexFromAnyShader = false;
+bool GRHISupportsStencilRefFromPixelShader = false;
+bool GRHISupportsConservativeRasterization = false;
+
+bool GRHISupportsPipelineFileCache = false;
+
+bool GRHIDeviceIsIntegrated = false;
 
 /** Whether we are profiling GPU hitches. */
 bool GTriggerGPUHitchProfile = false;
+
+bool GRHISupportsPixelShaderUAVs = true;
+
+bool GRHISupportsMeshShadersTier0 = false;
+bool GRHISupportsMeshShadersTier1 = false;
+
+bool GRHISupportsShaderTimestamp = false;
+
+bool GRHISupportsEfficientUploadOnResourceCreation = false;
+
+bool GRHISupportsAsyncPipelinePrecompile = true;
+
+bool GRHISupportsMapWriteNoOverwrite = false;
+
+bool GRHISupportsSeparateDepthStencilCopyAccess = true;
+
+bool GRHISupportsBindless = false;
 
 FVertexElementTypeSupportInfo GVertexElementTypeSupport;
 
@@ -856,26 +1572,35 @@ RHI_API int32 volatile GCurrentRendertargetMemorySize = 0;
 RHI_API int64 GTexturePoolSize = 0 * 1024 * 1024;
 RHI_API int32 GPoolSizeVRAMPercentage = 0;
 
-RHI_API EShaderPlatform GShaderPlatformForFeatureLevel[ERHIFeatureLevel::Num] = {SP_NumPlatforms,SP_NumPlatforms,SP_NumPlatforms,SP_NumPlatforms};
+RHI_API uint64 GDemotedLocalMemorySize = 0;
+
+RHI_API EShaderPlatform GShaderPlatformForFeatureLevel[ERHIFeatureLevel::Num] = {SP_NumPlatforms,SP_NumPlatforms,SP_NumPlatforms,SP_NumPlatforms,SP_NumPlatforms};
 
 // simple stats about draw calls. GNum is the previous frame and 
 // GCurrent is the current frame.
 // GCurrentNumDrawCallsRHIPtr points to the drawcall counter to increment
-RHI_API int32 GCurrentNumDrawCallsRHI = 0;
-RHI_API int32 GNumDrawCallsRHI = 0;
-RHI_API int32* GCurrentNumDrawCallsRHIPtr = &GCurrentNumDrawCallsRHI;
-RHI_API int32 GCurrentNumPrimitivesDrawnRHI = 0;
-RHI_API int32 GNumPrimitivesDrawnRHI = 0;
+RHI_API int32 GCurrentNumDrawCallsRHI[MAX_NUM_GPUS] = {};
+RHI_API int32 GNumDrawCallsRHI[MAX_NUM_GPUS] = {};
+thread_local FRHIDrawCallsStatPtr GCurrentNumDrawCallsRHIPtr = &GCurrentNumDrawCallsRHI;
+RHI_API int32 GCurrentNumPrimitivesDrawnRHI[MAX_NUM_GPUS] = {};
+RHI_API int32 GNumPrimitivesDrawnRHI[MAX_NUM_GPUS] = {};
 
 RHI_API uint64 GRHITransitionPrivateData_SizeInBytes = 0;
 RHI_API uint64 GRHITransitionPrivateData_AlignInBytes = 0;
 
-ERHIAccess GRHITextureReadAccessMask = ERHIAccess::ReadOnlyMask;
+// By default, read only states and UAV states are allowed to participate in state merging.
+ERHIAccess GRHIMergeableAccessMask = ERHIAccess::ReadOnlyMask | ERHIAccess::UAVMask;
+
+// By default, only exclusively read only accesses are allowed.
+ERHIAccess GRHIMultiPipelineMergeableAccessMask = ERHIAccess::ReadOnlyExclusiveMask;
 
 /** Called once per frame only from within an RHI. */
 void RHIPrivateBeginFrame()
 {
-	GNumDrawCallsRHI = GCurrentNumDrawCallsRHI;
+	for (int32 GPUIndex = 0; GPUIndex < MAX_NUM_GPUS; GPUIndex++)
+	{
+		GNumDrawCallsRHI[GPUIndex] = GCurrentNumDrawCallsRHI[GPUIndex];
+	}
 	
 #if CSV_PROFILER
 	// Only copy the display counters every so many frames to keep things more stable.
@@ -892,20 +1617,34 @@ void RHIPrivateBeginFrame()
 	for (int32 Index=0; Index<FDrawCallCategoryName::NumCategory; ++Index)
 	{
 		FDrawCallCategoryName* CategoryName = FDrawCallCategoryName::Array[Index];
-		if (bCopyDisplayFrames)
+		for (int32 GPUIndex = 0; GPUIndex < MAX_NUM_GPUS; GPUIndex++)
 		{
-			FDrawCallCategoryName::DisplayCounts[Index] = CategoryName->Counter;
+			if (bCopyDisplayFrames)
+			{
+				FDrawCallCategoryName::DisplayCounts[Index][GPUIndex] = CategoryName->Counters[GPUIndex];
+			}
+			GNumDrawCallsRHI[GPUIndex] += CategoryName->Counters[GPUIndex];
 		}
-		GNumDrawCallsRHI += CategoryName->Counter;
-		FCsvProfiler::RecordCustomStat(CategoryName->Name, CSV_CATEGORY_INDEX(DrawCall), CategoryName->Counter, ECsvCustomStatOp::Set);
-		CategoryName->Counter = 0;
+		// Multi-GPU support : CSV stats do not support MGPU yet
+		FCsvProfiler::RecordCustomStat(CategoryName->Name, CSV_CATEGORY_INDEX(DrawCall), CategoryName->Counters[0], ECsvCustomStatOp::Set);
+		for (int32 GPUIndex = 0; GPUIndex < MAX_NUM_GPUS; GPUIndex++)
+		{
+			CategoryName->Counters[GPUIndex] = 0;
+		}
 	}
 #endif
 
-	GNumPrimitivesDrawnRHI = GCurrentNumPrimitivesDrawnRHI;
-	CSV_CUSTOM_STAT(RHI, DrawCalls, GNumDrawCallsRHI, ECsvCustomStatOp::Set);
-	CSV_CUSTOM_STAT(RHI, PrimitivesDrawn, GNumPrimitivesDrawnRHI, ECsvCustomStatOp::Set);
-	GCurrentNumDrawCallsRHI = GCurrentNumPrimitivesDrawnRHI = 0;
+	for (int32 GPUIndex = 0; GPUIndex < MAX_NUM_GPUS; GPUIndex++)
+	{
+		GNumPrimitivesDrawnRHI[GPUIndex] = GCurrentNumPrimitivesDrawnRHI[GPUIndex];
+	}
+	// Multi-GPU support : CSV stats do not support MGPU yet
+	CSV_CUSTOM_STAT(RHI, DrawCalls, GNumDrawCallsRHI[0], ECsvCustomStatOp::Set);
+	CSV_CUSTOM_STAT(RHI, PrimitivesDrawn, GNumPrimitivesDrawnRHI[0], ECsvCustomStatOp::Set);
+	for (int32 GPUIndex = 0; GPUIndex < MAX_NUM_GPUS; GPUIndex++)
+	{
+		GCurrentNumDrawCallsRHI[GPUIndex] = GCurrentNumPrimitivesDrawnRHI[GPUIndex] = 0;
+	}
 }
 
 /** Whether to initialize 3D textures using a bulk data (or through a mip update if false). */
@@ -926,6 +1665,7 @@ FName FeatureLevelNames[] =
 	FName(TEXT("ES3_1")),
 	FName(TEXT("SM4_REMOVED")),
 	FName(TEXT("SM5")),
+	FName(TEXT("SM6")),
 };
 
 static_assert(UE_ARRAY_COUNT(FeatureLevelNames) == ERHIFeatureLevel::Num, "Missing entry from feature level names.");
@@ -1026,14 +1766,10 @@ RHI_API void GetShadingPathName(ERHIShadingPath::Type InShadingPath, FName& OutN
 }
 
 static FName NAME_PLATFORM_WINDOWS(TEXT("Windows"));
-static FName NAME_PLATFORM_PS4(TEXT("PS4"));
-static FName NAME_PLATFORM_XBOXONE(TEXT("XboxOne"));
 static FName NAME_PLATFORM_ANDROID(TEXT("Android"));
 static FName NAME_PLATFORM_IOS(TEXT("IOS"));
 static FName NAME_PLATFORM_MAC(TEXT("Mac"));
-static FName NAME_PLATFORM_SWITCH(TEXT("Switch"));
 static FName NAME_PLATFORM_TVOS(TEXT("TVOS"));
-static FName NAME_PLATFORM_LUMIN(TEXT("Lumin"));
 
 // @todo platplug: This is still here, only being used now by UMaterialShaderQualitySettings::GetOrCreatePlatformSettings
 // since I have moved the other uses to FindTargetPlatformWithSupport
@@ -1042,16 +1778,14 @@ FName ShaderPlatformToPlatformName(EShaderPlatform Platform)
 {
 	switch (Platform)
 	{
+	case SP_PCD3D_SM6:
 	case SP_PCD3D_SM5:
 	case SP_PCD3D_ES3_1:
 	case SP_OPENGL_PCES3_1:
 	case SP_VULKAN_PCES3_1:
 	case SP_VULKAN_SM5:
+	case SP_D3D_ES3_1_HOLOLENS:
 		return NAME_PLATFORM_WINDOWS;
-	case SP_PS4:
-		return NAME_PLATFORM_PS4;
-	case SP_XBOXONE_D3D12:
-		return NAME_PLATFORM_XBOXONE;
 	case SP_VULKAN_ES3_1_ANDROID:
 	case SP_VULKAN_SM5_ANDROID:
 	case SP_OPENGL_ES3_1_ANDROID:
@@ -1060,16 +1794,9 @@ FName ShaderPlatformToPlatformName(EShaderPlatform Platform)
 	case SP_METAL_MRT:
 		return NAME_PLATFORM_IOS;
 	case SP_METAL_SM5:
-	case SP_METAL_SM5_NOTESS:
 	case SP_METAL_MACES3_1:
 	case SP_METAL_MRT_MAC:
 		return NAME_PLATFORM_MAC;
-	case SP_SWITCH:
-	case SP_SWITCH_FORWARD:
-		return NAME_PLATFORM_SWITCH;
-	case SP_VULKAN_SM5_LUMIN:
-	case SP_VULKAN_ES3_1_LUMIN:
-		return NAME_PLATFORM_LUMIN;
 	case SP_METAL_TVOS:
 	case SP_METAL_MRT_TVOS:
 		return NAME_PLATFORM_TVOS;
@@ -1089,7 +1816,7 @@ FName ShaderPlatformToPlatformName(EShaderPlatform Platform)
 
 FName LegacyShaderPlatformToShaderFormat(EShaderPlatform Platform)
 {
-	return ShaderPlatformToShaderFormatName(Platform);
+	return  FDataDrivenShaderPlatformInfo::GetShaderFormat(Platform);
 }
 
 EShaderPlatform ShaderFormatToLegacyShaderPlatform(FName ShaderFormat)
@@ -1107,7 +1834,6 @@ RHI_API bool IsRHIDeviceAMD()
 RHI_API bool IsRHIDeviceIntel()
 {
 	check(GRHIVendorId != 0);
-	// Intel GPUs are integrated and use both DedicatedVideoMemory and SharedSystemMemory.
 	return GRHIVendorId == 0x8086;
 }
 
@@ -1120,29 +1846,27 @@ RHI_API bool IsRHIDeviceNVIDIA()
 
 RHI_API const TCHAR* RHIVendorIdToString()
 {
-	switch (GRHIVendorId)
-	{
-	case 0x1002: return TEXT("AMD");
-	case 0x1010: return TEXT("ImgTec");
-	case 0x10DE: return TEXT("NVIDIA");
-	case 0x13B5: return TEXT("ARM");
-	case 0x5143: return TEXT("Qualcomm");
-	case 0x8086: return TEXT("Intel");
-	default: return TEXT("Unknown");
-	}
+	return RHIVendorIdToString((EGpuVendorId)GRHIVendorId);
 }
 
 RHI_API const TCHAR* RHIVendorIdToString(EGpuVendorId VendorId)
 {
 	switch (VendorId)
 	{
-	case EGpuVendorId::Amd: return TEXT("AMD");
-	case EGpuVendorId::ImgTec: return TEXT("ImgTec");
-	case EGpuVendorId::Nvidia: return TEXT("NVIDIA");
-	case EGpuVendorId::Arm: return TEXT("ARM");
-	case EGpuVendorId::Qualcomm: return TEXT("Qualcomm");
-	case EGpuVendorId::Intel: return TEXT("Intel");
-	case EGpuVendorId::NotQueried: return TEXT("Not Queried");
+	case EGpuVendorId::Amd:			return TEXT("AMD");
+	case EGpuVendorId::ImgTec:		return TEXT("ImgTec");
+	case EGpuVendorId::Nvidia:		return TEXT("NVIDIA");
+	case EGpuVendorId::Arm:			return TEXT("ARM");
+	case EGpuVendorId::Broadcom:	return TEXT("Broadcom");
+	case EGpuVendorId::Qualcomm:	return TEXT("Qualcomm");
+	case EGpuVendorId::Apple:		return TEXT("Apple");
+	case EGpuVendorId::Intel:		return TEXT("Intel");
+	case EGpuVendorId::Vivante:		return TEXT("Vivante");
+	case EGpuVendorId::VeriSilicon:	return TEXT("VeriSilicon");
+	case EGpuVendorId::Kazan:		return TEXT("Kazan");
+	case EGpuVendorId::Codeplay:	return TEXT("Codeplay");
+	case EGpuVendorId::Mesa:		return TEXT("Mesa");
+	case EGpuVendorId::NotQueried:	return TEXT("Not Queried");
 	default:
 		break;
 	}
@@ -1150,69 +1874,37 @@ RHI_API const TCHAR* RHIVendorIdToString(EGpuVendorId VendorId)
 	return TEXT("Unknown");
 }
 
-RHI_API uint32 RHIGetShaderLanguageVersion(const FStaticShaderPlatform Platform)
+RHI_API uint32 RHIGetMetalShaderLanguageVersion(const FStaticShaderPlatform Platform)
 {
-	uint32 Version = 0;
-	if (IsMetalPlatform(Platform))
+    if (IsMetalPlatform(Platform))
 	{
 		if (IsPCPlatform(Platform))
 		{
-			static int32 MaxShaderVersion = -1;
-			if (MaxShaderVersion < 0)
-			{
-				MaxShaderVersion = 2;
-				int32 MinShaderVersion = 3;
-				if(!GConfig->GetInt(TEXT("/Script/MacTargetPlatform.MacTargetSettings"), TEXT("MaxShaderLanguageVersion"), MaxShaderVersion, GEngineIni))
-				{
-					MaxShaderVersion = 4;
-				}
-				MaxShaderVersion = FMath::Max(MinShaderVersion, MaxShaderVersion);
-			}
-			Version = (uint32)MaxShaderVersion;
+            static int32 MacMetalShaderLanguageVersion = -1;
+            if (MacMetalShaderLanguageVersion == -1)
+            {
+                if (!GConfig->GetInt(TEXT("/Script/MacTargetPlatform.MacTargetSettings"), TEXT("MetalLanguageVersion"), MacMetalShaderLanguageVersion, GEngineIni))
+                {
+                    MacMetalShaderLanguageVersion = 0; // 0 means default EMacMetalShaderStandard::MacMetalSLStandard_Minimum
+                }
+            }
+            return MacMetalShaderLanguageVersion;
 		}
 		else
 		{
-			static int32 MaxShaderVersion = -1;
-			if (MaxShaderVersion < 0)
-			{
-				MaxShaderVersion = 2;
-				int32 MinShaderVersion = 2;
-				if(!GConfig->GetInt(TEXT("/Script/IOSRuntimeSettings.IOSRuntimeSettings"), TEXT("MaxShaderLanguageVersion"), MaxShaderVersion, GEngineIni))
-				{
-					MaxShaderVersion = 0;
-				}
-				MaxShaderVersion = FMath::Max(MinShaderVersion, MaxShaderVersion);
-			}
-			Version = (uint32)MaxShaderVersion;
-		}
+            static int32 IOSMetalShaderLanguageVersion = -1;
+            if (IOSMetalShaderLanguageVersion == -1)
+            {
+                if (!GConfig->GetInt(TEXT("/Script/IOSRuntimeSettings.IOSRuntimeSettings"), TEXT("MetalLanguageVersion"), IOSMetalShaderLanguageVersion, GEngineIni))
+                {
+                	IOSMetalShaderLanguageVersion = 0;  // 0 means default EIOSMetalShaderStandard::IOSMetalSLStandard_Minimum
+                }
+            }
+            return IOSMetalShaderLanguageVersion;
+        }
 	}
-	return Version;
+	return 0;
 }
-
-RHI_API bool RHISupportsTessellation(const FStaticShaderPlatform Platform)
-{
-	if (IsFeatureLevelSupported(Platform, ERHIFeatureLevel::SM5))
-	{
-		return (Platform == SP_PCD3D_SM5) || (Platform == SP_XBOXONE_D3D12) || (Platform == SP_METAL_SM5) || (IsVulkanSM5Platform(Platform));
-	}
-	return false;
-}
-
-RHI_API bool RHISupportsPixelShaderUAVs(const FStaticShaderPlatform Platform)
-{
-	if (IsFeatureLevelSupported(Platform, ERHIFeatureLevel::SM5))
-	{
-		return true;
-	}
-	return false;
-}
-
-RHI_API bool RHISupportsIndexBufferUAVs(const FStaticShaderPlatform Platform)
-{
-	return Platform == SP_PCD3D_SM5 || IsVulkanPlatform(Platform) || IsMetalSM5Platform(Platform) || Platform == SP_XBOXONE_D3D12 || Platform == SP_PS4 
-		|| FDataDrivenShaderPlatformInfo::GetSupportsIndexBufferUAVs(Platform);
-}
-
 
 static ERHIFeatureLevel::Type GRHIMobilePreviewFeatureLevel = ERHIFeatureLevel::Num;
 RHI_API void RHISetMobilePreviewFeatureLevel(ERHIFeatureLevel::Type MobilePreviewFeatureLevel)
@@ -1255,7 +1947,7 @@ RHI_API int32 RHIGetPreferredClearUAVRectPSResourceType(const FStaticShaderPlatf
 	if (IsMetalPlatform(Platform))
 	{
 		static constexpr uint32 METAL_TEXTUREBUFFER_SHADER_LANGUAGE_VERSION = 4;
-		if (METAL_TEXTUREBUFFER_SHADER_LANGUAGE_VERSION <= RHIGetShaderLanguageVersion(Platform))
+		if (METAL_TEXTUREBUFFER_SHADER_LANGUAGE_VERSION <= RHIGetMetalShaderLanguageVersion(Platform))
 		{
 			return 0; // BUFFER
 		}
@@ -1307,16 +1999,9 @@ void FRHIRenderPassInfo::ConvertToRenderTargetsInfo(FRHISetRenderTargetsInfo& Ou
 	OutRTInfo.bClearDepth = (DepthLoadAction == ERenderTargetLoadAction::EClear);
 	OutRTInfo.bClearStencil = (StencilLoadAction == ERenderTargetLoadAction::EClear);
 
-	OutRTInfo.FoveationTexture = FoveationTexture;
+	OutRTInfo.ShadingRateTexture = ShadingRateTexture;
+	OutRTInfo.ShadingRateTextureCombiner = ShadingRateTextureCombiner;
 	OutRTInfo.MultiViewCount = MultiViewCount;
-}
-
-void FRHIRenderPassInfo::OnVerifyNumUAVsFailed(int32 InNumUAVs)
-{
-	bTooManyUAVs = true;
-	UE_LOG(LogRHI, Warning, TEXT("NumUAVs is %d which is greater the max %d. Trailing UAVs will be dropped"), InNumUAVs, MaxSimultaneousUAVs);
-	// Trigger an ensure to get callstack in dev builds
-	ensure(InNumUAVs <= MaxSimultaneousUAVs);
 }
 
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
@@ -1408,7 +2093,7 @@ void FRHIRenderPassInfo::Validate() const
 			// for depth read sub-pass
 			// 1. render pass must have depth target
 			// 2. depth target must support InputAttachement
-			ensure((DepthStencilRenderTarget.DepthStencilTarget->GetFlags() & TexCreate_InputAttachmentRead) != 0);
+			ensure(EnumHasAnyFlags(DepthStencilRenderTarget.DepthStencilTarget->GetFlags(), TexCreate_InputAttachmentRead));
 		}
 	}
 	else
@@ -1420,6 +2105,193 @@ void FRHIRenderPassInfo::Validate() const
 }
 #endif
 
+#define ValidateResourceDesc(expr, format, ...) \
+	if (bFatal) \
+	{ \
+		checkf(expr, format, ##__VA_ARGS__); \
+	} \
+	else if (!(expr)) \
+	{ \
+		return false;\
+	} \
+
+// static
+bool FRHITextureDesc::Validate(const FRHITextureCreateInfo& Desc, const TCHAR* Name, bool bFatal)
+{
+	// Validate texture's pixel format.
+	{
+		ValidateResourceDesc(Desc.Format != PF_Unknown, TEXT("Illegal to create texture %s with an invalid pixel format."), Name);
+		ValidateResourceDesc(Desc.Format < PF_MAX, TEXT("Illegal to create texture %s with an invalid pixel format."), Name);
+		ValidateResourceDesc(GPixelFormats[Desc.Format].Supported,
+			TEXT("Failed to create texture %s with pixel format %s because it is not supported."),
+			Name,
+			GPixelFormats[Desc.Format].Name);
+	}
+
+	// Validate texture's extent.
+	{
+		int32 MaxDimension = (Desc.Dimension == ETextureDimension::TextureCube || Desc.Dimension == ETextureDimension::TextureCubeArray) ? GMaxCubeTextureDimensions : GMaxTextureDimensions;
+
+		ValidateResourceDesc(Desc.Extent.X > 0, TEXT("Texture %s's Extent.X=%d is invalid."), Name, Desc.Extent.X);
+		ValidateResourceDesc(Desc.Extent.X <= MaxDimension, TEXT("Texture %s's Extent.X=%d is too large."), Name, Desc.Extent.X);
+
+		ValidateResourceDesc(Desc.Extent.Y > 0, TEXT("Texture %s's Extent.Y=%d is invalid."), Name, Desc.Extent.Y);
+		ValidateResourceDesc(Desc.Extent.Y <= MaxDimension, TEXT("Texture %s's Extent.Y=%d is too large."), Name, Desc.Extent.Y);
+	}
+
+	// Validate texture's depth
+	if (Desc.Dimension == ETextureDimension::Texture3D)
+	{
+		ValidateResourceDesc(Desc.Depth > 0, TEXT("Texture %s's Depth=%d is invalid."), Name, int32(Desc.Depth));
+		ValidateResourceDesc(Desc.Depth <= GMaxTextureDimensions, TEXT("Texture %s's Extent.Depth=%d is too large."), Name, Desc.Depth);
+	}
+	else
+	{
+		ValidateResourceDesc(Desc.Depth == 1, TEXT("Texture %s's Depth=%d is invalid for Dimension=%s."), Name, int32(Desc.Depth), GetTextureDimensionString(Desc.Dimension));
+	}
+
+	// Validate texture's array size
+	if (Desc.Dimension == ETextureDimension::Texture2DArray || Desc.Dimension == ETextureDimension::TextureCubeArray)
+	{
+		ValidateResourceDesc(Desc.ArraySize > 0, TEXT("Texture %s's ArraySize=%d is invalid."), Name, Desc.ArraySize);
+		ValidateResourceDesc(Desc.ArraySize <= GMaxTextureArrayLayers, TEXT("Texture %s's Extent.ArraySize=%d is too large."), Name, int32(Desc.ArraySize));
+	}
+	else
+	{
+		ValidateResourceDesc(Desc.ArraySize == 1, TEXT("Texture %s's ArraySize=%d is invalid for Dimension=%s."), Name, Desc.ArraySize,  GetTextureDimensionString(Desc.Dimension));
+	}
+
+	// Validate texture's samples count.
+	if (Desc.Dimension == ETextureDimension::Texture2D || Desc.Dimension == ETextureDimension::Texture2DArray)
+	{
+		ValidateResourceDesc(Desc.NumSamples > 0, TEXT("Texture %s's NumSamples=%d is invalid."), Name, Desc.NumSamples);
+	}
+	else
+	{
+		ValidateResourceDesc(Desc.NumSamples == 1, TEXT("Texture %s's NumSamples=%d is invalid for Dimension=%s."), Name, Desc.NumSamples, GetTextureDimensionString(Desc.Dimension));
+	}
+
+	// Validate texture's mips.
+	if (Desc.IsMultisample())
+	{
+		ValidateResourceDesc(Desc.NumMips == 1, TEXT("MSAA Texture %s's can only have one mip."), Name);
+	}
+	else
+	{
+		ValidateResourceDesc(Desc.NumMips > 0, TEXT("Texture %s's NumMips=%d is invalid."), Name, Desc.NumMips);
+		ValidateResourceDesc(Desc.NumMips <= GMaxTextureMipCount, TEXT("Texture %s's NumMips=%d is too large."), Name, Desc.NumMips);
+	}
+
+	return true;
+}
+
+// static
+bool FRHITextureSRVCreateInfo::Validate(const FRHITextureDesc& TextureDesc, const FRHITextureSRVCreateInfo& TextureSRVDesc, const TCHAR* TextureName, bool bFatal)
+{
+	if (TextureName == nullptr)
+	{
+		TextureName = TEXT("UnnamedTexture");
+	}
+
+	ValidateResourceDesc(TextureDesc.Flags & TexCreate_ShaderResource,
+		TEXT("Attempted to create SRV from texture %s which was not created with TexCreate_ShaderResource"),
+		TextureName);
+
+	// Validate the pixel format if overridden by the SRV's descriptor.
+	if (TextureSRVDesc.Format == PF_X24_G8)
+	{
+		// PF_X24_G8 is a bit of mess in the RHI, used to read the stencil, but have varying BlockBytes.
+		ValidateResourceDesc(TextureDesc.Format == PF_DepthStencil,
+			TEXT("PF_X24_G8 is only to read stencil from a PF_DepthStencil texture"));
+	}
+	else if (TextureSRVDesc.Format != PF_Unknown)
+	{
+		ValidateResourceDesc(TextureSRVDesc.Format < PF_MAX,
+			TEXT("Illegal to create SRV for texture %s with invalid FPooledRenderTargetDesc::Format."),
+			TextureName);
+		ValidateResourceDesc(GPixelFormats[TextureSRVDesc.Format].Supported,
+			TEXT("Failed to create SRV for texture %s with pixel format %s because it is not supported."),
+			TextureName, GPixelFormats[TextureSRVDesc.Format].Name);
+
+		EPixelFormat ResourcePixelFormat = TextureDesc.Format;
+
+		ValidateResourceDesc(
+			GPixelFormats[TextureSRVDesc.Format].BlockBytes == GPixelFormats[ResourcePixelFormat].BlockBytes &&
+			GPixelFormats[TextureSRVDesc.Format].BlockSizeX == GPixelFormats[ResourcePixelFormat].BlockSizeX &&
+			GPixelFormats[TextureSRVDesc.Format].BlockSizeY == GPixelFormats[ResourcePixelFormat].BlockSizeY &&
+			GPixelFormats[TextureSRVDesc.Format].BlockSizeZ == GPixelFormats[ResourcePixelFormat].BlockSizeZ,
+			TEXT("Failed to create SRV for texture %s with pixel format %s because it does not match the byte size of the texture's pixel format %s."),
+			TextureName, GPixelFormats[TextureSRVDesc.Format].Name, GPixelFormats[ResourcePixelFormat].Name);
+	}
+
+	ValidateResourceDesc((TextureSRVDesc.MipLevel + TextureSRVDesc.NumMipLevels) <= TextureDesc.NumMips,
+		TEXT("Failed to create SRV at mips %d-%d: the texture %s has only %d mip levels."),
+		TextureSRVDesc.MipLevel, (TextureSRVDesc.MipLevel + TextureSRVDesc.NumMipLevels), TextureName, TextureDesc.NumMips);
+
+	// Validate the array sloces
+	if (TextureDesc.IsTextureArray())
+	{
+		ValidateResourceDesc((TextureSRVDesc.FirstArraySlice + TextureSRVDesc.NumArraySlices) <= TextureDesc.ArraySize,
+			TEXT("Failed to create SRV at array slices %d-%d: the texture array %s has only %d slices."),
+			TextureSRVDesc.FirstArraySlice,
+			(TextureSRVDesc.FirstArraySlice + TextureSRVDesc.NumArraySlices),
+			TextureName,
+			TextureDesc.ArraySize);
+	}
+	else
+	{
+		ValidateResourceDesc(TextureSRVDesc.FirstArraySlice == 0,
+			TEXT("Failed to create SRV with FirstArraySlice=%d: the texture %s is not a texture array."),
+			TextureSRVDesc.FirstArraySlice, TextureName);
+		ValidateResourceDesc(TextureSRVDesc.NumArraySlices == 0,
+			TEXT("Failed to create SRV with NumArraySlices=%d: the texture %s is not a texture array."),
+			TextureSRVDesc.NumArraySlices, TextureName);
+	}
+
+	ValidateResourceDesc(TextureSRVDesc.MetaData != ERHITextureMetaDataAccess::FMask || GRHISupportsExplicitFMask,
+		TEXT("Failed to create FMask SRV for texture %s because the current RHI doesn't support it. Be sure to gate the call with GRHISupportsExplicitFMask."),
+		TextureName);
+
+	ValidateResourceDesc(TextureSRVDesc.MetaData != ERHITextureMetaDataAccess::HTile || GRHISupportsExplicitHTile,
+		TEXT("Failed to create HTile SRV for texture %s because the current RHI doesn't support it. Be sure to gate the call with GRHISupportsExplicitHTile."),
+		TextureName);
+
+	return true;
+}
+
+#undef ValidateResourceDesc
+
+uint64 FRHITextureDesc::CalcMemorySizeEstimate(uint32 FirstMipIndex, uint32 LastMipIndex) const
+{
+#if DO_CHECK
+	Validate(*this, TEXT("CalcMemorySizeEstimate"), /* bFatal = */true);
+#endif
+	check(FirstMipIndex < NumMips && FirstMipIndex <= LastMipIndex && LastMipIndex < NumMips);
+
+	uint64 MemorySize = 0;
+	for (uint32 MipIndex = FirstMipIndex; MipIndex <= LastMipIndex; ++MipIndex)
+	{
+		FIntVector MipSizeInBlocks = FIntVector(
+			FMath::DivideAndRoundUp(FMath::Max(Extent.X >> MipIndex, 1), GPixelFormats[Format].BlockSizeX),
+			FMath::DivideAndRoundUp(FMath::Max(Extent.Y >> MipIndex, 1), GPixelFormats[Format].BlockSizeY),
+			FMath::DivideAndRoundUp(FMath::Max(Depth    >> MipIndex, 1), GPixelFormats[Format].BlockSizeZ)
+		);
+
+		uint32 NumBlocksInMip = MipSizeInBlocks.X * MipSizeInBlocks.Y * MipSizeInBlocks.Z;
+		MemorySize += NumBlocksInMip * GPixelFormats[Format].BlockBytes;
+	}
+
+	MemorySize *= ArraySize;
+	MemorySize *= NumSamples;
+
+	if (IsTextureCube())
+	{
+		MemorySize *= 6;
+	}
+
+	return MemorySize;
+}
+
 static FRHIPanicEvent RHIPanicEvent;
 FRHIPanicEvent& RHIGetPanicDelegate()
 {
@@ -1428,66 +2300,60 @@ FRHIPanicEvent& RHIGetPanicDelegate()
 
 #include "Misc/DataDrivenPlatformInfoRegistry.h"
 
-FString LexToString(EShaderPlatform Platform)
+FString LexToString(EShaderPlatform Platform, bool bError)
 {
 	switch (Platform)
 	{
+	case SP_PCD3D_SM6: return TEXT("PCD3D_SM6");
 	case SP_PCD3D_SM5: return TEXT("PCD3D_SM5");
 	case SP_PCD3D_ES3_1: return TEXT("PCD3D_ES3_1");
 	case SP_OPENGL_PCES3_1: return TEXT("OPENGL_PCES3_1");
 	case SP_OPENGL_ES3_1_ANDROID: return TEXT("OPENGL_ES3_1_ANDROID");
-	case SP_PS4: return TEXT("PS4");
-	case SP_XBOXONE_D3D12: return TEXT("XBOXONE_D3D12");
-	case SP_SWITCH: return TEXT("SWITCH");
-	case SP_SWITCH_FORWARD: return TEXT("SWITCH_FORWARD");
 	case SP_METAL: return TEXT("METAL");
 	case SP_METAL_MRT: return TEXT("METAL_MRT");
 	case SP_METAL_TVOS: return TEXT("METAL_TVOS");
 	case SP_METAL_MRT_TVOS: return TEXT("METAL_MRT_TVOS");
 	case SP_METAL_MRT_MAC: return TEXT("METAL_MRT_MAC");
 	case SP_METAL_SM5: return TEXT("METAL_SM5");
-	case SP_METAL_SM5_NOTESS: return TEXT("METAL_SM5_NOTESS");
 	case SP_METAL_MACES3_1: return TEXT("METAL_MACES3_1");
 	case SP_VULKAN_ES3_1_ANDROID: return TEXT("VULKAN_ES3_1_ANDROID");
-	case SP_VULKAN_ES3_1_LUMIN: return TEXT("VULKAN_ES3_1_LUMIN");
 	case SP_VULKAN_PCES3_1: return TEXT("VULKAN_PCES3_1");
 	case SP_VULKAN_SM5: return TEXT("VULKAN_SM5");
-	case SP_VULKAN_SM5_LUMIN: return TEXT("VULKAN_SM5_LUMIN");
 	case SP_VULKAN_SM5_ANDROID: return TEXT("VULKAN_SM5_ANDROID");
-
-	case SP_OPENGL_ES2_ANDROID_REMOVED:
-	case SP_OPENGL_ES2_WEBGL_REMOVED:
-	case SP_OPENGL_ES2_IOS_REMOVED:
-	case SP_VULKAN_SM4_REMOVED:
-	case SP_PCD3D_SM4_REMOVED:
-	case SP_OPENGL_SM4_REMOVED:
-	case SP_PCD3D_ES2_REMOVED:
-	case SP_OPENGL_PCES2_REMOVED:
-	case SP_METAL_MACES2_REMOVED:
-	case SP_OPENGL_SM5_REMOVED:
-	case SP_OPENGL_ES31_EXT_REMOVED:
-		return TEXT("");
+	case SP_D3D_ES3_1_HOLOLENS: return TEXT("D3D_ES3_1_HOLOLENS");
+	case SP_CUSTOM_PLATFORM_FIRST: return TEXT("SP_CUSTOM_PLATFORM_FIRST");
+	case SP_CUSTOM_PLATFORM_LAST: return TEXT("SP_CUSTOM_PLATFORM_LAST");
 
 	default:
 		if (FStaticShaderPlatformNames::IsStaticPlatform(Platform))
 		{
 			return FStaticShaderPlatformNames::Get().GetShaderPlatform(Platform).ToString();
 		}
+		else if (Platform > SP_CUSTOM_PLATFORM_FIRST && Platform < SP_CUSTOM_PLATFORM_LAST)
+		{
+			return FString::Printf(TEXT("SP_CUSTOM_PLATFORM_%d"), Platform - SP_CUSTOM_PLATFORM_FIRST);
+		}
 		else
 		{
-			checkf(0, TEXT("Unknown EShaderPlatform %d!"), (int32)Platform);
+			checkf(!bError, TEXT("Unknown or removed EShaderPlatform %d!"), (int32)Platform);
 			return TEXT("");
 		}
 	}
+}
+
+FString LexToString(EShaderPlatform Platform)
+{
+	bool bError = true;
+	return LexToString(Platform, bError);
 }
 
 void LexFromString(EShaderPlatform& Value, const TCHAR* String)
 {
 	Value = EShaderPlatform::SP_NumPlatforms;
 
-	for (uint8 i = 0; i < (uint8)EShaderPlatform::SP_NumPlatforms; ++i)
+	for (int i = 0; i < (int)EShaderPlatform::SP_NumPlatforms; ++i)
 	{
-		if (LexToString((EShaderPlatform)i).Equals(String))
+		if (LexToString((EShaderPlatform)i, false).Equals(String, ESearchCase::IgnoreCase))
 		{
 			Value = (EShaderPlatform)i;
 			return;
@@ -1495,6 +2361,37 @@ void LexFromString(EShaderPlatform& Value, const TCHAR* String)
 	}
 }
 
+FString LexToString(ERHIFeatureLevel::Type Level)
+{
+	switch (Level)
+	{
+		case ERHIFeatureLevel::ES2_REMOVED:
+			return TEXT("ES2_REMOVED");
+		case ERHIFeatureLevel::ES3_1:
+			return TEXT("ES3_1");
+		case ERHIFeatureLevel::SM4_REMOVED:
+			return TEXT("SM4_REMOVED");
+		case ERHIFeatureLevel::SM5:
+			return TEXT("SM5");
+		case ERHIFeatureLevel::SM6:
+			return TEXT("SM6");
+		default:
+			break;
+	}
+	return TEXT("UnknownFeatureLevel");
+}
+
+const TCHAR* LexToString(ERHIDescriptorHeapType InHeapType)
+{
+	switch (InHeapType)
+	{
+	default: checkNoEntry();                   return TEXT("UnknownDescriptorHeapType");
+	case ERHIDescriptorHeapType::Standard:     return TEXT("Standard");
+	case ERHIDescriptorHeapType::RenderTarget: return TEXT("RenderTarget");
+	case ERHIDescriptorHeapType::DepthStencil: return TEXT("DepthStencil");
+	case ERHIDescriptorHeapType::Sampler:      return TEXT("Sampler");
+	}
+}
 
 const FName LANGUAGE_D3D("D3D");
 const FName LANGUAGE_Metal("Metal");
@@ -1506,60 +2403,237 @@ const FName LANGUAGE_Nintendo("Nintendo");
 RHI_API FGenericDataDrivenShaderPlatformInfo FGenericDataDrivenShaderPlatformInfo::Infos[SP_NumPlatforms];
 
 // Gets a string from a section, or empty string if it didn't exist
-FString GetSectionString(const FConfigSection& Section, FName Key)
+static inline FString GetSectionString(const FConfigSection& Section, FName Key)
 {
 	return Section.FindRef(Key).GetValue();
 }
 
-// Gets a bool from a section, or false if it didn't exist
-bool GetSectionBool(const FConfigSection& Section, FName Key)
+// Gets a bool from a section.  It returns the original value if the setting does not exist
+static inline bool GetSectionBool(const FConfigSection& Section, FName Key, bool OriginalValue)
 {
-	return FCString::ToBool(*GetSectionString(Section, Key));
+	const FConfigValue* ConfigValue = Section.Find(Key);
+	if (ConfigValue != nullptr)
+	{
+		return FCString::ToBool(*ConfigValue->GetValue());
+	}
+	else
+	{
+		return OriginalValue;
+	}
+}
+
+// Gets an integer from a section.  It returns the original value if the setting does not exist
+static inline uint32 GetSectionUint(const FConfigSection& Section, FName Key, uint32 OriginalValue)
+{
+	const FConfigValue* ConfigValue = Section.Find(Key);
+	if (ConfigValue != nullptr)
+	{
+		return (uint32)FCString::Atoi(*ConfigValue->GetValue());
+	}
+	else
+	{
+		return OriginalValue;
+	}
+}
+
+// Gets an integer from a section.  It returns the original value if the setting does not exist
+static inline uint32 GetSectionFeatureSupport(const FConfigSection& Section, FName Key, uint32 OriginalValue)
+{
+	const FConfigValue* ConfigValue = Section.Find(Key);
+	if (ConfigValue != nullptr)
+	{
+		FString Value = ConfigValue->GetValue();
+		if (Value == TEXT("Unsupported"))
+		{
+			return uint32(ERHIFeatureSupport::Unsupported);
+		}
+		if (Value == TEXT("RuntimeDependent"))
+		{
+			return uint32(ERHIFeatureSupport::RuntimeDependent);
+		}
+		else if (Value == TEXT("RuntimeGuaranteed"))
+		{
+			return uint32(ERHIFeatureSupport::RuntimeGuaranteed);
+		}
+		else
+		{
+			checkf(false, TEXT("Unknown ERHIFeatureSupport value \"%s\" for %s"), *Value, *Key.ToString());
+		}
+	}
+
+	return OriginalValue;
+}
+
+FRHIViewableResource* GetViewableResource(const FRHITransitionInfo& Info)
+{
+	switch (Info.Type)
+	{
+	case FRHITransitionInfo::EType::Buffer:
+	case FRHITransitionInfo::EType::Texture:
+		return Info.ViewableResource;
+
+	case FRHITransitionInfo::EType::UAV:
+		return Info.UAV ? Info.UAV->GetParentResource() : nullptr;
+	}
+
+	return nullptr;
+}
+
+void FGenericDataDrivenShaderPlatformInfo::SetDefaultValues()
+{
+	MaxFeatureLevel = ERHIFeatureLevel::Num;
+	bSupportsMSAA = true;
+	bSupportsDOFHybridScattering = true;
+	bSupportsHZBOcclusion = true;
+	bSupportsWaterIndirectDraw = true;
+	bSupportsAsyncPipelineCompilation = true;
+	bSupportsManualVertexFetch = true;
+	bSupportsVolumeTextureAtomics = true;
+	PreviewShaderPlatformParent = EShaderPlatform::SP_NumPlatforms;
 }
 
 void FGenericDataDrivenShaderPlatformInfo::ParseDataDrivenShaderInfo(const FConfigSection& Section, FGenericDataDrivenShaderPlatformInfo& Info)
 {
 	Info.Language = *GetSectionString(Section, "Language");
+	Info.ShaderFormat = *GetSectionString(Section, "ShaderFormat");
+	checkf(!Info.ShaderFormat.IsNone(), TEXT("Missing ShaderFormat for ShaderPlatform %s  ShaderFormat %s"), *Info.Name.ToString(), *Info.ShaderFormat.ToString());
+
 	GetFeatureLevelFromName(*GetSectionString(Section, "MaxFeatureLevel"), Info.MaxFeatureLevel);
 
-	Info.bIsMobile = GetSectionBool(Section, "bIsMobile");
-	Info.bIsMetalMRT = GetSectionBool(Section, "bIsMetalMRT");
-	Info.bIsPC = GetSectionBool(Section, "bIsPC");
-	Info.bIsConsole = GetSectionBool(Section, "bIsConsole");
-	Info.bIsAndroidOpenGLES = GetSectionBool(Section, "bIsAndroidOpenGLES");
-	Info.bSupportsMobileMultiView = GetSectionBool(Section, "bSupportsMobileMultiView");
-	Info.bSupportsVolumeTextureCompression = GetSectionBool(Section, "bSupportsVolumeTextureCompression");
-	Info.bSupportsDistanceFields = GetSectionBool(Section, "bSupportsDistanceFields");
-	Info.bSupportsDiaphragmDOF = GetSectionBool(Section, "bSupportsDiaphragmDOF");
-	Info.bSupportsRGBColorBuffer = GetSectionBool(Section, "bSupportsRGBColorBuffer");
-	Info.bSupportsCapsuleShadows = GetSectionBool(Section, "bSupportsCapsuleShadows");
-	Info.bSupportsVolumetricFog = GetSectionBool(Section, "bSupportsVolumetricFog");
-	Info.bSupportsIndexBufferUAVs = GetSectionBool(Section, "bSupportsIndexBufferUAVs");
-	Info.bSupportsInstancedStereo = GetSectionBool(Section, "bSupportsInstancedStereo");
-	Info.bSupportsMultiView = GetSectionBool(Section, "bSupportsMultiView");
-	Info.bSupportsMSAA = GetSectionBool(Section, "bSupportsMSAA");
-	Info.bSupports4ComponentUAVReadWrite = GetSectionBool(Section, "bSupports4ComponentUAVReadWrite");
-	Info.bSupportsRenderTargetWriteMask = GetSectionBool(Section, "bSupportsRenderTargetWriteMask");
-	Info.bSupportsRayTracing = GetSectionBool(Section, "bSupportsRayTracing");
-	Info.bSupportsRayTracingIndirectInstanceData = GetSectionBool(Section, "bSupportsRayTracingIndirectInstanceData");
-	Info.bSupportsGPUSkinCache = GetSectionBool(Section, "bSupportsGPUSkinCache");
-	Info.bSupportsByteBufferComputeShaders = GetSectionBool(Section, "bSupportsByteBufferComputeShaders");
-	Info.bSupportsGPUScene = GetSectionBool(Section, "bSupportsGPUScene");
-	Info.bSupportsPrimitiveShaders = GetSectionBool(Section, "bSupportsPrimitiveShaders");
-	Info.bSupportsUInt64ImageAtomics = GetSectionBool(Section, "bSupportsUInt64ImageAtomics");
-	Info.bSupportsTemporalHistoryUpscale = GetSectionBool(Section, "bSupportsTemporalHistoryUpscale");
-	Info.bSupportsRTIndexFromVS = GetSectionBool(Section, "bSupportsRTIndexFromVS");
-	Info.bSupportsWaveOperations = GetSectionBool(Section, "bSupportsWaveOperations");
-	Info.bRequiresExplicit128bitRT = GetSectionBool(Section, "bRequiresExplicit128bitRT");
-	Info.bSupportsGen5TemporalAA = GetSectionBool(Section, "bSupportsGen5TemporalAA");
-	Info.bTargetsTiledGPU = GetSectionBool(Section, "bTargetsTiledGPU");
-	Info.bNeedsOfflineCompiler = GetSectionBool(Section, "bNeedsOfflineCompiler");
+	Info.ShaderPropertiesHash = 0;
+	FString ShaderPropertiesString = Info.Name.GetPlainNameString();
+
+#define ADD_TO_PROPERTIES_STRING(SettingName, SettingValue) \
+	ShaderPropertiesString += TEXT(#SettingName); \
+	ShaderPropertiesString += FString::Printf(TEXT("_%d"), SettingValue);
+
+#define GET_SECTION_BOOL_HELPER(SettingName)	\
+	Info.SettingName = GetSectionBool(Section, #SettingName, Info.SettingName);	\
+	ADD_TO_PROPERTIES_STRING(SettingName, Info.SettingName)
+
+#define GET_SECTION_INT_HELPER(SettingName)	\
+	Info.SettingName = GetSectionUint(Section, #SettingName, Info.SettingName); \
+	ADD_TO_PROPERTIES_STRING(SettingName, Info.SettingName)
+
+#define GET_SECTION_SUPPORT_HELPER(SettingName)	\
+	Info.SettingName = GetSectionFeatureSupport(Section, #SettingName, Info.SettingName); \
+	ADD_TO_PROPERTIES_STRING(SettingName, Info.SettingName)
+
+	GET_SECTION_BOOL_HELPER(bIsMobile);
+	GET_SECTION_BOOL_HELPER(bIsMetalMRT);
+	GET_SECTION_BOOL_HELPER(bIsPC);
+	GET_SECTION_BOOL_HELPER(bIsConsole);
+	GET_SECTION_BOOL_HELPER(bIsAndroidOpenGLES);
+	GET_SECTION_BOOL_HELPER(bSupportsDebugViewShaders);
+	GET_SECTION_BOOL_HELPER(bSupportsMobileMultiView);
+	GET_SECTION_BOOL_HELPER(bSupportsArrayTextureCompression);
+	GET_SECTION_BOOL_HELPER(bSupportsDistanceFields);
+	GET_SECTION_BOOL_HELPER(bSupportsDiaphragmDOF);
+	GET_SECTION_BOOL_HELPER(bSupportsRGBColorBuffer);
+	GET_SECTION_BOOL_HELPER(bSupportsCapsuleShadows);
+	GET_SECTION_BOOL_HELPER(bSupportsPercentageCloserShadows);
+	GET_SECTION_BOOL_HELPER(bSupportsVolumetricFog);
+	GET_SECTION_BOOL_HELPER(bSupportsIndexBufferUAVs);
+	GET_SECTION_BOOL_HELPER(bSupportsInstancedStereo);
+	GET_SECTION_SUPPORT_HELPER(SupportsMultiViewport);
+	GET_SECTION_BOOL_HELPER(bSupportsMSAA);
+	GET_SECTION_BOOL_HELPER(bSupports4ComponentUAVReadWrite);
+	GET_SECTION_BOOL_HELPER(bSupportsRenderTargetWriteMask);
+	GET_SECTION_BOOL_HELPER(bSupportsRayTracing);
+	GET_SECTION_BOOL_HELPER(bSupportsRayTracingShaders);
+	GET_SECTION_BOOL_HELPER(bSupportsInlineRayTracing);
+	GET_SECTION_BOOL_HELPER(bSupportsRayTracingCallableShaders);
+	GET_SECTION_BOOL_HELPER(bSupportsRayTracingProceduralPrimitive);
+	GET_SECTION_BOOL_HELPER(bSupportsRayTracingTraversalStatistics);
+	GET_SECTION_BOOL_HELPER(bSupportsRayTracingIndirectInstanceData);
+	GET_SECTION_BOOL_HELPER(bSupportsPathTracing);
+	GET_SECTION_BOOL_HELPER(bSupportsHighEndRayTracingReflections);
+	GET_SECTION_BOOL_HELPER(bSupportsByteBufferComputeShaders);
+	GET_SECTION_BOOL_HELPER(bSupportsGPUScene);
+	GET_SECTION_BOOL_HELPER(bSupportsPrimitiveShaders);
+	GET_SECTION_BOOL_HELPER(bSupportsUInt64ImageAtomics);
+	GET_SECTION_BOOL_HELPER(bRequiresVendorExtensionsForAtomics);
+	GET_SECTION_BOOL_HELPER(bSupportsNanite);
+	GET_SECTION_BOOL_HELPER(bSupportsLumenGI);
+	GET_SECTION_BOOL_HELPER(bSupportsSSDIndirect);
+	GET_SECTION_BOOL_HELPER(bSupportsTemporalHistoryUpscale);
+	GET_SECTION_BOOL_HELPER(bSupportsRTIndexFromVS);
+	GET_SECTION_BOOL_HELPER(bSupportsIntrinsicWaveOnce);
+	GET_SECTION_BOOL_HELPER(bSupportsConservativeRasterization);
+	GET_SECTION_SUPPORT_HELPER(bSupportsWaveOperations);
+	GET_SECTION_INT_HELPER(MinimumWaveSize);
+	GET_SECTION_INT_HELPER(MaximumWaveSize);
+	GET_SECTION_BOOL_HELPER(bRequiresExplicit128bitRT);
+	GET_SECTION_BOOL_HELPER(bSupportsGen5TemporalAA);
+	GET_SECTION_BOOL_HELPER(bTargetsTiledGPU);
+	GET_SECTION_BOOL_HELPER(bNeedsOfflineCompiler);
+	GET_SECTION_BOOL_HELPER(bSupportsComputeFramework);
+	GET_SECTION_BOOL_HELPER(bSupportsAnisotropicMaterials);
+	GET_SECTION_BOOL_HELPER(bSupportsDualSourceBlending);
+	GET_SECTION_BOOL_HELPER(bRequiresGeneratePrevTransformBuffer);
+	GET_SECTION_BOOL_HELPER(bRequiresRenderTargetDuringRaster);
+	GET_SECTION_BOOL_HELPER(bRequiresDisableForwardLocalLights);
+	GET_SECTION_BOOL_HELPER(bCompileSignalProcessingPipeline);
+	GET_SECTION_BOOL_HELPER(bSupportsMeshShadersTier0);
+	GET_SECTION_BOOL_HELPER(bSupportsMeshShadersTier1);
+	GET_SECTION_INT_HELPER(MaxMeshShaderThreadGroupSize);
+	GET_SECTION_BOOL_HELPER(bSupportsPerPixelDBufferMask);
+	GET_SECTION_BOOL_HELPER(bIsHlslcc);
+	GET_SECTION_BOOL_HELPER(bSupportsDxc);
+	GET_SECTION_BOOL_HELPER(bSupportsVariableRateShading);
+	GET_SECTION_BOOL_HELPER(bIsSPIRV);
+	GET_SECTION_INT_HELPER(NumberOfComputeThreads);
+
+	GET_SECTION_BOOL_HELPER(bWaterUsesSimpleForwardShading);
+	GET_SECTION_BOOL_HELPER(bSupportsHairStrandGeometry);
+	GET_SECTION_BOOL_HELPER(bSupportsDOFHybridScattering);
+	GET_SECTION_BOOL_HELPER(bNeedsExtraMobileFrames);
+	GET_SECTION_BOOL_HELPER(bSupportsHZBOcclusion);
+	GET_SECTION_BOOL_HELPER(bSupportsWaterIndirectDraw);
+	GET_SECTION_BOOL_HELPER(bSupportsAsyncPipelineCompilation);
+	GET_SECTION_BOOL_HELPER(bSupportsManualVertexFetch);
+	GET_SECTION_BOOL_HELPER(bRequiresReverseCullingOnMobile);
+	GET_SECTION_BOOL_HELPER(bOverrideFMaterial_NeedsGBufferEnabled);
+	GET_SECTION_BOOL_HELPER(bSupportsMobileDistanceField);
+	GET_SECTION_BOOL_HELPER(bSupportsFFTBloom);
+	GET_SECTION_BOOL_HELPER(bSupportsVertexShaderLayer);
+	GET_SECTION_BOOL_HELPER(bSupportsBindless);
+	GET_SECTION_BOOL_HELPER(bSupportsVolumeTextureAtomics);
+	GET_SECTION_BOOL_HELPER(bSupportsROV);
+	GET_SECTION_BOOL_HELPER(bSupportsOIT);
+	GET_SECTION_SUPPORT_HELPER(bSupportsRealTypes);
+	GET_SECTION_INT_HELPER(EnablesHLSL2021ByDefault);
+	GET_SECTION_BOOL_HELPER(bSupportsSceneDataCompressedTransforms);
+	GET_SECTION_BOOL_HELPER(bSupportsSwapchainUAVs);
+#undef GET_SECTION_BOOL_HELPER
+#undef GET_SECTION_INT_HELPER
+#undef GET_SECTION_SUPPORT_HELPER
+#undef ADD_TO_PROPERTIES_STRING
+
+	Info.ShaderPropertiesHash = GetTypeHash(ShaderPropertiesString);
+#if WITH_EDITOR
+	FTextStringHelper::ReadFromBuffer(*GetSectionString(Section, FName("FriendlyName")), Info.FriendlyName);
+#endif
 }
 
 void FGenericDataDrivenShaderPlatformInfo::Initialize()
 {
+	static bool bInitialized = false;
+	if (bInitialized)
+	{
+		return;
+	}
+
 	// look for the standard DataDriven ini files
 	int32 NumDDInfoFiles = FDataDrivenPlatformInfoRegistry::GetNumDataDrivenIniFiles();
+	int32 CustomShaderPlatform = EShaderPlatform::SP_CUSTOM_PLATFORM_FIRST;
+
+	struct PlatformInfoAndPlatformEnum
+	{
+		FGenericDataDrivenShaderPlatformInfo Info;
+		EShaderPlatform ShaderPlatform;
+	};
+
 	for (int32 Index = 0; Index < NumDDInfoFiles; Index++)
 	{
 		FConfigFile IniFile;
@@ -1579,124 +2653,190 @@ void FGenericDataDrivenShaderPlatformInfo::Initialize()
 				LexFromString(ShaderPlatform, *SectionName.Mid(15));
 				if (ShaderPlatform == EShaderPlatform::SP_NumPlatforms)
 				{
-					UE_LOG(LogRHI, Warning, TEXT("Found an unknown shader platform %s in a DataDriven ini file"), *SectionName.Mid(15));
+#if DDPI_HAS_EXTENDED_PLATFORMINFO_DATA
+					const bool bIsEnabled = FDataDrivenPlatformInfoRegistry::GetPlatformInfo(PlatformName).bEnabledForUse;
+#else
+					const bool bIsEnabled = true;
+#endif
+					UE_CLOG(bIsEnabled, LogRHI, Warning, TEXT("Found an unknown shader platform %s in a DataDriven ini file"), *SectionName.Mid(15));
 					continue;
 				}
 				
 				// at this point, we can start pulling information out
+				Infos[ShaderPlatform].Name = *SectionName.Mid(15);
 				ParseDataDrivenShaderInfo(Section.Value, Infos[ShaderPlatform]);	
+				Infos[ShaderPlatform].bContainsValidPlatformInfo = true;
+
+#if WITH_EDITOR
+				for (const FPreviewPlatformMenuItem& Item : FDataDrivenPlatformInfoRegistry::GetAllPreviewPlatformMenuItems())
+				{
+					FName PreviewPlatformName = *(Infos[ShaderPlatform].Name).ToString();
+					if (Item.ShaderPlatformToPreview == PreviewPlatformName)
+					{
+						EShaderPlatform PreviewShaderPlatform = EShaderPlatform(CustomShaderPlatform++);
+						ParseDataDrivenShaderInfo(Section.Value, Infos[PreviewShaderPlatform]);
+						if (!Item.OptionalFriendlyNameOverride.IsEmpty())
+						{
+							Infos[PreviewShaderPlatform].FriendlyName = Item.OptionalFriendlyNameOverride;
+						}
+						Infos[PreviewShaderPlatform].Name = Item.PreviewShaderPlatformName;
+						Infos[PreviewShaderPlatform].PreviewShaderPlatformParent = ShaderPlatform;
+						Infos[PreviewShaderPlatform].bIsPreviewPlatform = true;
+						Infos[PreviewShaderPlatform].bContainsValidPlatformInfo = true;
+					}
+				}
+#endif
+			}
+		}
+	}
+	bInitialized = true;
+}
+
+void FGenericDataDrivenShaderPlatformInfo::UpdatePreviewPlatforms()
+{
+	for (int i = 0; i < EShaderPlatform::SP_NumPlatforms; ++i)
+	{
+		EShaderPlatform ShaderPlatform = EShaderPlatform(i);
+		if (IsValid(ShaderPlatform))
+		{
+			ERHIFeatureLevel::Type PreviewSPMaxFeatureLevel = Infos[ShaderPlatform].MaxFeatureLevel;
+			EShaderPlatform EditorSPForPreviewMaxFeatureLevel = GShaderPlatformForFeatureLevel[PreviewSPMaxFeatureLevel];
+			if (Infos[ShaderPlatform].bIsPreviewPlatform && EditorSPForPreviewMaxFeatureLevel < EShaderPlatform::SP_NumPlatforms)
+			{
+				Infos[ShaderPlatform].ShaderFormat = Infos[EditorSPForPreviewMaxFeatureLevel].ShaderFormat;
+				Infos[ShaderPlatform].Language = Infos[EditorSPForPreviewMaxFeatureLevel].Language;
+				Infos[ShaderPlatform].bIsHlslcc = Infos[EditorSPForPreviewMaxFeatureLevel].bIsHlslcc;
+				Infos[ShaderPlatform].bSupportsDxc = Infos[EditorSPForPreviewMaxFeatureLevel].bSupportsDxc;
+				Infos[ShaderPlatform].bSupportsGPUScene &= Infos[EditorSPForPreviewMaxFeatureLevel].bSupportsGPUScene;
+				Infos[ShaderPlatform].bIsPC = true;
+				Infos[ShaderPlatform].bIsConsole = false;
+				Infos[ShaderPlatform].bSupportsSceneDataCompressedTransforms = Infos[EditorSPForPreviewMaxFeatureLevel].bSupportsSceneDataCompressedTransforms;
+				Infos[ShaderPlatform].bSupportsNanite &= Infos[EditorSPForPreviewMaxFeatureLevel].bSupportsNanite;
+				Infos[ShaderPlatform].bSupportsLumenGI &= Infos[EditorSPForPreviewMaxFeatureLevel].bSupportsLumenGI;
+				Infos[ShaderPlatform].bSupportsUInt64ImageAtomics &= Infos[EditorSPForPreviewMaxFeatureLevel].bSupportsUInt64ImageAtomics;
+				Infos[ShaderPlatform].bSupportsGen5TemporalAA &= Infos[EditorSPForPreviewMaxFeatureLevel].bSupportsGen5TemporalAA;
+				Infos[ShaderPlatform].bSupportsMobileMultiView &= Infos[EditorSPForPreviewMaxFeatureLevel].bSupportsMobileMultiView;
+				Infos[ShaderPlatform].bSupportsInstancedStereo &= Infos[EditorSPForPreviewMaxFeatureLevel].bSupportsInstancedStereo;
+				Infos[ShaderPlatform].bSupportsManualVertexFetch &= Infos[EditorSPForPreviewMaxFeatureLevel].bSupportsManualVertexFetch;
+				Infos[ShaderPlatform].bSupportsRenderTargetWriteMask = false;
+				Infos[ShaderPlatform].bSupportsIntrinsicWaveOnce = false;
+				Infos[ShaderPlatform].bSupportsDOFHybridScattering = false;
+				Infos[ShaderPlatform].bSupports4ComponentUAVReadWrite = false;
 				Infos[ShaderPlatform].bContainsValidPlatformInfo = true;
 			}
 		}
 	}
 }
 
-//
-//	Pixel format information.
-//
-
-FPixelFormatInfo	GPixelFormats[PF_MAX] =
+#if WITH_EDITOR
+FText FGenericDataDrivenShaderPlatformInfo::GetFriendlyName(const FStaticShaderPlatform Platform)
 {
-	// Name						BlockSizeX	BlockSizeY	BlockSizeZ	BlockBytes	NumComponents	PlatformFormat	Supported		UnrealFormat
-
-	{ TEXT("unknown"),			0,			0,			0,			0,			0,				0,				0,				PF_Unknown			},
-	{ TEXT("A32B32G32R32F"),	1,			1,			1,			16,			4,				0,				1,				PF_A32B32G32R32F	},
-	{ TEXT("B8G8R8A8"),			1,			1,			1,			4,			4,				0,				1,				PF_B8G8R8A8			},
-	{ TEXT("G8"),				1,			1,			1,			1,			1,				0,				1,				PF_G8				},
-	{ TEXT("G16"),				1,			1,			1,			2,			1,				0,				1,				PF_G16				},
-	{ TEXT("DXT1"),				4,			4,			1,			8,			3,				0,				1,				PF_DXT1				},
-	{ TEXT("DXT3"),				4,			4,			1,			16,			4,				0,				1,				PF_DXT3				},
-	{ TEXT("DXT5"),				4,			4,			1,			16,			4,				0,				1,				PF_DXT5				},
-	{ TEXT("UYVY"),				2,			1,			1,			4,			4,				0,				0,				PF_UYVY				},
-	{ TEXT("FloatRGB"),			1,			1,			1,			4,			3,				0,				1,				PF_FloatRGB			},
-	{ TEXT("FloatRGBA"),		1,			1,			1,			8,			4,				0,				1,				PF_FloatRGBA		},
-	{ TEXT("DepthStencil"),		1,			1,			1,			4,			1,				0,				0,				PF_DepthStencil		},
-	{ TEXT("ShadowDepth"),		1,			1,			1,			4,			1,				0,				0,				PF_ShadowDepth		},
-	{ TEXT("R32_FLOAT"),		1,			1,			1,			4,			1,				0,				1,				PF_R32_FLOAT		},
-	{ TEXT("G16R16"),			1,			1,			1,			4,			2,				0,				1,				PF_G16R16			},
-	{ TEXT("G16R16F"),			1,			1,			1,			4,			2,				0,				1,				PF_G16R16F			},
-	{ TEXT("G16R16F_FILTER"),	1,			1,			1,			4,			2,				0,				1,				PF_G16R16F_FILTER	},
-	{ TEXT("G32R32F"),			1,			1,			1,			8,			2,				0,				1,				PF_G32R32F			},
-	{ TEXT("A2B10G10R10"),      1,          1,          1,          4,          4,              0,              1,				PF_A2B10G10R10		},
-	{ TEXT("A16B16G16R16"),		1,			1,			1,			8,			4,				0,				1,				PF_A16B16G16R16		},
-	{ TEXT("D24"),				1,			1,			1,			4,			1,				0,				1,				PF_D24				},
-	{ TEXT("PF_R16F"),			1,			1,			1,			2,			1,				0,				1,				PF_R16F				},
-	{ TEXT("PF_R16F_FILTER"),	1,			1,			1,			2,			1,				0,				1,				PF_R16F_FILTER		},
-	{ TEXT("BC5"),				4,			4,			1,			16,			2,				0,				1,				PF_BC5				},
-	{ TEXT("V8U8"),				1,			1,			1,			2,			2,				0,				1,				PF_V8U8				},
-	{ TEXT("A1"),				1,			1,			1,			1,			1,				0,				0,				PF_A1				},
-	{ TEXT("FloatR11G11B10"),	1,			1,			1,			4,			3,				0,				0,				PF_FloatR11G11B10	},
-	{ TEXT("A8"),				1,			1,			1,			1,			1,				0,				1,				PF_A8				},	
-	{ TEXT("R32_UINT"),			1,			1,			1,			4,			1,				0,				1,				PF_R32_UINT			},
-	{ TEXT("R32_SINT"),			1,			1,			1,			4,			1,				0,				1,				PF_R32_SINT			},
-
-	// IOS Support
-	{ TEXT("PVRTC2"),			8,			4,			1,			8,			4,				0,				0,				PF_PVRTC2			},
-	{ TEXT("PVRTC4"),			4,			4,			1,			8,			4,				0,				0,				PF_PVRTC4			},
-
-	{ TEXT("R16_UINT"),			1,			1,			1,			2,			1,				0,				1,				PF_R16_UINT			},
-	{ TEXT("R16_SINT"),			1,			1,			1,			2,			1,				0,				1,				PF_R16_SINT			},
-	{ TEXT("R16G16B16A16_UINT"),1,			1,			1,			8,			4,				0,				1,				PF_R16G16B16A16_UINT},
-	{ TEXT("R16G16B16A16_SINT"),1,			1,			1,			8,			4,				0,				1,				PF_R16G16B16A16_SINT},
-	{ TEXT("R5G6B5_UNORM"),     1,          1,          1,          2,          3,              0,              1,              PF_R5G6B5_UNORM		},
-	{ TEXT("R8G8B8A8"),			1,			1,			1,			4,			4,				0,				1,				PF_R8G8B8A8			},
-	{ TEXT("A8R8G8B8"),			1,			1,			1,			4,			4,				0,				1,				PF_A8R8G8B8			},
-	{ TEXT("BC4"),				4,			4,			1,			8,			1,				0,				1,				PF_BC4				},
-	{ TEXT("R8G8"),				1,			1,			1,			2,			2,				0,				1,				PF_R8G8				},
-
-	{ TEXT("ATC_RGB"),			4,			4,			1,			8,			3,				0,				0,				PF_ATC_RGB			},
-	{ TEXT("ATC_RGBA_E"),		4,			4,			1,			16,			4,				0,				0,				PF_ATC_RGBA_E		},
-	{ TEXT("ATC_RGBA_I"),		4,			4,			1,			16,			4,				0,				0,				PF_ATC_RGBA_I		},
-	{ TEXT("X24_G8"),			1,			1,			1,			1,			1,				0,				0,				PF_X24_G8			},
-	{ TEXT("ETC1"),				4,			4,			1,			8,			3,				0,				0,				PF_ETC1				},
-	{ TEXT("ETC2_RGB"),			4,			4,			1,			8,			3,				0,				0,				PF_ETC2_RGB			},
-	{ TEXT("ETC2_RGBA"),		4,			4,			1,			16,			4,				0,				0,				PF_ETC2_RGBA		},
-	{ TEXT("PF_R32G32B32A32_UINT"),1,		1,			1,			16,			4,				0,				1,				PF_R32G32B32A32_UINT},
-	{ TEXT("PF_R16G16_UINT"),	1,			1,			1,			4,			4,				0,				1,				PF_R16G16_UINT},
-
-	// ASTC support
-	{ TEXT("ASTC_4x4"),			4,			4,			1,			16,			4,				0,				0,				PF_ASTC_4x4			},
-	{ TEXT("ASTC_6x6"),			6,			6,			1,			16,			4,				0,				0,				PF_ASTC_6x6			},
-	{ TEXT("ASTC_8x8"),			8,			8,			1,			16,			4,				0,				0,				PF_ASTC_8x8			},
-	{ TEXT("ASTC_10x10"),		10,			10,			1,			16,			4,				0,				0,				PF_ASTC_10x10		},
-	{ TEXT("ASTC_12x12"),		12,			12,			1,			16,			4,				0,				0,				PF_ASTC_12x12		},
-
-	{ TEXT("BC6H"),				4,			4,			1,			16,			3,				0,				1,				PF_BC6H				},
-	{ TEXT("BC7"),				4,			4,			1,			16,			4,				0,				1,				PF_BC7				},
-	{ TEXT("R8_UINT"),			1,			1,			1,			1,			1,				0,				1,				PF_R8_UINT			},
-	{ TEXT("L8"),				1,			1,			1,			1,			1,				0,				0,				PF_L8				},
-	{ TEXT("XGXR8"),			1,			1,			1,			4,			4,				0,				1,				PF_XGXR8 			},
-	{ TEXT("R8G8B8A8_UINT"),	1,			1,			1,			4,			4,				0,				1,				PF_R8G8B8A8_UINT	},
-	{ TEXT("R8G8B8A8_SNORM"),	1,			1,			1,			4,			4,				0,				1,				PF_R8G8B8A8_SNORM	},
-
-	{ TEXT("R16G16B16A16_UINT"),1,			1,			1,			8,			4,				0,				1,				PF_R16G16B16A16_UNORM },
-	{ TEXT("R16G16B16A16_SINT"),1,			1,			1,			8,			4,				0,				1,				PF_R16G16B16A16_SNORM },
-	{ TEXT("PLATFORM_HDR_0"),	0,			0,			0,			0,			0,				0,				0,				PF_PLATFORM_HDR_0   },
-	{ TEXT("PLATFORM_HDR_1"),	0,			0,			0,			0,			0,				0,				0,				PF_PLATFORM_HDR_1   },
-	{ TEXT("PLATFORM_HDR_2"),	0,			0,			0,			0,			0,				0,				0,				PF_PLATFORM_HDR_2   },
-
-	// NV12 contains 2 textures: R8 luminance plane followed by R8G8 1/4 size chrominance plane.
-	// BlockSize/BlockBytes/NumComponents values don't make much sense for this format, so set them all to one.
-	{ TEXT("NV12"),				1,			1,			1,			1,			1,				0,				0,				PF_NV12             },
-
-	{ TEXT("PF_R32G32_UINT"),   1,   		1,			1,			8,			2,				0,				1,				PF_R32G32_UINT      },
-
-	{ TEXT("PF_ETC2_R11_EAC"),  4,   		4,			1,			8,			1,				0,				0,				PF_ETC2_R11_EAC     },
-	{ TEXT("PF_ETC2_RG11_EAC"), 4,   		4,			1,			16,			2,				0,				0,				PF_ETC2_RG11_EAC    },
-	{ TEXT("R8"),				1,			1,			1,			1,			1,				0,				1,				PF_R8				},
-};
-
-static struct FValidatePixelFormats
-{
-	FValidatePixelFormats()
+	if (IsRunningCommandlet() || GUsingNullRHI)
 	{
-		for (int32 Index = 0; Index < UE_ARRAY_COUNT(GPixelFormats); ++Index)
+		return FText();
+	}
+	check(IsValid(Platform));
+	return Infos[Platform].FriendlyName;
+}
+#endif
+
+const EShaderPlatform FGenericDataDrivenShaderPlatformInfo::GetShaderPlatformFromName(const FName ShaderPlatformName)
+{
+	for (int32 i = 0; i < SP_NumPlatforms; ++i)
+	{
+		const EShaderPlatform Platform = static_cast<EShaderPlatform>(i);
+		if (!Infos[Platform].bContainsValidPlatformInfo)
 		{
-			// Make sure GPixelFormats has an entry for every unreal format
-			checkf((EPixelFormat)Index == GPixelFormats[Index].UnrealFormat, TEXT("Missing entry for EPixelFormat %d"), (int32)Index);
+			continue;
+		}
+
+		if (Infos[Platform].Name == ShaderPlatformName)
+		{
+			return Platform;
 		}
 	}
-} ValidatePixelFormats;
+	return SP_NumPlatforms;
+}
+
+//
+//	MSAA sample offsets.
+//
+// https://docs.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_standard_multisample_quality_levels
+FVector2f GRHIDefaultMSAASampleOffsets[1 + 2 + 4 + 8 + 16] = {
+	// MSAA x1
+	FVector2f(+0.0f / 8.0f, +0.0f / 8.0f),
+
+	// MSAA x2
+	FVector2f(+4.0f / 8.0f, +4.0f / 8.0f),
+	FVector2f(-4.0f / 8.0f, -4.0f / 8.0f),
+
+	// MSAA x4
+	FVector2f(-2.0f / 8.0f, -6.0f / 8.0f),
+	FVector2f(+6.0f / 8.0f, -2.0f / 8.0f),
+	FVector2f(-6.0f / 8.0f, +2.0f / 8.0f),
+	FVector2f(+2.0f / 8.0f, +6.0f / 8.0f),
+
+	// MSAA x8
+	FVector2f(+1.0f / 8.0f, -3.0f / 8.0f),
+	FVector2f(-1.0f / 8.0f, +3.0f / 8.0f),
+	FVector2f(+5.0f / 8.0f, +1.0f / 8.0f),
+	FVector2f(-3.0f / 8.0f, -5.0f / 8.0f),
+	FVector2f(-5.0f / 8.0f, +5.0f / 8.0f),
+	FVector2f(-7.0f / 8.0f, -1.0f / 8.0f),
+	FVector2f(+3.0f / 8.0f, +7.0f / 8.0f),
+	FVector2f(+7.0f / 8.0f, -7.0f / 8.0f),
+
+	// MSAA x16
+	FVector2f(+1.0f / 8.0f, +1.0f / 8.0f),
+	FVector2f(-1.0f / 8.0f, -3.0f / 8.0f),
+	FVector2f(-3.0f / 8.0f, +2.0f / 8.0f),
+	FVector2f(+4.0f / 8.0f, -1.0f / 8.0f),
+	FVector2f(-5.0f / 8.0f, -2.0f / 8.0f),
+	FVector2f(+2.0f / 8.0f, +5.0f / 8.0f),
+	FVector2f(+5.0f / 8.0f, +3.0f / 8.0f),
+	FVector2f(+3.0f / 8.0f, -5.0f / 8.0f),
+	FVector2f(-2.0f / 8.0f, +6.0f / 8.0f),
+	FVector2f(+0.0f / 8.0f, -7.0f / 8.0f),
+	FVector2f(-4.0f / 8.0f, -6.0f / 8.0f),
+	FVector2f(-6.0f / 8.0f, +4.0f / 8.0f),
+	FVector2f(-8.0f / 8.0f, +0.0f / 8.0f),
+	FVector2f(+7.0f / 8.0f, -4.0f / 8.0f),
+	FVector2f(+6.0f / 8.0f, +7.0f / 8.0f),
+	FVector2f(-7.0f / 8.0f, -8.0f / 8.0f),
+};
+
+int32 CalculateMSAASampleArrayIndex(int32 NumSamples, int32 SampleIndex)
+{
+	check(NumSamples > 0 && NumSamples <= 16);
+	check(FMath::IsPowerOfTwo(NumSamples));
+	check(SampleIndex < NumSamples);
+
+	return NumSamples - 1 + SampleIndex;
+}
+
+void RHIInitDefaultPixelFormatCapabilities()
+{
+	for (FPixelFormatInfo& Info : GPixelFormats)
+	{
+		if (Info.Supported)
+		{
+			const EPixelFormat PixelFormat = Info.UnrealFormat;
+			if (IsBlockCompressedFormat(PixelFormat))
+			{
+				// Block compressed formats should have limited capabilities
+				EnumAddFlags(Info.Capabilities, EPixelFormatCapabilities::AnyTexture | EPixelFormatCapabilities::TextureMipmaps | EPixelFormatCapabilities::TextureLoad | EPixelFormatCapabilities::TextureSample | EPixelFormatCapabilities::TextureGather);
+			}
+			else
+			{
+				EnumAddFlags(Info.Capabilities, EPixelFormatCapabilities::AllTextureFlags | EPixelFormatCapabilities::AllBufferFlags | EPixelFormatCapabilities::UAV);
+				if (!IsDepthOrStencilFormat(PixelFormat))
+				{
+					EnumRemoveFlags(Info.Capabilities, EPixelFormatCapabilities::DepthStencil);
+				}
+			}
+		}
+	}
+}
 
 //
 //	CalculateImageBytes
@@ -1705,18 +2845,262 @@ static struct FValidatePixelFormats
 SIZE_T CalculateImageBytes(uint32 SizeX,uint32 SizeY,uint32 SizeZ,uint8 Format)
 {
 	if ( Format == PF_A1 )
-	{
+	{		
 		// The number of bytes needed to store all 1 bit pixels in a line is the width of the image divided by the number of bits in a byte
-		uint32 BytesPerLine = SizeX / 8;
+		uint32 BytesPerLine = (SizeX + 7) / 8;
 		// The number of actual bytes in a 1 bit image is the bytes per line of pixels times the number of lines
 		return sizeof(uint8) * BytesPerLine * SizeY;
 	}
 	else if( SizeZ > 0 )
 	{
-		return static_cast<SIZE_T>(SizeX / GPixelFormats[Format].BlockSizeX) * (SizeY / GPixelFormats[Format].BlockSizeY) * (SizeZ / GPixelFormats[Format].BlockSizeZ) * GPixelFormats[Format].BlockBytes;
+		return GPixelFormats[Format].Get3DImageSizeInBytes(SizeX, SizeY, SizeZ);
 	}
 	else
 	{
-		return static_cast<SIZE_T>(SizeX / GPixelFormats[Format].BlockSizeX) * (SizeY / GPixelFormats[Format].BlockSizeY) * GPixelFormats[Format].BlockBytes;
+		return GPixelFormats[Format].Get2DImageSizeInBytes(SizeX, SizeY);
 	}
+}
+
+FRHIShaderResourceView* FRHITextureViewCache::GetOrCreateSRV(FRHITexture* Texture, const FRHITextureSRVCreateInfo& SRVCreateInfo)
+{
+	for (const auto& KeyValue : SRVs)
+	{
+		if (KeyValue.Key == SRVCreateInfo)
+		{
+			return KeyValue.Value.GetReference();
+		}
+	}
+
+	FShaderResourceViewRHIRef RHIShaderResourceView;
+
+	if (SRVCreateInfo.MetaData != ERHITextureMetaDataAccess::None)
+	{
+		FRHITexture2D* Texture2D = Texture->GetTexture2D();
+		check(Texture2D);
+
+		switch (SRVCreateInfo.MetaData)
+		{
+		case ERHITextureMetaDataAccess::HTile:
+			check(GRHISupportsExplicitHTile);
+			RHIShaderResourceView = RHICreateShaderResourceViewHTile(Texture2D);
+			break;
+
+		case ERHITextureMetaDataAccess::FMask:
+			RHIShaderResourceView = RHICreateShaderResourceViewFMask(Texture2D);
+			break;
+
+		case ERHITextureMetaDataAccess::CMask:
+			RHIShaderResourceView = RHICreateShaderResourceViewWriteMask(Texture2D);
+			break;
+		}
+	}
+
+	if (!RHIShaderResourceView)
+	{
+		RHIShaderResourceView = RHICreateShaderResourceView(Texture, SRVCreateInfo);
+	}
+
+	check(RHIShaderResourceView);
+	FRHIShaderResourceView* View = RHIShaderResourceView.GetReference();
+	SRVs.Emplace(SRVCreateInfo, MoveTemp(RHIShaderResourceView));
+	return View;
+}
+
+FRHIUnorderedAccessView* FRHITextureViewCache::GetOrCreateUAV(FRHITexture* Texture, const FRHITextureUAVCreateInfo& UAVCreateInfo)
+{
+	for (const auto& KeyValue : UAVs)
+	{
+		if (KeyValue.Key == UAVCreateInfo)
+		{
+			return KeyValue.Value.GetReference();
+		}
+	}
+
+	FUnorderedAccessViewRHIRef RHIUnorderedAccessView;
+
+	if (UAVCreateInfo.MetaData != ERHITextureMetaDataAccess::None)
+	{
+		FRHITexture2D* Texture2D = Texture->GetTexture2D();
+		check(Texture2D);
+
+		switch (UAVCreateInfo.MetaData)
+		{
+		case ERHITextureMetaDataAccess::HTile:
+			check(GRHISupportsExplicitHTile);
+			RHIUnorderedAccessView = RHICreateUnorderedAccessViewHTile(Texture2D);
+			break;
+
+		case ERHITextureMetaDataAccess::Stencil:
+			RHIUnorderedAccessView = RHICreateUnorderedAccessViewStencil(Texture2D, UAVCreateInfo.MipLevel);
+			break;
+		}
+	}
+
+	if (!RHIUnorderedAccessView)
+	{
+		if (UAVCreateInfo.Format != PF_Unknown)
+		{
+			RHIUnorderedAccessView = RHICreateUnorderedAccessView(Texture, UAVCreateInfo.MipLevel, UAVCreateInfo.Format, UAVCreateInfo.FirstArraySlice, UAVCreateInfo.NumArraySlices);
+		}
+		else
+		{
+			RHIUnorderedAccessView = RHICreateUnorderedAccessView(Texture, UAVCreateInfo.MipLevel, UAVCreateInfo.FirstArraySlice, UAVCreateInfo.NumArraySlices);
+		}
+	}
+
+	check(RHIUnorderedAccessView);
+	FRHIUnorderedAccessView* View = RHIUnorderedAccessView.GetReference();
+	UAVs.Emplace(UAVCreateInfo, MoveTemp(RHIUnorderedAccessView));
+	return View;
+}
+
+FRHIShaderResourceView* FRHIBufferViewCache::GetOrCreateSRV(FRHIBuffer* Buffer, const FRHIBufferSRVCreateInfo& SRVCreateInfo)
+{
+	for (const auto& KeyValue : SRVs)
+	{
+		if (KeyValue.Key == SRVCreateInfo)
+		{
+			return KeyValue.Value.GetReference();
+		}
+	}
+
+	FShaderResourceViewRHIRef RHIShaderResourceView;
+
+	if (SRVCreateInfo.Format != PF_Unknown)
+	{
+		RHIShaderResourceView = RHICreateShaderResourceView(Buffer, SRVCreateInfo.BytesPerElement, SRVCreateInfo.Format);
+	}
+	else
+	{
+		RHIShaderResourceView = RHICreateShaderResourceView(Buffer);
+	}
+
+	FRHIShaderResourceView* View = RHIShaderResourceView.GetReference();
+	SRVs.Emplace(SRVCreateInfo, MoveTemp(RHIShaderResourceView));
+	return View;
+}
+
+FRHIUnorderedAccessView* FRHIBufferViewCache::GetOrCreateUAV(FRHIBuffer* Buffer, const FRHIBufferUAVCreateInfo& UAVCreateInfo)
+{
+	for (const auto& KeyValue : UAVs)
+	{
+		if (KeyValue.Key == UAVCreateInfo)
+		{
+			return KeyValue.Value.GetReference();
+		}
+	}
+
+	FUnorderedAccessViewRHIRef RHIUnorderedAccessView;
+
+	if (UAVCreateInfo.Format != PF_Unknown)
+	{
+		RHIUnorderedAccessView = RHICreateUnorderedAccessView(Buffer, UAVCreateInfo.Format);
+	}
+	else
+	{
+		RHIUnorderedAccessView = RHICreateUnorderedAccessView(Buffer, UAVCreateInfo.bSupportsAtomicCounter, UAVCreateInfo.bSupportsAppendBuffer);
+	}
+
+	FRHIUnorderedAccessView* View = RHIUnorderedAccessView.GetReference();
+	UAVs.Emplace(UAVCreateInfo, MoveTemp(RHIUnorderedAccessView));
+	return View;
+}
+
+#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
+
+void FRHITextureViewCache::SetDebugName(const TCHAR* DebugName)
+{
+	for (const auto& KeyValue : UAVs)
+	{
+		RHIBindDebugLabelName(KeyValue.Value, DebugName);
+	}
+}
+
+void FRHIBufferViewCache::SetDebugName(const TCHAR* DebugName)
+{
+	for (const auto& KeyValue : UAVs)
+	{
+		RHIBindDebugLabelName(KeyValue.Value, DebugName);
+	}
+}
+
+#endif
+
+void FRHITransientTexture::Acquire(const TCHAR* InName, uint32 InPassIndex, uint64 InAcquireCycle)
+{
+	FRHITransientResource::Acquire(InName, InPassIndex, InAcquireCycle);
+	ViewCache.SetDebugName(InName);
+
+#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
+	RHIBindDebugLabelName(GetRHI(), InName);
+#endif
+}
+
+void FRHITransientBuffer::Acquire(const TCHAR* InName, uint32 InPassIndex, uint64 InAcquireCycle)
+{
+	FRHITransientResource::Acquire(InName, InPassIndex, InAcquireCycle);
+	ViewCache.SetDebugName(InName);
+
+	// TODO: Add method to rename a buffer.
+}
+
+FDebugName::FDebugName()
+	: Name()
+	, Number(NAME_NO_NUMBER_INTERNAL)
+{
+}
+
+FDebugName::FDebugName(FName InName)
+	: Name(InName)
+	, Number(NAME_NO_NUMBER_INTERNAL)
+{
+}
+
+FDebugName::FDebugName(FName InName, int32 InNumber)
+	: Name(InName)
+	, Number(InNumber)
+{
+}
+
+FDebugName::FDebugName(FMemoryImageName InName, int32 InNumber)
+	: Name(InName)
+	, Number(InNumber)
+{
+}
+
+FDebugName& FDebugName::operator=(FName Other)
+{
+	Name = FMemoryImageName(Other);
+	Number = NAME_NO_NUMBER_INTERNAL;
+	return *this;
+}
+
+FString FDebugName::ToString() const
+{
+	FString Out;
+	FName(Name).AppendString(Out);
+	if (Number != NAME_NO_NUMBER_INTERNAL)
+	{
+		Out.Appendf(TEXT("_%u"), Number);
+	}
+	return Out;
+}
+
+void FDebugName::AppendString(FStringBuilderBase& Builder) const
+{
+	FName(Name).AppendString(Builder);
+	if (Number != NAME_NO_NUMBER_INTERNAL)
+	{
+		Builder << '_' << Number;
+	}
+}
+
+RHI_API void RHISetCurrentNumDrawCallPtr(FRHIDrawCallsStatPtr InNumDrawCallsRHIPtr)
+{
+	GCurrentNumDrawCallsRHIPtr = InNumDrawCallsRHIPtr;
+}
+
+RHI_API void RHIIncCurrentNumDrawCallPtr(uint32 GPUIndex)
+{
+	FPlatformAtomics::InterlockedIncrement(&(*GCurrentNumDrawCallsRHIPtr)[GPUIndex]);
 }

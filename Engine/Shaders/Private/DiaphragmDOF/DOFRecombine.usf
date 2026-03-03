@@ -135,11 +135,10 @@ float4 ViewportSize;
 uint4 ViewportRect;
 
 float2 TemporalJitterPixels;
-float4 CocModelParameters;
-float2 DepthBlurParameters;
 float2 DOFBufferUVMax;
 
 float4 SeparateTranslucencyBilinearUVMinMax;
+uint SeparateTranslucencyUpscaling;
 
 Texture2D BokehLUT;
 
@@ -147,8 +146,11 @@ Texture2D SceneColorInput;
 Texture2D SceneDepthTexture;
 Texture2D SceneSeparateCoc;
 
+Texture2D<float> LowResDepthTexture;
+Texture2D<float> FullResDepthTexture;
+
 Texture2D SceneSeparateTranslucency;
-SamplerState SceneSeparateTranslucencySampler;
+Texture2D SceneSeparateTranslucencyModulateColor;
 
 float4 ConvolutionInputSize;
 
@@ -167,6 +169,9 @@ Texture2D BackgroundConvolution_SeparateAlpha;
 
 RWTexture2D<float4>	SceneColorOutput;
 
+// Utilities to upsample tranmslucency to full resolution
+#include "../SeparateTranslucency.ush"
+float2 SeparateTranslucencyTextureLowResExtentInverse;
 
 //------------------------------------------------------- INTERMEDIARY STRUCTURES
 
@@ -185,8 +190,8 @@ struct FRecombineInputParameters
 	// Buffer size and inv size for the DOF inputs.
 	float4 DOFBufferSize;
 
-	// Base for sobol random sequence.
-	uint2 SobolRandomBase;
+	// Random seeds
+	uint2 Seed0;
 };
 
 
@@ -207,11 +212,6 @@ float NoizNorm(float2 N, float X)
 float2 RotVec(float Radius, float Radians)
 {
 	return Radius * float2(cos(Radians), sin(Radians));
-}
-
-float DepthToHalfResCocRadius(float WorldDepth)
-{
-	return DepthToHalfResCocRadius(CocModelParameters, DepthBlurParameters, WorldDepth);
 }
 
 void AmendAdditiveColorWithMaxTranslucency(inout float4 Color, inout float Translucency, float MaxTranslucency)
@@ -562,7 +562,7 @@ void FetchAndAccumulateSamplePair(
 	float SampleDistance = FullResPixelDistanceToCocDistance(length(PixelOffset));
 
 	// Scene buffer offset.
-	float2 SceneBufferUVOffset = PixelOffset * View.BufferSizeAndInvSize.zw;
+	float2 SceneBufferUVOffset = PixelOffset * View.BufferSizeAndInvSize.zw * float2(CocInvSqueeze, 1.0);
 	
 	// Two sample to gather at same time.
 	FGatherSample Sample[2];
@@ -578,7 +578,7 @@ void FetchAndAccumulateSamplePair(
 		{
 			const float InvLutSize = rcp(float(BOKEH_LUT_SIZE));
 
-			float2 LookupUV = (0.5 + 0.5 * InvLutSize) + PixelOffset * (SampleSign * InvLutSize);
+			float2 LookupUV = (0.5 + 0.5 * InvLutSize) + PixelOffset * (SampleSign * InvLutSize) * float2(CocInvSqueeze, 1.0);
 			float4 LookupSample = BokehLUT.SampleLevel(GlobalPointClampedSampler, LookupUV, 0);
 			SampleDistance = LookupSample.x;
 		}
@@ -597,7 +597,7 @@ void FetchAndAccumulateSamplePair(
 			Sample[k].CocRadius = Sample[k].Color.a;
 		#else
 			Sample[k].Color = SceneColorInput.SampleLevel(GlobalPointClampedSampler, BufferUV, 0);
-			Sample[k].CocRadius = DepthToHalfResCocRadius(SampleWorldDepth(BufferUV));
+			Sample[k].CocRadius = SceneDepthToCocRadius(SampleWorldDepth(BufferUV));
 		#endif
 		
 		// Convert scene color alpha from translucency to opacity.
@@ -645,11 +645,10 @@ void GatherToAccumulator(
 #else
 {
 	// Samples at full resolution.
-	UNROLL
+	LOOP
 	for(uint SamplePairId = 0; SamplePairId < GatherParameters.SamplePairCount; SamplePairId++)
 	{
-		//float2 E = SobolIndex(InputParameters.SobolRandomBase, SamplePairId << 3, 4 + 3) / 0x10000;
-		float2 E = SobolIndex(InputParameters.SobolRandomBase, SamplePairId << 3, 4 + 3) * rcp(float(0x10000));
+		float2 E = Hammersley16(SamplePairId, CONFIG_GATHER_PAIR_COUNT, InputParameters.Seed0);
 		float2 DiskRandom = UniformSampleDiskConcentricApprox(E);
 	
 		float2 PixelOffset = GatherParameters.KernelPixelRadius * DiskRandom;
@@ -690,6 +689,8 @@ void RecombineMainCS(
 	uint2 GroupThreadId : SV_GroupThreadID,
 	uint GroupThreadIndex : SV_GroupIndex) 
 {
+	float4 Debug = 0;
+
 	// Setup input parameters.
 	FRecombineInputParameters InputParameters;
 	{
@@ -711,7 +712,7 @@ void RecombineMainCS(
 			InputParameters.DOFBufferUV = min(InputParameters.DOFBufferUV, DOFBufferUVMax);
 		}
 
-		InputParameters.SobolRandomBase = SobolIndex(SobolPixel(DispatchThreadId), View.StateFrameIndexMod8, /* Bits = */ 3);
+		InputParameters.Seed0 = Rand3DPCG16(int3(DispatchThreadId, View.StateFrameIndexMod8)).xy;
 	}
 
 	//Fetch foreground layer first to early return if ForegroundTranslucency == 0.0.
@@ -746,7 +747,7 @@ void RecombineMainCS(
 	#if CONFIG_FETCH_FULLRES_COC_FROM_ALPHA
 		CenterSample.CocRadius = CenterSample.Color.a;
 	#else
-		CenterSample.CocRadius = DepthToHalfResCocRadius(SampleWorldDepth(InputParameters.SceneBufferUV));
+		CenterSample.CocRadius = SceneDepthToCocRadius(SampleWorldDepth(InputParameters.SceneBufferUV));
 	#endif
 	
 	// Convert scene color alpha from translucency to opacity.
@@ -790,7 +791,7 @@ void RecombineMainCS(
 				#if CONFIG_FETCH_FULLRES_COC_FROM_ALPHA
 					float SampleCocRadius = SceneColorInput.SampleLevel(GlobalPointClampedSampler, SampleUV, 0).a;
 				#else
-					float SampleCocRadius = DepthToHalfResCocRadius(SampleWorldDepth(SampleUV));
+					float SampleCocRadius = SceneDepthToCocRadius(SampleWorldDepth(SampleUV));
 				#endif
 
 				float SampleAbsCocRadius = abs(SampleCocRadius);
@@ -854,7 +855,7 @@ void RecombineMainCS(
 			}
 			#elif NEIGHBORHOOD_ANALISIS_METHOD == NEIGHBORHOOD_ANALISIS_WAVE
 			{
-				TileMaxConsideredAbsCocRadius = WaveAllMax(MaxConsideredAbsCocRadius);
+				TileMaxConsideredAbsCocRadius = WaveActiveMax(MaxConsideredAbsCocRadius);
 			}
 			#else
 				#error Unknown neighborhood analisis method to use.
@@ -872,14 +873,20 @@ void RecombineMainCS(
 
 		// Set up gathering parameters.
 		{
+			float FullResKernelRadius = CocDistanceToFullResPixelDistance(TileMaxConsideredAbsCocRadius);
+
 			// Set the size of the kernel to exactly the max convolution that needs to be done.
-			GatherParameters.KernelPixelRadius = ceil(CocDistanceToFullResPixelDistance(TileMaxConsideredAbsCocRadius));
+			GatherParameters.KernelPixelRadius = ceil(FullResKernelRadius);
 
 			// Increase the size of the kernel radius to avoid the gather Point sampler to create Coc step artifacts.
 			GatherParameters.KernelPixelRadius += 0.5;
 
+			float KenelArea = Pow2(FullResKernelRadius) * PI;
+
+			float RecommendedPairCount = KenelArea * 0.5;
+
 			// Number of pair of sample.
-			GatherParameters.SamplePairCount = CONFIG_GATHER_PAIR_COUNT;
+			GatherParameters.SamplePairCount = min(uint(CONFIG_GATHER_PAIR_COUNT), uint(RecommendedPairCount));
 		}
 	}
 	#endif // CONFIG_SLIGHT_FOCUS_METHOD != SLIGHT_FOCUS_METHOD_DISABLED
@@ -998,20 +1005,24 @@ void RecombineMainCS(
 		GatherForegroundAdditiveColor *= SafeRcp(1 - GatherForegroundTranslucency);
 		GatherForegroundTranslucency = 0;
 	}
-	else if (CONFIG_COMPOSITING_METHOD == COMPOSITING_METHOD_BILINEAR_BKG)
+	else
 	{
-		BackgroundColor = BackgroundConvolution_SceneColor.SampleLevel(GlobalBilinearClampedSampler, InputParameters.DOFBufferUV, 0);
+		#if CONFIG_COMPOSITING_METHOD == COMPOSITING_METHOD_BILINEAR_BKG
+		{
+			BackgroundColor = BackgroundConvolution_SceneColor.SampleLevel(GlobalBilinearClampedSampler, InputParameters.DOFBufferUV, 0);
 
-		#if CONFIG_DOF_ALPHA
-			BackgroundValidity = BackgroundConvolution_SeparateAlpha.SampleLevel(GlobalBilinearClampedSampler, InputParameters.DOFBufferUV, 0).r;
-		#else
-			//Background = float4(0, 0, 0, 1);
-			BackgroundValidity = BackgroundColor.a;
+			#if CONFIG_DOF_ALPHA
+				BackgroundValidity = BackgroundConvolution_SeparateAlpha.SampleLevel(GlobalBilinearClampedSampler, InputParameters.DOFBufferUV, 0).r;
+			#else
+				//Background = float4(0, 0, 0, 1);
+				BackgroundValidity = BackgroundColor.a;
+			#endif
+	
+			// Make sure the background color is always normalized, or unrendered.
+			BackgroundColor *= SafeRcp(BackgroundValidity);
+		}
 		#endif
-	
-		// Make sure the background color is always normalized, or unrendered.
-		BackgroundColor *= SafeRcp(BackgroundValidity);
-	
+
 		// Hole fill the background in output final scene color before composing foreground on top.
 		#if CONFIG_HOLE_FILLING_METHOD == HOLE_FILLING_METHOD_SEPARATE_GATHER
 		{
@@ -1075,13 +1086,48 @@ void RecombineMainCS(
 	// Compose separate translucency.
 	if (1)
 	{
-		float2 SeparateTranslucencyBufferUV = clamp(InputParameters.SceneBufferUV, SeparateTranslucencyBilinearUVMinMax.xy, SeparateTranslucencyBilinearUVMinMax.zw);
+		NearestDepthNeighborUpsamplingResult UpsampleResult;
+		if (SeparateTranslucencyUpscaling == 0)
+		{
+			UpsampleResult.bUsePointSampler = true;
+			UpsampleResult.UV = InputParameters.SceneBufferUV;
+		}
+		else
+		{
+			float2 PixelPos = (View.ViewRectMin.xy + DispatchThreadId) + 0.5;
+			UpsampleResult = NearestDepthNeighborUpsampling(
+				LowResDepthTexture,
+				FullResDepthTexture,
+				PixelPos,
+				InputParameters.SceneBufferUV,
+				SeparateTranslucencyTextureLowResExtentInverse);
+		}
+		
+		UpsampleResult.UV = clamp(UpsampleResult.UV, SeparateTranslucencyBilinearUVMinMax.xy, SeparateTranslucencyBilinearUVMinMax.zw);
 
-		float4 SeparateTranslucencyColor = SceneSeparateTranslucency.SampleLevel(SceneSeparateTranslucencySampler, SeparateTranslucencyBufferUV, 0);
-		float SeparateTranslucency = SeparateTranslucencyColor.a;
-		SeparateTranslucencyColor.a = 1 - SeparateTranslucencyColor.a;
+		float4 SeparateTranslucencyColor = 0;
+		float4 SeparateTranslucencyModulateColor = 0;
+		if (UpsampleResult.bUsePointSampler)
+		{
+			SeparateTranslucencyColor = SceneSeparateTranslucency.SampleLevel(GlobalPointClampedSampler, UpsampleResult.UV, 0);
+			SeparateTranslucencyModulateColor = SceneSeparateTranslucencyModulateColor.SampleLevel(GlobalPointClampedSampler, UpsampleResult.UV, 0);
+		}
+		else
+		{
+			SeparateTranslucencyColor = SceneSeparateTranslucency.SampleLevel(GlobalBilinearClampedSampler, UpsampleResult.UV, 0);
+			SeparateTranslucencyModulateColor = SceneSeparateTranslucencyModulateColor.SampleLevel(GlobalBilinearClampedSampler, UpsampleResult.UV, 0);
+		}
+		float SeparateTranslucencyBackgroundVisibility = SeparateTranslucencyColor.a;
+		float GreyScaleModulateColorBackgroundVisibility = dot(SeparateTranslucencyModulateColor.rgb, float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f));
 
-		OutputFinalSceneColor = OutputFinalSceneColor * SeparateTranslucency + SeparateTranslucencyColor;
+		// This matches what is done in ComposeSeparateTranslucency.usf
+		OutputFinalSceneColor.rgb = OutputFinalSceneColor.rgb * SeparateTranslucencyBackgroundVisibility * SeparateTranslucencyModulateColor.rgb + SeparateTranslucencyColor.rgb;
+		// Also stores BackgroundVisibility (=transmittance) in alpha
+		float FinalSceneVisibility = 1.0 - OutputFinalSceneColor.a;
+		OutputFinalSceneColor.a = FinalSceneVisibility * SeparateTranslucencyBackgroundVisibility * GreyScaleModulateColorBackgroundVisibility;
+
+		// Convert from visibility to coverage to comply with the following process
+		OutputFinalSceneColor.a = 1.0f - OutputFinalSceneColor.a;
 	}
 
 	// Convert alpha channel from opacity back to translucency.
@@ -1095,72 +1141,37 @@ void RecombineMainCS(
 	}
 	
 	// Debug optimisation colors.
-	#if DEBUG_FAST_PATHS
+	#if 0
 	{
 		float3 DebugColor;
 
 		if (bGatherFullRes)
 		{
 			// RED: Full res gather.
-			DebugColor = float3(1.0, 0.25, 0.25);
+			Debug = float4(1.0, 0.0, 0.0, 0.0);
 		}
 		else if (bCanReturnForegroundOnly)
 		{
 			// GREEN: Foreground is the cheapest.
-			DebugColor = float3(0.25, 1.0, 0.25);
+			Debug = float4(0.0, 1.0, 0.0, 0.0);
 		}
 		else
 		{
 			// BLUE: Fetch foreground and background.
-			DebugColor = float3(0.25, 0.25, 1.0);
+			Debug = float4(0.0, 0.0, 1.0, 0.0);
 		}
-
-		OutputFinalSceneColor.rgb *= DebugColor;
-		//if (View.GeneralPurposeTweak > 0.5)
-		//	OutputFinalSceneColor.rgb = DebugColor;
 	}
-	#endif
-	
-	#if CONFIG_SLIGHT_FOCUS_METHOD != SLIGHT_FOCUS_METHOD_DISABLED && 0
+	#elif 0
 	{
-		OutputFinalSceneColor = GatherParameters.KernelPixelRadius;
+		if (bGatherFullRes)
+		{
+			Debug = float4(1.0, 0.0, 0.0, 0.0);
+		}
+		else
+		{
+			Debug = float4(0.0, 1.0, 0.0, 0.0);
+		}
 	}
-	#elif 0 // DEBUG
-	//if (View.GeneralPurposeTweak > 0.5)
-	//{
-	//	//OutputFinalSceneColor = ForegroundColor;
-	//	//OutputFinalSceneColor = HoleFillingAdditiveColor;
-	//	//OutputFinalSceneColor = BackgroundColor.a;
-	//	//OutputFinalSceneColor = SlightOutOfFocusConvolution_SceneColor.SampleLevel(GlobalPointClampedSampler, InputParameters.DOFBufferUV, 0).a;
-	//	//OutputFinalSceneColor = GatherBackgroundUnpremultipliedColor;
-	//	//OutputFinalSceneColor.a = GatherBackgroundTranslucency;
-	//}
-	#elif 0 // DEBUG
-	//if (View.GeneralPurposeTweak > 0.5)
-	//{
-	//	OutputFinalSceneColor = GatherBackgroundAdditiveColor;
-	//	if (View.GeneralPurposeTweak > 1.5)
-	//		OutputFinalSceneColor = GatherBackgroundTranslucency;
-	//	if (View.GeneralPurposeTweak > 2.5)
-	//		OutputFinalSceneColor = BackgroundColor;
-	//	if (View.GeneralPurposeTweak > 3.5)
-	//		OutputFinalSceneColor = ForegroundColor;
-	//	if (View.GeneralPurposeTweak > 4.5)
-	//		OutputFinalSceneColor = GatherForegroundTranslucency;
-	//	
-	//	//OutputFinalSceneColor = GatherForegroundTranslucency;
-	//	//OutputFinalSceneColor = BackgroundConvolution_SceneColor.SampleLevel(GlobalBilinearClampedSampler, InputParameters.DOFBufferUV, 0);
-	//
-	//
-	//	//if (View.GeneralPurposeTweak > 3.5)
-	//	//	OutputFinalSceneColor = PostprocessInput3.SampleLevel(GlobalBilinearClampedSampler, InputParameters.DOFBufferUV, 0);
-	//	//if (View.GeneralPurposeTweak > 4.5)
-	//	//	OutputFinalSceneColor = PostprocessInput3.SampleLevel(GlobalBilinearClampedSampler, InputParameters.DOFBufferUV, 0).a;
-	//
-	//	//OutputFinalSceneColor = BackgroundColor;
-	//	//OutputFinalSceneColor = PostprocessInput3.SampleLevel(GlobalPointClampedSampler, InputParameters.DOFBufferUV, 0);
-	//	//OutputFinalSceneColor = ForegroundHoleFillingConvolution_SceneColor.SampleLevel(GlobalPointClampedSampler, InputParameters.DOFBufferUV, 0);
-	//}
 	#endif
 	
 	#if 1 // Lower VGPR footprint.
@@ -1173,5 +1184,12 @@ void RecombineMainCS(
 		SceneColorOutput[OutputPixelPosition] = OutputFinalSceneColor;
 	#else
 		SceneColorOutput[OutputPixelPosition] = float4(OutputFinalSceneColor.rgb, 0);
+	#endif
+		
+
+	#if DEBUG_OUTPUT
+	{
+		DebugOutput[OutputPixelPosition] = Debug;
+	}
 	#endif
 }

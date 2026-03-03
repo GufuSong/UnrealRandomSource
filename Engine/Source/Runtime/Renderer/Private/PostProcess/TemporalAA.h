@@ -3,8 +3,28 @@
 #pragma once
 
 #include "ScreenPass.h"
+#include "PostProcess/PostProcessMotionBlur.h"
 
 struct FTemporalAAHistory;
+struct FTranslucencyPassResources;
+
+
+/** Configuration of the main temporal AA pass. */
+enum class EMainTAAPassConfig : uint8
+{
+	// TAA is disabled.
+	Disabled,
+
+	// Uses old UE4's Temporal AA maintained for Gen4 consoles
+	TAA,
+
+	// Uses Temporal Super Resolution
+	TSR,
+
+	// Uses third party View.Family->GetTemporalUpscalerInterface()
+	ThirdParty,
+};
+
 
 /** List of TAA configurations. */
 enum class ETAAPassConfig
@@ -23,11 +43,12 @@ enum class ETAAPassConfig
 	// Permutation for DOF that handle Coc.
 	DiaphragmDOF,
 	DiaphragmDOFUpsampling,
+	
+	// Permutation for hair.
+	Hair,
 
 	MAX
 };
-
-bool IsTemporalAASceneDownsampleAllowed(const FViewInfo& View);
 
 static FORCEINLINE bool IsTAAUpsamplingConfig(ETAAPassConfig Pass)
 {
@@ -58,6 +79,14 @@ struct FTAAOutputs
 	FRDGTexture* DownsampledSceneColor = nullptr;
 };
 
+/** Quality of TAA. */
+enum class ETAAQuality : uint8
+{
+	Low,
+	Medium,
+	High,
+	MAX
+};
 
 /** Configuration of TAA. */
 struct FTAAPassParameters
@@ -66,7 +95,7 @@ struct FTAAPassParameters
 	ETAAPassConfig Pass = ETAAPassConfig::Main;
 
 	// Whether to use the faster shader permutation.
-	bool bUseFast = false;
+	ETAAQuality Quality = ETAAQuality::High;
 
 	// Whether output texture should be render targetable.
 	bool bOutputRenderTargetable = false;
@@ -143,19 +172,33 @@ extern RENDERER_API FTAAOutputs AddTemporalAAPass(
 	const FTemporalAAHistory& InputHistory,
 	FTemporalAAHistory* OutputHistory);
 
+extern RENDERER_API FScreenPassTexture AddTSRComputeMoireLuma(FRDGBuilder& GraphBuilder, FGlobalShaderMap* ShaderMap, FScreenPassTexture SceneColor);
+
 /** Interface for the main temporal upscaling algorithm. */
-class RENDERER_API ITemporalUpscaler
+class RENDERER_API ITemporalUpscaler : public ISceneViewFamilyExtention
 {
 public:
 
 	struct FPassInputs
 	{
-		bool bAllowDownsampleSceneColor;
+		bool bGenerateSceneColorHalfRes = false;
+		bool bGenerateSceneColorQuarterRes = false;
+		bool bGenerateOutputMip1 = false;
+		bool bGenerateVelocityFlattenTextures = false;
 		EPixelFormat DownsampleOverrideFormat;
-		FRDGTextureRef SceneColorTexture;
-		FRDGTextureRef SceneDepthTexture;
-		FRDGTextureRef SceneVelocityTexture;
-		FRDGTextureRef EyeAdaptationTexture;
+		FRDGTextureRef SceneColorTexture = nullptr;
+		FRDGTextureRef SceneDepthTexture = nullptr;
+		FRDGTextureRef SceneVelocityTexture = nullptr;
+		FTranslucencyPassResources PostDOFTranslucencyResources;
+		FScreenPassTexture MoireInputTexture;
+	};
+
+	struct FOutputs
+	{
+		FScreenPassTexture FullRes;
+		FScreenPassTexture HalfRes;
+		FScreenPassTexture QuarterRes;
+		FVelocityFlattenTextures VelocityFlattenTextures;
 	};
 
 	virtual ~ITemporalUpscaler() {};
@@ -167,22 +210,18 @@ public:
 	// *  scene color (or null if it was not performed), and the secondary view rect.
 	// */
 
-	virtual void AddPasses(
+	virtual FOutputs AddPasses(
 		FRDGBuilder& GraphBuilder,
 		const FViewInfo& View,
-		const FPassInputs& PassInputs,
-		FRDGTextureRef* OutSceneColorTexture,
-		FIntRect* OutSceneColorViewRect,
-		FRDGTextureRef* OutSceneColorHalfResTexture,
-		FIntRect* OutSceneColorHalfResViewRect) const = 0;
+		const FPassInputs& PassInputs) const = 0;
 
 
 	virtual float GetMinUpsampleResolutionFraction() const = 0;
 	virtual float GetMaxUpsampleResolutionFraction() const = 0;
 
+	virtual ITemporalUpscaler* Fork_GameThread(const class FSceneViewFamily& ViewFamily) const = 0;
+
 	static const ITemporalUpscaler* GetDefaultTemporalUpscaler();
-	static int GetTemporalUpscalerMode();
+
+	static EMainTAAPassConfig GetMainTAAPassConfig(const FViewInfo& View);
 }; 
-
-extern RENDERER_API const ITemporalUpscaler* GTemporalUpscaler;
-

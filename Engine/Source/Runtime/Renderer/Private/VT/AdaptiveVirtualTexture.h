@@ -13,7 +13,7 @@ class FVirtualTextureSystem;
 
 /**
  * Concrete implementation of an adaptive virtual texture.
- * This allocates multiple virtual textures within the same space: one each for a grid of UV ranges, and an additional persistent one for the low mips.
+ * This allocates multiple virtual textures within the same space: one each for a grid of UV ranges, and an additional persistent one for the low resolution mips.
  * We then use an additional page table indirection texture in the shader to select the correct page table address range for our sampled UV.
  * We use the virtual texture feedback to decide when to increase or decrease the resolution of each UV range.
  * When we change resolution for a range we directly remap the page table entires. This removes the cost and any visual glitch from regenerating the pages.
@@ -30,7 +30,7 @@ public:
 	uint32 GetPackedAllocationRequest(uint32 vAddress, uint32 vLevelPlusOne, uint32 Frame) const;
 	/** Queue a batch of allocation requests. These will be used to reallocate any virtual textures during the next call to UpdateAllocations(). */
 	void QueuePackedAllocationRequests(uint32 const* InRequests, uint32 InNumRequests, uint32 InFrame);
-	/** Quee a batch of allocation requests. This static function relays the global requests to the individual object queues. */
+	/** Queue a batch of allocation requests. This static function relays the global requests to the individual object queues. */
 	static void QueuePackedAllocationRequests(FVirtualTextureSystem* InSystem, uint32 const* InRequests, uint32 InNumRequests, uint32 InFrame);
 	/** Update any allocations based on recent requests. */
 	void UpdateAllocations(FVirtualTextureSystem* InSystem, FRHICommandListImmediate& RHICmdList, uint32 InFrame);
@@ -39,6 +39,16 @@ public:
 	virtual IAllocatedVirtualTexture* GetAllocatedVirtualTexture() override;
 	virtual int32 GetSpaceID() const override;
 	//~ End IAdaptiveVirtualTexture Interface.
+
+	/** Information needed by GetProducers() for all producers for the internally allocated virtual textures. */
+	struct FProducerInfo
+	{
+		FVirtualTextureProducerHandle ProducerHandle;
+		FIntRect RemappedTextureRegion;
+		uint32 RemappedMaxLevel;
+	};
+	/** Get internal producers that touch the texture region. */
+	void GetProducers(FIntRect const& InTextureRegion, uint32 InMaxLevel, TArray<FProducerInfo>& OutProducerInfos);
 
 protected:
 	//~ Begin IAdaptiveVirtualTexture Interface.
@@ -61,7 +71,7 @@ private:
 	bool FreeLRU(FVirtualTextureSystem* InSystem, uint32 InFrame, uint32 InFrameUnusedThreshold);
 
 private:
-	/** Adaptive virtual texture descrition. */
+	/** Adaptive virtual texture description. */
 	FAdaptiveVTDescription AdaptiveDesc;
 	/** Allocated virtual texture description for the full virtual texture. Used internally to generate descriptions for the sub allocations. */
 	FAllocatedVTDescription AllocatedDesc;
@@ -97,6 +107,8 @@ private:
 	FHashTable GridIndexMap;
 	/** Map from AllocatedVT pointer to allocation slot index. */
 	FHashTable AllocatedVTMap;
+	/** Indices to AllocationSlots array for newly allocated virtual textures that are pending their root page before we can use them. */
+	TArray<int32> SlotsPendingRootPageMap;
 	/** Binary heap to track least recently used entries in AllocationSlots array. Used to decide what slots to evict next. */
 	FBinaryHeap<uint32, uint32> LRUHeap;
 

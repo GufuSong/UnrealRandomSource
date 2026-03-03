@@ -1,0 +1,12 @@
+{
+  "ExpandedNodes": [
+    "",
+    "\\Source",
+    "\\Source\\Runtime",
+    "\\Source\\Runtime\\RHI",
+    "\\Source\\Runtime\\RHI\\Private",
+    "\\Source\\Runtime\\RHI\\Public"
+  ],
+  "SelectedNode": "\\Source\\Runtime\\RHI\\Public\\DynamicRHI.h",
+  "PreviewInSolutionExplorer": false
+}

@@ -1,55 +1,78 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
-#include "HairStrandsVoxelPageCommonStruct.ush"
 #include "../Common.ush"
 #include "../Matrices.ush"
 #include "HairStrandsVoxelPageCommon.ush"
 #include "HairStrandsAABBCommon.ush"
+#include "HairStrandsVisibilityCommon.ush"
 
-#if SHADER_ALLOCATEPAGEINDEX
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
-float				PageWorldSize;
+#if SHADER_ALLOCATEPAGEINDEX 
+
+float				CPUPageWorldSize;
+float				CPUVoxelWorldSize;
+uint				bUseCPUVoxelWorldSize;	// When adaptive voxel size is disabled, we use CPU voxel size value
 uint				TotalPageIndexCount; 	// This is the max page index count;
 uint				PageResolution; 		// Resolution of a page
 uint				MacroGroupCount;
 uint				IndirectDispatchGroupSize;
+uint				bDoesMacroGroupSupportVoxelization;
 
 // For testing parity with CPU version
-float3				CPU_MinAABB;
-float3				CPU_MaxAABB;
+float3				CPU_TranslatedWorldMinAABB;
+float3				CPU_TranslatedWorldMaxAABB;
 int3				CPU_PageIndexResolution;
 uint				CPU_bUseCPUData;
 
-RWBuffer<int>								MacroGroupAABBBuffer;
+Buffer<float>								GPUVoxelWorldSize;
+Buffer<float>								MacroGroupVoxelSizeBuffer;
+Buffer<int>									MacroGroupAABBBuffer;
+RWBuffer<int>								MacroGroupVoxelAlignedAABBBuffer;
 RWBuffer<uint4>								OutPageIndexResolutionAndOffsetBuffer;
 RWBuffer<uint>								OutPageIndexAllocationIndirectBufferArgs;
 RWStructuredBuffer<FVoxelizationViewInfo>	OutVoxelizationViewInfoBuffer;
 
-#define MAX_INSTANCE_GROUP_COUNT 32
-groupshared uint PageIndexOffsets[MAX_INSTANCE_GROUP_COUNT];
+#ifndef MAX_HAIR_MACROGROUP_COUNT
+#error MAX_HAIR_MACROGROUP_COUNT needs to be defined
+#endif
+
+#define INVALID_OFFSET 0xFFFFFFFF
+
+groupshared uint PageIndexOffsets[MAX_HAIR_MACROGROUP_COUNT];
 
 // This code assume we have less than 32 macro group (which fit into a single CU/SM)
-[numthreads(MAX_INSTANCE_GROUP_COUNT, 1, 1)]
+[numthreads(MAX_HAIR_MACROGROUP_COUNT, 1, 1)]
 void AllocatePageIndex(uint2 DispatchThreadId : SV_DispatchThreadID)
 {
 	const uint MacroGroupId = DispatchThreadId.x;
 
 	FHairAABB Bound = InitHairAABB();
-	const bool bIsValid = MacroGroupId < MacroGroupCount;
+	float PageWorldSize = CPUPageWorldSize;
+	bool bIsValid = MacroGroupId < MacroGroupCount;
 	if (bIsValid)
 	{
+		const bool bSupportVoxelization = (bDoesMacroGroupSupportVoxelization >> MacroGroupId) & 0x1;
 		Bound = ReadHairAABB(MacroGroupId, MacroGroupAABBBuffer);
-		if (any(Bound.Min > Bound.Max))
+		const float VoxelWorldSize = bUseCPUVoxelWorldSize ? CPUVoxelWorldSize : max(GPUVoxelWorldSize[0], MacroGroupVoxelSizeBuffer[MacroGroupId]);
+		PageWorldSize = VoxelWorldSize * PageResolution;
+
+		if (any(Bound.Min > Bound.Max) || !bSupportVoxelization)
 		{
 			Bound.Min = 0;
 			Bound.Max = 0;
+			bIsValid = false;
 		}
 	}
 
 	// Page index allocation
 	int3 PageIndexResolution = 0;
 	{
-		// Snap the max AABB to the voxel size
+		// Snap the max AABB to the voxel size.
+		
+		// The contents of MacroGroupAABBBuffer (tight fitting AABBs) and MacroGroupVoxelAlignedAABBBuffer diverge here
+		// because the macro group AABBs for voxelization need to be snapped to the voxel page boundary.
+		
 		// Allocate enough pages to cover the AABB, where page (0,0,0) origin sit on MinAABB.
 		float3 MacroGroupSize = 0;
 		if (bIsValid)
@@ -67,21 +90,41 @@ void AllocatePageIndex(uint2 DispatchThreadId : SV_DispatchThreadID)
 		// Postfix sum to instance group are always ordered by index
 		if (DispatchThreadId.x == 0)
 		{
+			bool bValidAllocation = true;
 			uint PageIndexOffset = 0;
 			for (uint LocalMacroGroupId = 0; LocalMacroGroupId < MacroGroupCount; ++LocalMacroGroupId)
 			{
 				const uint PageCount = PageIndexOffsets[LocalMacroGroupId];
-				PageIndexOffsets[LocalMacroGroupId] = PageIndexOffset;
+				bValidAllocation = bValidAllocation && (PageIndexOffset + PageCount <= TotalPageIndexCount);
+				PageIndexOffsets[LocalMacroGroupId] = bValidAllocation ? PageIndexOffset : INVALID_OFFSET;
 				PageIndexOffset += PageCount;
 			}
 		}
 		GroupMemoryBarrierWithGroupSync();
 
+		const uint PageIndexOffset = PageIndexOffsets[MacroGroupId];
+		bIsValid = bIsValid && (PageIndexOffset != INVALID_OFFSET);
 		if (bIsValid)
 		{
-			const uint PageIndexOffset = PageIndexOffsets[MacroGroupId];
 			OutPageIndexResolutionAndOffsetBuffer[MacroGroupId] = uint4(PageIndexResolution, PageIndexOffset);
-			WriteHairAABB(MacroGroupId, Bound, MacroGroupAABBBuffer);
+			WriteHairAABB(MacroGroupId, Bound, MacroGroupVoxelAlignedAABBBuffer);
+		}
+		else
+		{
+			// Clear all output if the allocation is not valid
+			const uint ArgsOffset = MacroGroupId * 3;
+			OutPageIndexResolutionAndOffsetBuffer[MacroGroupId]    = uint4(0, 0, 0, 0);
+			OutPageIndexAllocationIndirectBufferArgs[ArgsOffset]   = 0;
+			OutPageIndexAllocationIndirectBufferArgs[ArgsOffset+1] = 1;
+			OutPageIndexAllocationIndirectBufferArgs[ArgsOffset+2] = 1;
+
+			FVoxelizationViewInfo ViewInfo;
+			ViewInfo.TranslatedWorldToClip = 0;
+			ViewInfo.ViewForward = 0;
+			ViewInfo.RasterResolution = 0;
+			ViewInfo.Pad0 = 0;
+			ViewInfo.Pad1 = 0;
+			OutVoxelizationViewInfoBuffer[MacroGroupId] = ViewInfo;
 		}
 	}
 
@@ -94,10 +137,10 @@ void AllocatePageIndex(uint2 DispatchThreadId : SV_DispatchThreadID)
 	// This code path is only for debug purpose and work only when there is a single instance group
 	if (CPU_bUseCPUData > 0)
 	{
-		Bound.Min = CPU_MinAABB;
-		Bound.Max = CPU_MaxAABB;
+		Bound.Min = CPU_TranslatedWorldMinAABB;
+		Bound.Max = CPU_TranslatedWorldMaxAABB;
 		PageIndexResolution = CPU_PageIndexResolution;
-		WriteHairAABB(MacroGroupId, Bound, MacroGroupAABBBuffer);
+		WriteHairAABB(MacroGroupId, Bound, MacroGroupVoxelAlignedAABBBuffer);
 	}
 
 	// Prepare indirect buffer for doing the actual page index allocation and filling the page index
@@ -160,11 +203,11 @@ void AllocatePageIndex(uint2 DispatchThreadId : SV_DispatchThreadID)
 		const float3 RasterAABBSize = Bound.Max - Bound.Min;
 		const float3 RasterAABBCenter = (Bound.Max + Bound.Min) * 0.5f;
 
-		const float4x4 ProjMatrix  = ReversedZOrthoMatrix(0.5f * RasterProjectionSize.x, 0.5f * RasterProjectionSize.y, 1.0f / RasterProjectionSize.z, 0);
-		const float4x4 ViewMatrix  = LookAtMatrix(RasterAABBCenter - RasterDirection * RasterProjectionSize.z * 0.5f, RasterAABBCenter, RasterUp);
+		const float4x4 ProjMatrix = ReversedZOrthoMatrix(0.5f * RasterProjectionSize.x, 0.5f * RasterProjectionSize.y, 1.0f / RasterProjectionSize.z, 0);
+		const float4x4 TranslatedViewMatrix = LookAtMatrix(RasterAABBCenter - RasterDirection * RasterProjectionSize.z * 0.5f, RasterAABBCenter, RasterUp);
 
 		FVoxelizationViewInfo ViewInfo;
-		ViewInfo.WorldToClip = mul(ViewMatrix, ProjMatrix);
+		ViewInfo.TranslatedWorldToClip = mul(TranslatedViewMatrix, ProjMatrix);
 		ViewInfo.ViewForward = RasterDirection;
 		ViewInfo.RasterResolution = RasterResolution;
 		ViewInfo.Pad0 = 0;
@@ -173,6 +216,8 @@ void AllocatePageIndex(uint2 DispatchThreadId : SV_DispatchThreadID)
 	}
 }
 #endif
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 #if SHADER_MARKVALID_PREPARE || SHADER_MARKVALID_INDIRECTARG || SHADER_MARKVALID_SCATTER
 struct FScatterCoord
@@ -228,7 +273,9 @@ void UpdatePackScatterCoord(inout uint2 Out, uint PartIndex)
 #define SCATTER_GROUP_SIZE 32
 #define SCATTER_GROUP_LINE 4
 
-#endif
+#endif // SHADER_MARKVALID_PREPARE || SHADER_MARKVALID_INDIRECTARG || SHADER_MARKVALID_SCATTER
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 #if SHADER_MARKVALID_PREPARE
 uint			MaxClusterCount;
@@ -236,8 +283,9 @@ uint			MacroGroupId;
 uint			MaxScatterAllocationCount;
 uint			bForceDirectPageAllocation;
 
+Buffer<int>		GroupAABBsBuffer;
 Buffer<int>		ClusterAABBsBuffer;
-Buffer<int>		MacroGroupAABBBuffer;
+Buffer<int>		MacroGroupVoxelAlignedAABBBuffer;
 Buffer<uint4>	PageIndexResolutionAndOffsetBuffer;
 
 RWBuffer<uint>	OutValidPageIndexBuffer;
@@ -248,6 +296,7 @@ RWBuffer<uint2> OutDeferredScatterBuffer;
 // PageIndexBuffer      is sampled with linear coordinate computed from the 3d page coordinate. VALID NODE ARE NOT COMPACTED. It contains the LINEAR PAGE INDEX (to map to the 3d volume).
 // PageIndexCoordBuffer is sampled with linear coordinate for allocated nodes. VALID NODE ARE COMPACTED. It contains the 3d page coordinate and ClustedId. Only used for opaque voxel injection.
 
+#if PERMUTATION_USE_CLUSTER
 [numthreads(SCATTER_GROUP_SIZE, 1, 1)]
 void MarkValid_PrepareCS(uint2 DispatchThreadId : SV_DispatchThreadID)
 {
@@ -273,7 +322,7 @@ void MarkValid_PrepareCS(uint2 DispatchThreadId : SV_DispatchThreadID)
 		return;
 
 	const uint4 PageIndexResolutionAndOffset = PageIndexResolutionAndOffsetBuffer.Load(MacroGroupId);
-	FHairAABB MacroGroupBound				 = ReadHairAABB(MacroGroupId, MacroGroupAABBBuffer);
+	FHairAABB MacroGroupBound				 = ReadHairAABB(MacroGroupId, MacroGroupVoxelAlignedAABBBuffer);
 	const int3 PageIndexResolution			 = PageIndexResolutionAndOffset.xyz;
 	const uint PageIndexOffset				 = PageIndexResolutionAndOffset.w;
 
@@ -339,7 +388,45 @@ void MarkValid_PrepareCS(uint2 DispatchThreadId : SV_DispatchThreadID)
 		}
 	}
 }
-#endif
+#else // PERMUTATION_USE_CLUSTER
+[numthreads(8, 8, 8)]
+void MarkValid_PrepareCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint4 PageIndexResolutionAndOffset = PageIndexResolutionAndOffsetBuffer.Load(MacroGroupId);
+	const FHairAABB MacroGroupBound = ReadHairAABB(MacroGroupId, MacroGroupVoxelAlignedAABBBuffer);
+	const int3 PageIndexResolution = PageIndexResolutionAndOffset.xyz;
+	const uint PageIndexOffset = PageIndexResolutionAndOffset.w;
+
+	const uint3 Coord = DispatchThreadId;
+	if (any(Coord >= PageIndexResolution))
+		return;
+
+	const FHairAABB GroupBound = ReadHairAABB(0, GroupAABBsBuffer);
+	const uint3 MinCoord = PositionToCoord(GroupBound.Min, MacroGroupBound.Min, MacroGroupBound.Max, PageIndexResolution);
+	const uint3 MaxCoord = PositionToCoord(GroupBound.Max, MacroGroupBound.Min, MacroGroupBound.Max, PageIndexResolution);
+
+	if (any(!IsFinite(float3(MinCoord))))
+		return;
+
+	if (any(!IsFinite(float3(MaxCoord))))
+		return;
+
+	if (all(Coord >= MinCoord) && all(Coord <=MaxCoord))
+	{
+		const uint3 PageIndexCoord = uint3(Coord.x, Coord.y, Coord.z);
+		const uint LinearPageIndexCoord = CoordToIndex(PageIndexCoord, PageIndexResolution, PageIndexOffset);
+		InterlockedOr(OutValidPageIndexBuffer[LinearPageIndexCoord], 1u);
+	}
+
+	// Fake writting to insure RDG allocate buffers even there is only Group-based allocated elements (vs. cluster-based allocated elements)
+	if (Coord.x > 65000)
+	{
+		OutDeferredScatterCounter[0] = 0;
+		OutDeferredScatterBuffer[0] = uint2(0,0);
+	}
+}
+#endif // PERMUTATION_USE_CLUSTER
+#endif // SHADER_MARKVALID_PREPARE
 
 #if SHADER_MARKVALID_INDIRECTARG
 Buffer<uint> DeferredScatterCounter;
@@ -358,6 +445,8 @@ void MarkValid_BuildIndirectArgCS(uint2 DispatchThreadId : SV_DispatchThreadID)
 	OutIndirectArgsBuffer[2] = 1;
 }
 #endif
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 #if SHADER_MARKVALID_SCATTER
 Buffer<int>		IndirectBufferArgs;
@@ -394,16 +483,18 @@ void MarkValid_ScatterCS(uint2 DispatchThreadId : SV_DispatchThreadID)
 }
 #endif
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
 #if SHADER_MARKVALID
 uint			MaxClusterCount;
 int3			CPU_PageIndexResolution;
-float3			CPU_MinAABB;
+float3			CPU_TranslatedWorldMinAABB;
 uint			CPU_PageIndexOffset;
-float3			CPU_MaxAABB;
+float3			CPU_TranslatedWorldMaxAABB;
 uint			MacroGroupId;
 
 Buffer<int>		ClusterAABBsBuffer;
-Buffer<int>		MacroGroupAABBBuffer;
+Buffer<int>		MacroGroupVoxelAlignedAABBBuffer;
 Buffer<uint4>	PageIndexResolutionAndOffsetBuffer;
 RWBuffer<uint>	OutValidPageIndexBuffer;
 
@@ -437,12 +528,12 @@ void MarkValidCS(uint2 DispatchThreadId : SV_DispatchThreadID)
 #if PERMUTATION_GPU_DRIVEN == 1
 	const uint4 PageIndexResolutionAndOffset = PageIndexResolutionAndOffsetBuffer.Load(MacroGroupId);
 
-	MacroGroupBound = ReadHairAABB(MacroGroupId, MacroGroupAABBBuffer);
+	MacroGroupBound			= ReadHairAABB(MacroGroupId, MacroGroupVoxelAlignedAABBBuffer);
 	PageIndexResolution		= PageIndexResolutionAndOffset.xyz;
 	PageIndexOffset			= PageIndexResolutionAndOffset.w;
 #else
-	MacroGroupBound.Min		= CPU_MinAABB;
-	MacroGroupBound.Max		= CPU_MaxAABB;
+	MacroGroupBound.Min		= CPU_TranslatedWorldMinAABB;
+	MacroGroupBound.Max		= CPU_TranslatedWorldMaxAABB;
 	PageIndexResolution		= CPU_PageIndexResolution;
 	PageIndexOffset			= CPU_PageIndexOffset;
 #endif
@@ -466,6 +557,8 @@ void MarkValidCS(uint2 DispatchThreadId : SV_DispatchThreadID)
 	}
 }
 #endif
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 #if SHADER_ALLOCATE
 uint MacroGroupId;
@@ -531,13 +624,20 @@ void AllocateCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_Dis
 	if (bIsValid)
 	{
 		const uint PageIndex = GroupBase + Offset;
-		PageIndexBuffer[GridIndex] = PageIndex < PageCount ? PageIndex : INVALID_VOXEL_PAGE_INDEX;
-		PageToPageIndexBuffer[PageIndex] = GridIndex;
+		const bool bIsAllocationValid = PageIndex < PageCount;
+
+		PageIndexBuffer[GridIndex] = bIsAllocationValid ? PageIndex : INVALID_VOXEL_PAGE_INDEX;
+		if (bIsAllocationValid)
+		{
+			PageToPageIndexBuffer[PageIndex] = GridIndex;
+		}
+
 		// Output the coordinates of the allocated page for indirect dispatch usage
+		// If the allocated failed (run out of page), then we mark the IndexCoord with a invalid GroupID
 		const uint LinearIndex = DispatchThreadId.x;
 		const uint3 PageIndexCoord = IndexToCoord(LinearIndex, PageIndexResolution);
 		const uint IndexRelativeToMacroGroupIndexOffset = PageIndex - PageIndexGlobalCounter[1];
-		PageIndexCoordBuffer[PageIndexOffset + IndexRelativeToMacroGroupIndexOffset] = uint4(PageIndexCoord, MacroGroupId);
+		PageIndexCoordBuffer[PageIndexOffset + IndexRelativeToMacroGroupIndexOffset] = uint4(PageIndexCoord, bIsAllocationValid ? MacroGroupId : INVALID_MACRO_GROUP_ID);
 	}
 	// Mark page index as invalid
 	// Insure that even if write more (due to larger dispatch count that needed), we do not stomp other instance group page index
@@ -548,15 +648,21 @@ void AllocateCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_Dis
 }
 #endif
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
 #if SHADER_ADDDESC
 
-float3 CPU_MinAABB;
+float3 CPU_TranslatedWorldMinAABB;
 uint MacroGroupId;
-float3 CPU_MaxAABB;
+float3 CPU_TranslatedWorldMaxAABB;
 uint CPU_PageIndexOffset;
 int3 CPU_PageIndexResolution;
+float CPU_VoxelWorldSize;
+uint bUseCPUVoxelWorldSize; // When adaptive voxel size is disabled, we use CPU voxel size value
 
-Buffer<int> MacroGroupAABBBuffer;
+Buffer<float> GPU_VoxelWorldSize;
+Buffer<int> MacroGroupVoxelAlignedAABBBuffer;
+Buffer<float> MacroGroupVoxelSizeBuffer;
 Buffer<uint4> PageIndexResolutionAndOffsetBuffer;
 RWStructuredBuffer<FPackedVirtualVoxelNodeDesc> OutNodeDescBuffer;
 
@@ -567,17 +673,20 @@ void AddDescCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_Disp
 
 #if PERMUTATION_GPU_DRIVEN == 1
 	const uint4 PageIndexResolutionAndOffset = PageIndexResolutionAndOffsetBuffer.Load(MacroGroupId);
-	const FHairAABB Bound = ReadHairAABB(MacroGroupId, MacroGroupAABBBuffer);
+	const FHairAABB TranslatedWorldBound = ReadHairAABB(MacroGroupId, MacroGroupVoxelAlignedAABBBuffer);
+	const float VoxelWorldSize = MacroGroupVoxelSizeBuffer[MacroGroupId];
 
-	Node.MinAABB = Bound.Min;
-	Node.MaxAABB = Bound.Max;
+	Node.TranslatedWorldMinAABB = TranslatedWorldBound.Min;
+	Node.TranslatedWorldMaxAABB = TranslatedWorldBound.Max;
 	Node.PageIndexResolution = PageIndexResolutionAndOffset.xyz;
 	Node.PageIndexOffset = PageIndexResolutionAndOffset.w;
+	Node.VoxelWorldSize = bUseCPUVoxelWorldSize ? CPU_VoxelWorldSize : max(GPU_VoxelWorldSize[0], VoxelWorldSize);
 #else
-	Node.MinAABB = CPU_MinAABB;
-	Node.MaxAABB = CPU_MaxAABB;
+	Node.TranslatedWorldMinAABB = CPU_TranslatedWorldMinAABB;
+	Node.TranslatedWorldMaxAABB = CPU_TranslatedWorldMaxAABB;
 	Node.PageIndexResolution = CPU_PageIndexResolution;
 	Node.PageIndexOffset = CPU_PageIndexOffset;
+	Node.VoxelWorldSize = CPU_VoxelWorldSize;
 #endif
 
 	FPackedVirtualVoxelNodeDesc PackedNode = PackVoxelNode(Node);
@@ -585,6 +694,7 @@ void AddDescCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_Disp
 }
 #endif
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 #if SHADER_ADDINDIRECTBUFFER
 
@@ -594,6 +704,7 @@ uint IndirectGroupSize;
 
 RWBuffer<uint> OutPageIndexGlobalCounter;
 RWBuffer<uint> OutIndirectArgsBuffer;
+RWBuffer<uint> OutTotalRequestedPageAllocationBuffer; 
 
 [numthreads(1, 1, 1)]
 void AddIndirectBufferCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_DispatchThreadID)
@@ -614,10 +725,14 @@ void AddIndirectBufferCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId
 
 	// Copy current total to previous total
 	OutPageIndexGlobalCounter[1] = TotalAllocatedPageCount;
+
+	// The value will be written several times, but only the value written during the last macro group will give the final page count allocated/requested
+	OutTotalRequestedPageAllocationBuffer[0] = TotalAllocatedPageCount;
 }
 
 #endif
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define IND_CLEAR_GROUP_SIZE_Z 64
 
@@ -644,6 +759,7 @@ void VoxelIndPageClearBufferGenCS(uint GroupIndex : SV_GroupIndex, uint3 Dispatc
 
 #endif
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 #if SHADER_INDPAGECLEAR
 
@@ -678,3 +794,123 @@ void VoxelIndPageClearCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 Gro
 
 #endif
 
+#if SHADER_ADAPTIVE_FEEDBACK
+
+#define DEBUG_ENABLE 0
+
+#if DEBUG_ENABLE
+#include "../ShaderPrint.ush"
+#endif
+
+uint  CPUAllocatedPageCount;
+float CPUMinVoxelWorldSize;
+float AdaptiveCorrectionThreshold;
+float AdaptiveCorrectionSpeed;
+
+Buffer<uint> TotalRequestedPageAllocationBuffer;
+Buffer<float> CurrGPUMinVoxelWorldSize;
+RWBuffer<float> NextGPUMinVoxelWorldSize;
+
+float RoundHairVoxelSize(float In)
+{
+	// Round voxel size to 0.01f to avoid oscillation issue
+	return floor(In * 1000.f + 0.5f) * 0.001f;
+}
+
+[numthreads(1, 1, 1)]
+void FeedbackCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const float CurrVoxelWorldSize = RoundHairVoxelSize(CurrGPUMinVoxelWorldSize[0]);
+	
+	// Voxel pages are represent a volume. To derive a better estimate of the ratio by which voxel size needs to be scale, 
+	// compute the cubic root of this ratio.
+	//
+	// AllocatedPage   AllocatedRes^3
+	// ------------- = --------------  = VolumeRatio = LinearRatio^3
+	//    MaxPage          MaxRes^3
+
+	// Ratio used for predicting voxel size increase
+	const uint GPUAllocatedPageCount = TotalRequestedPageAllocationBuffer[0];
+	const float VolumeRatio = float(GPUAllocatedPageCount) / float(CPUAllocatedPageCount);
+	const float LinearRatio = pow(VolumeRatio, 1.f / 3.f);
+
+	// Ratio used for predicting voxel size decrease (i.e. when requested allocation fit, 
+	// but the voxel size does not match the (more precise) target).
+	// In this case, we add a threshold/margin to to the target, so that there is no oscillation.
+	const float VolumeRatio_Thres = float(GPUAllocatedPageCount) / float(CPUAllocatedPageCount * AdaptiveCorrectionThreshold);
+	const float LinearRatio_Thres = pow(VolumeRatio_Thres, 1.f / 3.f);
+
+	// If the page pool is not large enough increase voxel size
+	float NextVoxelWorldSize = CPUMinVoxelWorldSize;
+	if (GPUAllocatedPageCount > CPUAllocatedPageCount)
+	{
+		//NextVoxelWorldSize = CurrVoxelWorldSize * LinearRatio;
+		NextVoxelWorldSize = CurrVoxelWorldSize * LinearRatio_Thres;
+	}
+	// If the page pool is large enough but the voxel are larger than the requested size decrease voxel size
+	else if (GPUAllocatedPageCount < CPUAllocatedPageCount && CurrVoxelWorldSize > CPUMinVoxelWorldSize)
+	{
+		const float TargetVoxelWorldSize = CurrVoxelWorldSize * LinearRatio_Thres;
+		NextVoxelWorldSize = max(CPUMinVoxelWorldSize, lerp(CurrVoxelWorldSize, TargetVoxelWorldSize, AdaptiveCorrectionSpeed));
+	}
+	//else if (GPUAllocatedPageCount > CPUAllocatedPageCount * AdaptiveCorrectionThreshold)
+	//{
+	//	const float TargetVoxelWorldSize = CurrVoxelWorldSize * LinearRatio_Thres;
+	//	NextVoxelWorldSize = max(CPUMinVoxelWorldSize, lerp(CurrVoxelWorldSize, TargetVoxelWorldSize, AdaptiveCorrectionSpeed));
+	//}
+	else
+	{
+		NextVoxelWorldSize = CPUMinVoxelWorldSize;
+	}
+
+	// Clamp voxel size into a reasonable amount (e.g. 0.1mm - 100mm)
+	const float ClampMinVoxelWorldSize = 0.01f;
+	const float ClampMaxVoxelWorldSize = 10.0f;
+	NextVoxelWorldSize = clamp(RoundHairVoxelSize(NextVoxelWorldSize), ClampMinVoxelWorldSize, ClampMaxVoxelWorldSize);
+
+	// Debug
+#if DEBUG_ENABLE
+	FFontColor CPUColor = FontEmerald;
+	FFontColor GPUColor = FontOrange;
+	FFontColor CstColor = FontSilver;
+
+	FShaderPrintContext Context = InitShaderPrintContext(true, uint2(700, 50));
+
+	Print(Context, TEXT(" ------------------------------- "), FontSilver); Newline(Context);
+	Print(Context, TEXT("|          Allocations          |"), FontSilver); Newline(Context);
+	Print(Context, TEXT(" ------------------------------- "), FontSilver); Newline(Context);
+
+	Print(Context, TEXT("GPU Allocated      "), GPUColor);
+	Print(Context, GPUAllocatedPageCount, GPUColor);
+	Newline(Context);
+
+	Print(Context, TEXT("CPU Allocated      "), CPUColor);
+	Print(Context, CPUAllocatedPageCount, CPUColor);
+	Newline(Context);
+
+	Print(Context, TEXT("GPU Curr Min. Size "), GPUColor);
+	Print(Context, CurrVoxelWorldSize, GPUColor);
+	Newline(Context);
+
+	Print(Context, TEXT("GPU Next Min. Size "), GPUColor);
+	Print(Context, NextVoxelWorldSize, GPUColor);
+	Newline(Context);
+
+	Print(Context, TEXT("CPU Min. Size      "), CPUColor);
+	Print(Context, CPUMinVoxelWorldSize, CPUColor);
+	Newline(Context);
+
+	Print(Context, TEXT("Correction Thres.  "), CstColor);
+	Print(Context, AdaptiveCorrectionThreshold, CstColor);
+	Newline(Context);
+
+	Print(Context, TEXT("Correction Speed   "), CstColor);
+	Print(Context, AdaptiveCorrectionSpeed, CstColor);
+	Newline(Context);
+#endif
+
+	// Update state data
+	NextGPUMinVoxelWorldSize[0] = RoundHairVoxelSize(NextVoxelWorldSize);
+}
+
+#endif // SHADER_ADAPTIVE_FEEDBACK

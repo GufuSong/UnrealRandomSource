@@ -4,17 +4,11 @@
 	#define DIM_DENOISER_OUTPUT 0
 #endif
 
-#include "../HairStrands/HairStrandsVoxelPageCommonStruct.ush"
 #include "../Common.ush"
 
 #define SUPPORT_CONTACT_SHADOWS		0
 #define USE_SOURCE_TEXTURE			1
-#define USE_SOURCE_TEXTURE_ARRAY	1
 
-#define LTCMatTexture				RaytracingLightsDataPacked.LTCMatTexture
-#define LTCMatSampler				GlobalBilinearClampedSampler
-#define LTCAmpTexture				RaytracingLightsDataPacked.LTCAmpTexture
-#define LTCAmpSampler				GlobalBilinearClampedSampler
 #define PreIntegratedGF				ReflectionStruct.PreIntegratedGF
 #define PreIntegratedGFSampler		GlobalBilinearClampedSampler
 
@@ -29,16 +23,11 @@
 #include "RayTracingCommon.ush"
 #include "RayTracingDeferredShadingCommon.ush"
 #include "RayTracingHitGroupCommon.ush"
-#include "RayTracingDirectionalLight.ush"
-#include "RayTracingRectLight.ush"
-#include "RayTracingSphereLight.ush"
-#include "RayTracingSpotLight.ush"
-#include "RayTracingPointLight.ush"
 
 #define	ERayTracingPrimaryRaysFlag_None                               0
 #define	ERayTracingPrimaryRaysFlag_UseGBufferForMaxDistance    (1u << 0)
-#define	ERayTracingPrimaryRaysFlag_ConsiderSurfaceScatter	   (1u << 1)
-#define	ERayTracingPrimaryRaysFlag_AllowSkipSkySample		   (1u << 2)
+#define	ERayTracingPrimaryRaysFlag_PrimaryView                 (1u << 1)
+#define	ERayTracingPrimaryRaysFlag_AllowSkipSkySample          (1u << 2)
 
 
 int SamplesPerPixel;
@@ -89,13 +78,12 @@ float3 GetSkyRadiance(float3 Direction, float Roughness)
 
 RAY_TRACING_ENTRY_RAYGEN(RayTracingPrimaryRaysRGS)
 {
+	// STRATA_TODO
+#if !STRATA_ENABLED
 	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
 	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
 	uint LinearIndex = PixelCoord.y * View.BufferSizeAndInvSize.x + PixelCoord.x; // TODO(Denoiser): PixelCoord or DispatchThreadId
 	
-	RandomSequence RandSequence;
-	RandomSequence_Initialize(RandSequence, LinearIndex, View.StateFrameIndex);
-
 	float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
 	float2 UV = (float2(PixelCoord) + 0.5) * InvBufferSize;
 
@@ -107,17 +95,19 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingPrimaryRaysRGS)
 #endif
 
 	float Depth = GBufferData.Depth;
-	float3 WorldPosition = ReconstructWorldPositionFromDepth(UV, Depth);
-	float WorldSpaceDistance = length(WorldPosition - View.WorldViewOrigin);
+	float3 TranslatedWorldPosition = ReconstructTranslatedWorldPositionFromDepth(UV, Depth);
 
-	// Trace rays from camera origin to (Gbuffer - epsilon) to only intersect translucent objects
-	RayDesc Ray = CreatePrimaryRay(UV);
+	// Trace rays from camera origin to Gbuffer (only translucent objects are considered on the first ray, so a bias is not needed)
+	FRayDesc Ray = CreatePrimaryRay(UV);
 	FRayCone RayCone = (FRayCone)0;
 	RayCone.SpreadAngle = View.EyeToPixelSpreadAngle;
 
 	if((ERayTracingPrimaryRaysFlag_UseGBufferForMaxDistance & PrimaryRayFlags) != 0) 
 	{
-		Ray.TMax = WorldSpaceDistance - 0.1;
+		// NOTE: we need a small epsilon even though we only trace RAY_TRACING_MASK_TRANSLUCENT objects at first
+		//       because we might have an object with a mix of materials on it and therefore still need to avoid
+		//       hitting the target surface if possible
+		Ray.TMax = dot(TranslatedWorldPosition - Ray.Origin, Ray.Direction) - 0.1; // assumes Ray.Direction is normalized
 	}
 
 	bool bAllowSkySampling;
@@ -133,7 +123,8 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingPrimaryRaysRGS)
 	// Check if the Sky Light should affect reflection rays within translucency.
 	const bool bSkyLightAffectReflection = ShouldSkyLightAffectReflection();
 	
-	bool bHasScattered = (ERayTracingPrimaryRaysFlag_ConsiderSurfaceScatter & PrimaryRayFlags) != 0;
+	const bool bPrimaryView = (ERayTracingPrimaryRaysFlag_PrimaryView & PrimaryRayFlags) != 0;
+	bool bHasScattered = bPrimaryView;
 	float AccumulatedOpacity = 0.0;
 
 	// Integrated data by path tracing
@@ -144,12 +135,16 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingPrimaryRaysRGS)
 
 	for (uint RefractionRayIndex = 0; RefractionRayIndex < MaxRefractionRays; ++RefractionRayIndex)
 	{
-		const uint RefractionRayFlags = 0;
-		const uint RefractionInstanceInclusionMask = RAY_TRACING_MASK_ALL;
+		const uint RefractionRayFlags = RefractionRayIndex == 0? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : 0;
+		const uint RefractionInstanceInclusionMask = (!bPrimaryView && RefractionRayIndex == 0) || !TranslucencyRefraction ? RAY_TRACING_MASK_TRANSLUCENT : RAY_TRACING_MASK_ALL;
 		const bool bRefractionRayTraceSkyLightContribution = false;
 		const bool bRefractionDecoupleSampleGeneration = true;
 		const bool bRefractionEnableSkyLightContribution = true;
 		float3 PathVertexRadiance = float3(0, 0, 0);
+
+		RandomSequence RandSequence;
+
+		RandomSequence_Initialize(RandSequence, PixelCoord, RefractionRayIndex, View.StateFrameIndex, MaxRefractionRays);
 
 		FMaterialClosestHitPayload Payload = TraceRayAndAccumulateResults(
 			Ray,
@@ -206,10 +201,9 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingPrimaryRaysRGS)
 		if (Payload.Roughness < TranslucencyMaxRoughness)
 		{
 			// Trace reflection ray 
-			uint DummyVariable;
-			float2 RandSample = RandomSequence_GenerateSample2D(RandSequence, DummyVariable);
+			float2 RandSample = RandomSequence_GenerateSample2D(RandSequence);
 
-			RayDesc ReflectionRay;
+			FRayDesc ReflectionRay;
 			ReflectionRay.TMin = 0.01;
 			ReflectionRay.TMax = LocalMaxRayDistance;
 			ReflectionRay.Origin = HitPoint;
@@ -273,9 +267,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingPrimaryRaysRGS)
 		float3 RefractedDirection = Ray.Direction;
 		if (TranslucencyRefraction)
 		{
-			// #dxr_todo Determine if parameterization from Specular is still the proper path forward
-			//float Ior = Payload.Ior;
-			float Ior = DielectricF0ToIor(DielectricSpecularToF0(Payload.Specular));
+			float Ior = Payload.Ior;
 			bHasScattered |= Ior > 1.0 ? true : false;
 
 			float ReflectionRefractionEventThroughput;
@@ -344,12 +336,10 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingPrimaryRaysRGS)
 		FinalAlpha = SceneColorTexture.SampleLevel(GlobalPointClampedSampler, UV, 0).w;
 	}
 
-	if(ShouldUsePreExposure) 
-	{
-		PathRadiance.rgb *= View.PreExposure;
-	}
+	PathRadiance.rgb *= View.PreExposure;
 
 	PathRadiance = ClampToHalfFloatRange(PathRadiance);
 	ColorOutput[DispatchThreadId] = float4(PathRadiance, FinalAlpha);
 	RayHitDistanceOutput[DispatchThreadId] = HitDistance;
+#endif // !STRATA_ENABLED
 }

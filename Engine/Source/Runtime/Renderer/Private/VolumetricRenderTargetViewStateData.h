@@ -49,10 +49,13 @@ public:
 	const uint32 GetVolumetricTracingRTDownsampleFactor() const { return VolumetricTracingRTDownsampleFactor; }
 
 	FUintVector4 GetTracingCoordToZbufferCoordScaleBias() const;
+	FUintVector4 GetTracingCoordToFullResPixelCoordScaleBias() const;
 
 	float GetUvNoiseScale()		const { return UvNoiseScale; }
 	int32 GetMode()				const { return Mode; }
 	int32 GetUpsamplingMode()	const { return UpsamplingMode; }
+
+	uint64 GetGPUSizeBytes(bool bLogSizes) const;
 
 private:
 
@@ -109,6 +112,8 @@ public:
 	uint32 GetPreviousIndex() { return 1 - CurrentRT; }
 
 	void Reset();
+
+	uint64 GetGPUSizeBytes(bool bLogSizes) const;
 
 private:
 

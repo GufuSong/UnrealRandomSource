@@ -15,17 +15,12 @@
 	#define DIM_GENERATE_RAYS 0
 #endif
 
-#include "../HairStrands/HairStrandsVoxelPageCommonStruct.ush"
 #include "../Common.ush"
 
 #define SUPPORT_CONTACT_SHADOWS		0
 #define USE_SOURCE_TEXTURE			1
-#define USE_SOURCE_TEXTURE_ARRAY	1
+#define STRATA_LEGACY_REFLECTION_API 1
 
-#define LTCMatTexture				RaytracingLightsDataPacked.LTCMatTexture
-#define LTCMatSampler				GlobalBilinearClampedSampler
-#define LTCAmpTexture				RaytracingLightsDataPacked.LTCAmpTexture
-#define LTCAmpSampler				GlobalBilinearClampedSampler
 #define PreIntegratedGF				ReflectionStruct.PreIntegratedGF
 #define PreIntegratedGFSampler		GlobalBilinearClampedSampler
 
@@ -70,6 +65,18 @@ RaytracingAccelerationStructure                 TLAS;
 // used during to reduce ray intersection overhead during Shading.
 RWStructuredBuffer<FRayIntersectionBookmark>    BookmarkBuffer;
 
+FPackedMaterialClosestHitPayload InitializePackedPayload(uint2 PixelPos, bool bSkyLightAffectReflection)
+{
+	FPackedMaterialClosestHitPayload PackedPayload = (FPackedMaterialClosestHitPayload)0;
+	if (bSkyLightAffectReflection)
+	{
+		PackedPayload.SetEnableSkyLightContribution();
+	}
+	PackedPayload.SetPixelCoord(PixelPos);
+	PackedPayload.SetMipBias(TextureMipBias);
+	return PackedPayload;
+}
+
 RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 {
 	const uint DispatchThreadId = DispatchRaysIndex().x; // This shader is dispatched in 1D configuration
@@ -104,7 +111,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 	const uint2 PixelPos = UnpackPixelCoordinates(ReflectionRay.PixelCoordinates);
 	if (all(PixelPos - View.ViewRectMin.xy < RayTracingResolution))
 	{
-		RayDesc Ray;
+		FRayDesc Ray;
 		Ray.TMin      = 0;
 		Ray.TMax      = 1e9;
 		Ray.Origin    = ReflectionRay.Origin;
@@ -120,9 +127,9 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 		if (bIsValidPixel)
 		{
 			TraceDeferredMaterialGatherRay(TLAS,
-				RAY_FLAG_FORCE_OPAQUE,
+				RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
 				RAY_TRACING_MASK_OPAQUE,
-				Ray,
+				Ray.GetNativeDesc(),
 				Bookmark,
 				DeferredMaterialPayload
 			);
@@ -155,12 +162,12 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 	//float ResultDistance = DENOISER_INVALID_HIT_DISTANCE;
 	float ResultDistance = 1.0e20;
 
-	FPackedMaterialClosestHitPayload PackedPayload = (FPackedMaterialClosestHitPayload)0;
+	FPackedMaterialClosestHitPayload PackedPayload = InitializePackedPayload(PixelPos, bSkyLightAffectReflection);
 	float3 RayHitWorldPos = ReflectionRay.Origin + ReflectionRay.GetDirection() * DENOISER_MISS_HIT_DISTANCE;
 
 	if (DeferredMaterialPayload.SortKey < RAY_TRACING_DEFERRED_MATERIAL_KEY_RAY_MISS)
 	{
-		RayDesc Ray;
+		FRayDesc Ray;
 		Ray.TMin      = 0;
 		Ray.TMax      = 1e9;
 		Ray.Origin    = ReflectionRay.Origin;
@@ -168,18 +175,11 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 
 		FRayIntersectionBookmark Bookmark = BookmarkBuffer[DeferredMaterialPayload.PixelCoordinates];
 
-		if (bSkyLightAffectReflection)
-		{
-			PackedPayload.SetEnableSkyLightContribution();
-		}
-		PackedPayload.SetPixelCoord(PixelPos);
-		PackedPayload.SetMipBias(TextureMipBias);
-
 		TraceDeferredMaterialShadingRay(
 			TLAS,
 			RAY_FLAG_FORCE_OPAQUE,
 			RAY_TRACING_MASK_OPAQUE,
-			Ray,
+			Ray.GetNativeDesc(),
 			Bookmark,
 			PackedPayload);
 
@@ -192,6 +192,9 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 		if ((!PackedPayload.IsHit() || PackedPayload.GetOpacity() == 0) 
 			&& ReflectionRay.Roughness <= AnyHitMaxRoughness)
 		{
+			// Reset the payload to a known initial state, as previous Trace() call may have overwritten some of the fields.
+			PackedPayload = InitializePackedPayload(PixelPos, bSkyLightAffectReflection);
+
 			FRayCone RayCone = (FRayCone)0;
 			TraceMaterialRayPacked(
 				PackedPayload,
@@ -211,8 +214,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 			bool bDecoupleSampleGeneration             = false;
 			uint ReflectedShadowsType                  = 1; // Hard shadows
 			
-			RandomSequence RandSequence; // Not actually used, since hard shadows are forced
-			RandomSequence_Initialize(RandSequence, DispatchThreadId, 0);
+			RandomSequence RandSequence = (RandomSequence) 0; // Not actually used, since hard shadows are forced
 
 			float3 LightingViewDirection = Ray.Direction;
 			RayHitWorldPos = Ray.Origin + Ray.Direction * PackedPayload.HitT;
@@ -266,6 +268,9 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 			ResultDistance = PackedPayload.HitT;
 		}
 	}
+
+	// Filter out any NaN-s and negative numbers to prevent any errors propagating into the subsequent pipeline.
+	ResultColor.rgb = -min(-ResultColor.rgb, float3(0, 0, 0));
 
 	ColorOutput[PixelPos] = ResultColor;
 

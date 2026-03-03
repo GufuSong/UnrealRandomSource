@@ -14,15 +14,13 @@
 #include "GenericPlatform/GenericPlatformDriver.h"
 #include "GenericPlatform/GenericPlatformCrashContext.h"
 #include "PipelineStateCache.h"
-
-#if NV_GEFORCENOW
-THIRD_PARTY_INCLUDES_START
-#include "GfnRuntimeSdk_CAPI.h"
-THIRD_PARTY_INCLUDES_END
-#endif
+#include "TextureProfiler.h"
 
 IMPLEMENT_TYPE_LAYOUT(FRayTracingGeometryInitializer);
 IMPLEMENT_TYPE_LAYOUT(FRayTracingGeometrySegment);
+
+static_assert(sizeof(FRayTracingGeometryInstance) <= 104,
+	"Ray tracing instance descriptor is expected to be no more than 104 bytes, as there may be a very large number of them.");
 
 #ifndef PLATFORM_ALLOW_NULL_RHI
 	#define PLATFORM_ALLOW_NULL_RHI		0
@@ -38,12 +36,21 @@ static TAutoConsoleVariable<int32> CVarWarnOfBadDrivers(
 	TEXT("The test is fast so this should not cost any performance.\n")
 	TEXT(" 0: off\n")
 	TEXT(" 1: a message on startup might appear (default)\n")
-	TEXT(" 2: Simulating the system has a blacklisted NVIDIA driver (UI should appear)\n")
-	TEXT(" 3: Simulating the system has a blacklisted AMD driver (UI should appear)\n")
-	TEXT(" 4: Simulating the system has a not blacklisted AMD driver (no UI should appear)\n")
+	TEXT(" 2: Simulating the system has a NVIDIA driver on the deny list (UI should appear)\n")
+	TEXT(" 3: Simulating the system has a AMD driver on the deny list (UI should appear)\n")
+	TEXT(" 4: Simulating the system has an allowed AMD driver (no UI should appear)\n")
 	TEXT(" 5: Simulating the system has a Intel driver (no UI should appear)"),
 	ECVF_RenderThreadSafe
 	);
+
+static TAutoConsoleVariable<int32> CVarBadDriverWarningIsFatal(
+	TEXT("r.BadDriverWarningIsFatal"),
+	0,
+	TEXT("If non-zero, trigger a fatal error when warning of bad drivers.\n")
+	TEXT("For the fatal error to occur, r.WarnOfBadDrivers must be non-zero.\n")
+	TEXT(" 0: off (default)\n")
+	TEXT(" 1: a fatal error occurs after the out of date driver message is dismissed\n"),
+	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarDisableDriverWarningPopupIfGFN(
 	TEXT("r.DisableDriverWarningPopupIfGFN"),
@@ -65,10 +72,6 @@ void InitNullRHI()
 	GDynamicRHI = DynamicRHIModule->CreateRHI();
 	GDynamicRHI->Init();
 
-	// Command lists need the validation RHI context if enabled, so call the global scope version of RHIGetDefaultContext() and RHIGetDefaultAsyncComputeContext().
-	GRHICommandList.GetImmediateCommandList().SetContext(::RHIGetDefaultContext());
-	GRHICommandList.GetImmediateAsyncComputeCommandList().SetComputeContext(::RHIGetDefaultAsyncComputeContext());
-
 	GUsingNullRHI = true;
 	GRHISupportsTextureStreaming = false;
 
@@ -76,15 +79,16 @@ void InitNullRHI()
 	FGenericCrashContext::SetEngineData(TEXT("RHI.RHIName"), TEXT("NullRHI"));
 }
 
-#if PLATFORM_WINDOWS
+#if PLATFORM_WINDOWS || PLATFORM_UNIX
 static void RHIDetectAndWarnOfBadDrivers(bool bHasEditorToken)
 {
-	int32 CVarValue = CVarWarnOfBadDrivers.GetValueOnGameThread();
-
-	if(!GIsRHIInitialized || !CVarValue || GRHIVendorId == 0)
+	if (GRHIVendorId == 0)
 	{
+		UE_LOG(LogRHI, Log, TEXT("Skipping Driver Check, no vendor ID set."));
 		return;
 	}
+
+	int32 WarnMode = CVarWarnOfBadDrivers.GetValueOnGameThread();
 
 	FGPUDriverInfo DriverInfo;
 
@@ -99,7 +103,7 @@ static void RHIDetectAndWarnOfBadDrivers(bool bHasEditorToken)
 
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
 	// for testing
-	if(CVarValue == 2)
+	if(WarnMode == 2)
 	{
 		DriverInfo.SetNVIDIA();
 		DriverInfo.DeviceDescription = TEXT("Test NVIDIA (bad)");
@@ -107,7 +111,7 @@ static void RHIDetectAndWarnOfBadDrivers(bool bHasEditorToken)
 		DriverInfo.InternalDriverVersion = TEXT("9.18.134.643");
 		DriverInfo.DriverDate = TEXT("01-01-1900");
 	}
-	else if(CVarValue == 3)
+	else if(WarnMode == 3)
 	{
 		DriverInfo.SetAMD();
 		DriverInfo.DeviceDescription = TEXT("Test AMD (bad)");
@@ -115,7 +119,7 @@ static void RHIDetectAndWarnOfBadDrivers(bool bHasEditorToken)
 		DriverInfo.InternalDriverVersion = TEXT("13.152.1.1000");
 		DriverInfo.DriverDate = TEXT("09-10-13");
 	}
-	else if(CVarValue == 4)
+	else if(WarnMode == 4)
 	{
 		DriverInfo.SetAMD();
 		DriverInfo.DeviceDescription = TEXT("Test AMD (good)");
@@ -123,7 +127,7 @@ static void RHIDetectAndWarnOfBadDrivers(bool bHasEditorToken)
 		DriverInfo.InternalDriverVersion = TEXT("15.30.1025.1001");
 		DriverInfo.DriverDate = TEXT("01-01-16");
 	}
-	else if(CVarValue == 5)
+	else if(WarnMode == 5)
 	{
 		DriverInfo.SetIntel();
 		DriverInfo.DeviceDescription = TEXT("Test Intel (good)");
@@ -136,52 +140,126 @@ static void RHIDetectAndWarnOfBadDrivers(bool bHasEditorToken)
 	FGPUHardware DetectedGPUHardware(DriverInfo);
 
 	// Pre-GCN GPUs usually don't support updating to latest driver
-	// But it is unclear what is the lastest version supported as it varies from card to card
+	// But it is unclear what is the latest version supported as it varies from card to card
 	// So just don't complain if pre-gcn
 	if (DriverInfo.IsValid() && !GRHIDeviceIsAMDPreGCNArchitecture)
 	{
-		FBlackListEntry BlackListEntry = DetectedGPUHardware.FindDriverBlacklistEntry();
+		FDriverDenyListEntry DenyListEntry = DetectedGPUHardware.FindDriverDenyListEntry();
 
-		if (BlackListEntry.IsValid())
+		TArray<FString> DeviceCanUpdateDriverList;
+		GConfig->GetArray(TEXT("Devices"), TEXT("DeviceCanUpdateDriverList"), DeviceCanUpdateDriverList, GHardwareIni);
+
+		bool bVendorHasEntries = false;
+		bool bDeviceCanUpdateDriver = false;
+		for (const FString& DeviceCanUpdateDriverString : DeviceCanUpdateDriverList)
 		{
-			bool bLatestBlacklisted = DetectedGPUHardware.IsLatestBlacklisted();
+			const TCHAR* Line = *DeviceCanUpdateDriverString;
+
+			FString VendorId;
+			FParse::Value(Line + 1, TEXT("VendorId="), VendorId);
+			uint32 VendorIdInt = FParse::HexNumber(*VendorId);
+
+			FString DeviceId;
+			FParse::Value(Line + 1, TEXT("DeviceId="), DeviceId);
+			uint32 DeviceIdInt = FParse::HexNumber(*DeviceId);
+
+			bVendorHasEntries |= DriverInfo.VendorId && DriverInfo.VendorId == VendorIdInt;
+
+			if (DriverInfo.VendorId && GRHIDeviceId &&
+				DriverInfo.VendorId == VendorIdInt && GRHIDeviceId == DeviceIdInt)
+			{
+				bDeviceCanUpdateDriver = true;
+				break;
+			}
+		}
+
+		GRHIAdapterDriverOnDenyList = DenyListEntry.IsValid();
+		FGenericCrashContext::SetEngineData(TEXT("RHI.DriverDenylisted"), DenyListEntry.IsValid() ? TEXT("true") : TEXT("false"));
+
+		if(!GRHIAdapterDriverOnDenyList)
+		{
+			return;
+		}
+
+		// Only alert users who are capable of updating their driver. Assume vendors with an empty list can always update.
+		bool bShowPrompt = bDeviceCanUpdateDriver || !bVendorHasEntries;
+		bShowPrompt = bShowPrompt && !FApp::IsUnattended() && WarnMode != 0;
+
+		if (bShowPrompt)
+		{
+			bool bLatestDenied = DetectedGPUHardware.IsLatestDenied();
 
 			// Note: we don't localize the vendor's name.
 			FString VendorString = DriverInfo.ProviderName;
+			FText HyperlinkText;
 			if (DriverInfo.IsNVIDIA())
 			{
 				VendorString = TEXT("NVIDIA");
+				HyperlinkText = NSLOCTEXT("MessageDialog", "DriverDownloadLinkNVIDIA", "https://www.nvidia.com/en-us/geforce/drivers/");
 			}
 			else if (DriverInfo.IsAMD())
 			{
 				VendorString = TEXT("AMD");
+				HyperlinkText = NSLOCTEXT("MessageDialog", "DriverDownloadLinkAMD", "https://www.amd.com/en/support");
 			}
 			else if (DriverInfo.IsIntel())
 			{
 				VendorString = TEXT("Intel");
+				HyperlinkText = NSLOCTEXT("MessageDialog", "DriverDownloadLinkIntel", "https://downloadcenter.intel.com/product/80939/Graphics");
 			}
 
 			// format message box UI
 			FFormatNamedArguments Args;
 			Args.Add(TEXT("AdapterName"), FText::FromString(DriverInfo.DeviceDescription));
 			Args.Add(TEXT("Vendor"), FText::FromString(VendorString));
+			Args.Add(TEXT("RHI"), FText::FromString(DenyListEntry.RHIName));
+			Args.Add(TEXT("Hyperlink"), HyperlinkText);
 			Args.Add(TEXT("RecommendedVer"), FText::FromString(DetectedGPUHardware.GetSuggestedDriverVersion(DriverInfo.RHIName)));
 			Args.Add(TEXT("InstalledVer"), FText::FromString(DriverInfo.UserDriverVersion));
 
 			// this message can be suppressed with r.WarnOfBadDrivers=0
 			FText LocalizedMsg;
-			if (bLatestBlacklisted)
+			if (bLatestDenied)
 			{
-				LocalizedMsg = FText::Format(NSLOCTEXT("MessageDialog", "LatestVideoCardDriverIssueReport","The latest version of the {Vendor} graphics driver has known issues.\nPlease install the recommended driver version.\n\n{AdapterName}\nInstalled: {InstalledVer}\nRecommended: {RecommendedVer}"),Args);
+				if (!DenyListEntry.RHIName.IsEmpty())
+				{
+					LocalizedMsg = FText::Format(NSLOCTEXT("MessageDialog", "LatestVideoCardDriverRHIIssueReport", "The latest version of the {Vendor} graphics driver has known issues in {RHI}.\nPlease install the recommended driver version or switch to a different rendering API.\n\nWould you like to visit the following URL to download the driver?\n\n{Hyperlink}\n\n{AdapterName}\nInstalled: {InstalledVer}\nRecommended: {RecommendedVer}"), Args);
+				}
+				else
+				{
+					LocalizedMsg = FText::Format(NSLOCTEXT("MessageDialog", "LatestVideoCardDriverIssueReport", "The latest version of the {Vendor} graphics driver has known issues.\nPlease install the recommended driver version.\n\nWould you like to visit the following URL to download the driver?\n\n{Hyperlink}\n\n{AdapterName}\nInstalled: {InstalledVer}\nRecommended: {RecommendedVer}"), Args);
+				}
 			}
 			else
 			{
-				LocalizedMsg = FText::Format(NSLOCTEXT("MessageDialog", "VideoCardDriverIssueReport","The installed version of the {Vendor} graphics driver has known issues.\nPlease update to the latest driver version.\n\n{AdapterName}\nInstalled: {InstalledVer}\nRecommended: {RecommendedVer}"),Args);
+				if (!DenyListEntry.RHIName.IsEmpty())
+				{
+					LocalizedMsg = FText::Format(NSLOCTEXT("MessageDialog", "VideoCardDriverRHIIssueReport", "The installed version of the {Vendor} graphics driver has known issues in {RHI}.\nPlease install either the latest or the recommended driver version or switch to a different rendering API.\n\nWould you like to visit the following URL to download the driver?\n\n{Hyperlink}\n\n{AdapterName}\nInstalled: {InstalledVer}\nRecommended: {RecommendedVer}"), Args);
+				}
+				else
+				{
+					LocalizedMsg = FText::Format(NSLOCTEXT("MessageDialog", "VideoCardDriverIssueReport", "The installed version of the {Vendor} graphics driver has known issues.\nPlease install either the latest or the recommended driver version.\n\nWould you like to visit the following URL to download the driver?\n\n{Hyperlink}\n\n{AdapterName}\nInstalled: {InstalledVer}\nRecommended: {RecommendedVer}"), Args);
+				}
 			}
 
-			FPlatformMisc::MessageBoxExt(EAppMsgType::Ok,
-				*LocalizedMsg.ToString(),
-				*NSLOCTEXT("MessageDialog", "TitleVideoCardDriverIssue", "WARNING: Known issues with graphics driver").ToString());
+			FText Title = NSLOCTEXT("MessageDialog", "TitleVideoCardDriverIssue", "WARNING: Known issues with graphics driver");
+			EAppReturnType::Type Response = FMessageDialog::Open(EAppMsgType::YesNo, LocalizedMsg, &Title);
+			if (Response == EAppReturnType::Yes)
+			{
+				FPlatformProcess::LaunchURL(*HyperlinkText.ToString(), nullptr, nullptr);
+			}
+#if !UE_BUILD_SHIPPING
+			if (CVarBadDriverWarningIsFatal.GetValueOnGameThread())
+			{
+				// Force a fatal error depending on CVar
+				UE_LOG(LogRHI, Fatal, TEXT("Fatal crash requested when graphics drivers are out of date.\n")
+					TEXT("To prevent this crash, please update drivers."));
+			}
+#endif
+		}
+		else
+		{
+			UE_LOG(LogRHI, Warning, TEXT("Running with bad GPU drivers but warning dialog will not be shown: bDeviceCanUpdateDriver=%d, VendorHasEntries=%d, IsUnattended=%d, r.WarnOfBadDrivers=%d"), bDeviceCanUpdateDriver, bVendorHasEntries, FApp::IsUnattended(), WarnMode);
 		}
 	}
 }
@@ -190,17 +268,26 @@ static void RHIDetectAndWarnOfBadDrivers(bool bHasEditorToken)
 {
 	int32 CVarValue = CVarWarnOfBadDrivers.GetValueOnGameThread();
 
-	if (!GIsRHIInitialized || !CVarValue || GRHIVendorId == 0 || bHasEditorToken || FApp::IsUnattended())
+	if (!CVarValue || GRHIVendorId == 0 || bHasEditorToken || FApp::IsUnattended())
 	{
 		return;
 	}
 
-	if (FPlatformMisc::MacOSXVersionCompare(10,15,5) < 0)
+	if (FPlatformMisc::MacOSXVersionCompare(12, 0, 0) < 0)
 	{
 		// this message can be suppressed with r.WarnOfBadDrivers=0
 		FPlatformMisc::MessageBoxExt(EAppMsgType::Ok,
-									 *NSLOCTEXT("MessageDialog", "UpdateMacOSX_Body", "Please update to the latest version of macOS for best performance and stability.").ToString(),
-									 *NSLOCTEXT("MessageDialog", "UpdateMacOSX_Title", "Update macOS").ToString());
+								 *NSLOCTEXT("MessageDialog", "UpdateMacOSX_Body", "Please update to the latest version of macOS for best performance and stability.").ToString(),
+								 *NSLOCTEXT("MessageDialog", "UpdateMacOSX_Title", "Update macOS").ToString());
+		
+#if !UE_BUILD_SHIPPING
+		if (CVarBadDriverWarningIsFatal.GetValueOnGameThread())
+		{
+			// Force a fatal error depending on CVar
+		UE_LOG(LogRHI, Fatal, TEXT("Fatal crash requested when graphics drivers are out of date.\n")
+			TEXT("To prevent this crash, please update macOS."));
+		}
+#endif
 	}
 }
 #endif // PLATFORM_WINDOWS
@@ -209,6 +296,10 @@ void RHIInit(bool bHasEditorToken)
 {
 	if (!GDynamicRHI)
 	{
+#if RHI_ENABLE_RESOURCE_INFO
+		FRHIResource::StartTrackingAllResources();
+#endif
+
 		// read in any data driven shader platform info structures we can find
 		FGenericDataDrivenShaderPlatformInfo::Initialize();
 
@@ -225,6 +316,27 @@ void RHIInit(bool bHasEditorToken)
 			GDynamicRHI = PlatformCreateDynamicRHI();
 			if (GDynamicRHI)
 			{
+#if PLATFORM_WINDOWS || PLATFORM_MAC || PLATFORM_UNIX
+
+				// Get driver version. Creating GDynamicRHI is expected to set GRHIAdapterName.
+				FGPUDriverInfo GPUDriverInfo = FPlatformMisc::GetGPUDriverInfo(GRHIAdapterName);
+				if (GPUDriverInfo.IsValid())
+				{
+					// GetGPUDriverInfo is not implemented on Linux, so it returns an invalid driver info object. However, the FVulkanDynamicRHI constructor
+					// sets these values on that platform, so we'll still have data we can log.
+					GRHIAdapterUserDriverVersion = GPUDriverInfo.UserDriverVersion;
+					GRHIAdapterInternalDriverVersion = GPUDriverInfo.InternalDriverVersion;
+					GRHIAdapterDriverDate = GPUDriverInfo.DriverDate;
+				}
+
+				UE_LOG(LogRHI, Log, TEXT("RHI Adapter Info:"));
+				UE_LOG(LogRHI, Log, TEXT("            Name: %s"), *GRHIAdapterName);
+				UE_LOG(LogRHI, Log, TEXT("  Driver Version: %s (internal:%s, unified:%s)"), *GRHIAdapterUserDriverVersion, *GRHIAdapterInternalDriverVersion, *GPUDriverInfo.GetUnifiedDriverVersion());
+				UE_LOG(LogRHI, Log, TEXT("     Driver Date: %s"), *GRHIAdapterDriverDate);
+
+				RHIDetectAndWarnOfBadDrivers(bHasEditorToken);
+#endif
+
 				GDynamicRHI->Init();
 
 #if WITH_MGPU
@@ -233,14 +345,12 @@ void RHIInit(bool bHasEditorToken)
 
 				// Validation of contexts.
 				GRHICommandList.GetImmediateCommandList().GetContext();
-				GRHICommandList.GetImmediateAsyncComputeCommandList().GetComputeContext();
 				check(GIsRHIInitialized);
 
 				// Set default GPU mask to all GPUs. This is necessary to ensure that any commands
 				// that create and initialize resources are executed on all GPUs. Scene rendering
 				// will restrict itself to a subset of GPUs as needed.
 				GRHICommandList.GetImmediateCommandList().SetGPUMask(FRHIGPUMask::All());
-				GRHICommandList.GetImmediateAsyncComputeCommandList().SetGPUMask(FRHIGPUMask::All());
 
 				FString FeatureLevelString;
 				GetFeatureLevelName(GMaxRHIFeatureLevel, FeatureLevelString);
@@ -254,12 +364,18 @@ void RHIInit(bool bHasEditorToken)
 				}
 
 				// Update the crash context analytics
-				FGenericCrashContext::SetEngineData(TEXT("RHI.RHIName"), GDynamicRHI ? GDynamicRHI->GetName() : TEXT("Unknown"));
+				FGenericCrashContext::SetEngineData(TEXT("RHI.RHIName"), GDynamicRHI ? (GMaxRHIFeatureLevel == ERHIFeatureLevel::ES3_1 ? FString(GDynamicRHI->GetName()) + TEXT("_ES31") : GDynamicRHI->GetName()) : TEXT("Unknown"));
 				FGenericCrashContext::SetEngineData(TEXT("RHI.AdapterName"), GRHIAdapterName);
 				FGenericCrashContext::SetEngineData(TEXT("RHI.UserDriverVersion"), GRHIAdapterUserDriverVersion);
 				FGenericCrashContext::SetEngineData(TEXT("RHI.InternalDriverVersion"), GRHIAdapterInternalDriverVersion);
 				FGenericCrashContext::SetEngineData(TEXT("RHI.DriverDate"), GRHIAdapterDriverDate);
 				FGenericCrashContext::SetEngineData(TEXT("RHI.FeatureLevel"), FeatureLevelString);
+				FGenericCrashContext::SetEngineData(TEXT("RHI.GPUVendor"), RHIVendorIdToString());
+				FGenericCrashContext::SetEngineData(TEXT("RHI.DeviceId"), FString::Printf(TEXT("%04X"), GRHIDeviceId));
+
+#if TEXTURE_PROFILER_ENABLED
+				FTextureProfiler::Get()->Init();
+#endif
 			}
 #if PLATFORM_ALLOW_NULL_RHI
 			else
@@ -272,35 +388,6 @@ void RHIInit(bool bHasEditorToken)
 
 		check(GDynamicRHI);
 	}
-
-#if PLATFORM_WINDOWS || PLATFORM_MAC
-#if NV_GEFORCENOW
-	bool bDetectAndWarnBadDrivers = true;
-	if (IsRHIDeviceNVIDIA() && !!CVarDisableDriverWarningPopupIfGFN.GetValueOnAnyThread())
-	{
-		const GfnRuntimeSdk::GfnRuntimeError GfnResult = GfnRuntimeSdk::gfnInitializeRuntimeSdk(GfnRuntimeSdk::gfnDefaultLanguage);
-		const bool bGfnRuntimeSDKInitialized = GfnResult == GfnRuntimeSdk::gfnSuccess || GfnResult == GfnRuntimeSdk::gfnInitSuccessClientOnly;
-		if (bGfnRuntimeSDKInitialized)
-		{
-			UE_LOG(LogRHI, Log, TEXT("GeForceNow SDK initialized: %d"), (int32)GfnResult);
-		}
-		else
-		{
-			UE_LOG(LogRHI, Log, TEXT("GeForceNow SDK initialization failed: %d"), (int32)GfnResult);
-		}
-
-		// Don't pop up a driver version warning window when running on a cloud machine
-		bDetectAndWarnBadDrivers = !bGfnRuntimeSDKInitialized || !GfnRuntimeSdk::gfnIsRunningInCloud();
-	}
-
-	if (bDetectAndWarnBadDrivers)
-	{
-		RHIDetectAndWarnOfBadDrivers(bHasEditorToken);
-	}
-#else
-	RHIDetectAndWarnOfBadDrivers(bHasEditorToken);
-#endif
-#endif
 }
 
 void RHIPostInit(const TArray<uint32>& InPixelFormatByteWidth)
@@ -317,18 +404,26 @@ void RHIExit()
 		// Clean up all cached pipelines
 		PipelineStateCache::Shutdown();
 
+		// Flush any potential commands queued before we shut things down.
+		FRHICommandListExecutor::GetImmediateCommandList().ImmediateFlush(EImmediateFlushType::FlushRHIThread);
+
 		// Destruct the dynamic RHI.
 		GDynamicRHI->Shutdown();
 		delete GDynamicRHI;
 		GDynamicRHI = NULL;
+
+#if RHI_ENABLE_RESOURCE_INFO
+		FRHIResource::StopTrackingAllResources();
+#endif
+	}
+	else if (GUsingNullRHI)
+	{
+		// If we are using NullRHI flush the command list here in case somethings has been added to the command list during exit calls
+		FRHICommandListExecutor::GetImmediateCommandList().ImmediateFlush(EImmediateFlushType::FlushRHIThreadFlushResources);
+		FRHICommandListExecutor::GetImmediateCommandList().ImmediateFlush(EImmediateFlushType::FlushRHIThread);
 	}
 
-#if NV_GEFORCENOW
-	if (GRHIVendorId != 0 && IsRHIDeviceNVIDIA() && !!CVarDisableDriverWarningPopupIfGFN.GetValueOnAnyThread())
-	{
-		GfnRuntimeSdk::gfnShutdownRuntimeSdk();
-	}
-#endif
+	FRHICommandListImmediate::CleanupGraphEvents();
 }
 
 
@@ -423,28 +518,33 @@ void FDynamicRHI::EnableIdealGPUCaptureOptions(bool bEnabled)
 	}	
 }
 
-void FDynamicRHI::RHITransferIndexBufferUnderlyingResource(FRHIIndexBuffer* DestIndexBuffer, FRHIIndexBuffer* SrcIndexBuffer)
+void FDynamicRHI::RHITransferBufferUnderlyingResource(FRHIBuffer* DestBuffer, FRHIBuffer* SrcBuffer)
 {
-	UE_LOG(LogRHI, Fatal, TEXT("RHITransferIndexBufferUnderlyingResource isn't implemented for the current RHI"));
+	UE_LOG(LogRHI, Fatal, TEXT("RHITransferBufferUnderlyingResource isn't implemented for the current RHI"));
 }
 
-void FDynamicRHI::RHITransferVertexBufferUnderlyingResource(FRHIVertexBuffer* DestVertexBuffer, FRHIVertexBuffer* SrcVertexBuffer)
+FUnorderedAccessViewRHIRef FDynamicRHI::RHICreateUnorderedAccessView(FRHITexture* Texture, uint32 MipLevel)
 {
-	UE_LOG(LogRHI, Fatal, TEXT("RHITransferVertexBufferUnderlyingResource isn't implemented for the current RHI"));
+	return RHICreateUnorderedAccessView(Texture, MipLevel, 0, 0);
 }
 
 FUnorderedAccessViewRHIRef FDynamicRHI::RHICreateUnorderedAccessView(FRHITexture* Texture, uint32 MipLevel, uint8 Format)
 {
-	UE_LOG(LogRHI, Fatal, TEXT("RHICreateUnorderedAccessView with Format parameter isn't implemented for the current RHI"));
-	return RHICreateUnorderedAccessView(Texture, MipLevel);
+	return RHICreateUnorderedAccessView(Texture, MipLevel, Format, 0, 0);
 }
 
-void FDynamicRHI::RHIUpdateShaderResourceView(FRHIShaderResourceView* SRV, FRHIVertexBuffer* VertexBuffer, uint32 Stride, uint8 Format)
+FUnorderedAccessViewRHIRef FDynamicRHI::RHICreateUnorderedAccessView(FRHITexture* Texture, uint32 MipLevel, uint8 Format, uint16 FirstArraySlice, uint16 NumArraySlices)
+{
+	UE_LOG(LogRHI, Fatal, TEXT("RHICreateUnorderedAccessView with Format parameter isn't implemented for the current RHI"));
+	return RHICreateUnorderedAccessView(Texture, MipLevel, FirstArraySlice, NumArraySlices);
+}
+
+void FDynamicRHI::RHIUpdateShaderResourceView(FRHIShaderResourceView* SRV, FRHIBuffer* Buffer, uint32 Stride, uint8 Format)
 {
 	UE_LOG(LogRHI, Fatal, TEXT("RHIUpdateShaderResourceView isn't implemented for the current RHI"));
 }
 
-void FDynamicRHI::RHIUpdateShaderResourceView(FRHIShaderResourceView* SRV, FRHIIndexBuffer* IndexBuffer)
+void FDynamicRHI::RHIUpdateShaderResourceView(FRHIShaderResourceView* SRV, FRHIBuffer* Buffer)
 {
 	UE_LOG(LogRHI, Fatal, TEXT("RHIUpdateShaderResourceView isn't implemented for the current RHI"));
 }
@@ -454,10 +554,116 @@ uint64 FDynamicRHI::RHIGetMinimumAlignmentForBufferBackedSRV(EPixelFormat Format
 	return 1;
 }
 
-uint64 FDynamicRHI::RHICalcVMTexture2DPlatformSize(uint32 Mip0Width, uint32 Mip0Height, uint8 Format, uint32 NumMips, uint32 FirstMipIdx, uint32 NumSamples, ETextureCreateFlags Flags, uint32& OutAlign)
+uint64 FDynamicRHI::RHIComputePrecachePSOHash(const FGraphicsPipelineStateInitializer& Initializer)
 {
-	UE_LOG(LogRHI, Fatal, TEXT("RHICalcVMTexture2DPlatformSize isn't implemented for the current RHI"));
-	return -1;
+	// When compute precache PSO hash we assume a valid state precache PSO hash is already provided
+	checkf(Initializer.StatePrecachePSOHash != 0, TEXT("Initializer should have a valid state precache PSO hash set when computing the full initializer PSO hash"));
+	
+	// All members which are not part of the state objects
+	struct FNonStateHashKey
+	{
+		uint64							StatePrecachePSOHash;
+
+		EPrimitiveType					PrimitiveType;
+		uint32							RenderTargetsEnabled;
+		FGraphicsPipelineStateInitializer::TRenderTargetFormats	RenderTargetFormats;
+		FGraphicsPipelineStateInitializer::TRenderTargetFlags RenderTargetFlags;
+		EPixelFormat					DepthStencilTargetFormat;
+		ETextureCreateFlags				DepthStencilTargetFlag;
+		ERenderTargetLoadAction			DepthTargetLoadAction;
+		ERenderTargetStoreAction		DepthTargetStoreAction;
+		ERenderTargetLoadAction			StencilTargetLoadAction;
+		ERenderTargetStoreAction		StencilTargetStoreAction;
+		FExclusiveDepthStencil			DepthStencilAccess;
+		uint16							NumSamples;
+		ESubpassHint					SubpassHint;
+		uint8							SubpassIndex;
+		EConservativeRasterization		ConservativeRasterization;
+		bool							bDepthBounds;
+		uint8							MultiViewCount;
+		bool							bHasFragmentDensityAttachment;
+		EVRSShadingRate					ShadingRate;
+	} HashKey;
+
+	FMemory::Memzero(&HashKey, sizeof(FNonStateHashKey));
+
+	HashKey.StatePrecachePSOHash		= Initializer.StatePrecachePSOHash;
+
+	HashKey.PrimitiveType				= Initializer.PrimitiveType;
+	HashKey.RenderTargetsEnabled		= Initializer.RenderTargetsEnabled;
+	HashKey.RenderTargetFormats			= Initializer.RenderTargetFormats;
+	HashKey.RenderTargetFlags			= Initializer.RenderTargetFlags;
+	HashKey.DepthStencilTargetFormat	= Initializer.DepthStencilTargetFormat;
+	HashKey.DepthStencilTargetFlag		= Initializer.DepthStencilTargetFlag;
+	HashKey.DepthTargetLoadAction		= Initializer.DepthTargetLoadAction;
+	HashKey.DepthTargetStoreAction		= Initializer.DepthTargetStoreAction;	
+	HashKey.StencilTargetLoadAction		= Initializer.StencilTargetLoadAction;
+	HashKey.StencilTargetStoreAction	= Initializer.StencilTargetStoreAction;
+	HashKey.DepthStencilAccess			= Initializer.DepthStencilAccess;
+	HashKey.NumSamples					= Initializer.NumSamples;
+	HashKey.SubpassHint					= Initializer.SubpassHint;
+	HashKey.SubpassIndex				= Initializer.SubpassIndex;
+	HashKey.ConservativeRasterization	= Initializer.ConservativeRasterization;
+	HashKey.bDepthBounds				= Initializer.bDepthBounds;
+	HashKey.MultiViewCount				= Initializer.MultiViewCount;
+	HashKey.bHasFragmentDensityAttachment = Initializer.bHasFragmentDensityAttachment;
+	HashKey.ShadingRate					= Initializer.ShadingRate;
+
+	return CityHash64((const char*)&HashKey, sizeof(FNonStateHashKey));
+}
+
+bool FDynamicRHI::RHIMatchPrecachePSOInitializers(const FGraphicsPipelineStateInitializer& LHS, const FGraphicsPipelineStateInitializer& RHS)
+{
+	// first check non pointer objects
+	if (LHS.ImmutableSamplerState != RHS.ImmutableSamplerState ||
+		LHS.PrimitiveType != RHS.PrimitiveType ||
+		LHS.bDepthBounds != RHS.bDepthBounds ||
+		LHS.MultiViewCount != RHS.MultiViewCount ||
+		LHS.ShadingRate != RHS.ShadingRate ||
+		LHS.bHasFragmentDensityAttachment != RHS.bHasFragmentDensityAttachment ||
+		LHS.RenderTargetsEnabled != RHS.RenderTargetsEnabled ||
+		LHS.RenderTargetFormats != RHS.RenderTargetFormats ||
+		LHS.RenderTargetFlags != RHS.RenderTargetFlags ||
+		LHS.DepthStencilTargetFormat != RHS.DepthStencilTargetFormat ||
+		LHS.DepthStencilTargetFlag != RHS.DepthStencilTargetFlag ||
+		LHS.DepthTargetLoadAction != RHS.DepthTargetLoadAction ||
+		LHS.DepthTargetStoreAction != RHS.DepthTargetStoreAction ||
+		LHS.StencilTargetLoadAction != RHS.StencilTargetLoadAction ||
+		LHS.StencilTargetStoreAction != RHS.StencilTargetStoreAction ||
+		LHS.DepthStencilAccess != RHS.DepthStencilAccess ||
+		LHS.NumSamples != RHS.NumSamples ||
+		LHS.SubpassHint != RHS.SubpassHint ||
+		LHS.SubpassIndex != RHS.SubpassIndex ||
+		LHS.ConservativeRasterization != RHS.ConservativeRasterization)
+	{
+		return false;
+	}
+
+	// check the RHI shaders (pointer check for shaders should be fine)
+	if (LHS.BoundShaderState.VertexShaderRHI != RHS.BoundShaderState.VertexShaderRHI ||
+		LHS.BoundShaderState.PixelShaderRHI != RHS.BoundShaderState.PixelShaderRHI ||
+		LHS.BoundShaderState.GetMeshShader() != RHS.BoundShaderState.GetMeshShader() ||
+		LHS.BoundShaderState.GetAmplificationShader() != RHS.BoundShaderState.GetAmplificationShader() ||
+		LHS.BoundShaderState.GetGeometryShader() != RHS.BoundShaderState.GetGeometryShader())
+	{
+		return false;
+	}
+
+	// Full compare the of the vertex declaration
+	if (!MatchRHIState<FRHIVertexDeclaration, FVertexDeclarationElementList>(LHS.BoundShaderState.VertexDeclarationRHI, RHS.BoundShaderState.VertexDeclarationRHI))
+	{
+		return false;
+	}
+
+	// Check actual state content (each initializer can have it's own state and not going through a factory)
+	if (!MatchRHIState<FRHIBlendState, FBlendStateInitializerRHI>(LHS.BlendState, RHS.BlendState) ||
+		!MatchRHIState<FRHIRasterizerState, FRasterizerStateInitializerRHI>(LHS.RasterizerState, RHS.RasterizerState) ||
+		!MatchRHIState<FRHIDepthStencilState, FDepthStencilStateInitializerRHI>(LHS.DepthStencilState, RHS.DepthStencilState))
+	{
+		return false;
+	}
+
+	return true;
 }
 
 FDefaultRHIRenderQueryPool::FDefaultRHIRenderQueryPool(ERenderQueryType InQueryType, FDynamicRHI* InDynamicRHI, uint32 InNumQueries)
@@ -479,13 +685,13 @@ FDefaultRHIRenderQueryPool::FDefaultRHIRenderQueryPool(ERenderQueryType InQueryT
 
 FDefaultRHIRenderQueryPool::~FDefaultRHIRenderQueryPool()
 {
-	check(IsInRenderingThread());
+	check(IsInRHIThread() || IsInRenderingThread());
 	checkf(AllocatedQueries == Queries.Num(), TEXT("Querypool deleted before all Queries have been released"));
 }
 
 FRHIPooledRenderQuery FDefaultRHIRenderQueryPool::AllocateQuery()
 {
-	check(IsInRenderingThread());
+	check(IsInParallelRenderingThread());
 	if (Queries.Num() > 0)
 	{
 		return FRHIPooledRenderQuery(this, Queries.Pop());
@@ -509,7 +715,7 @@ void FDefaultRHIRenderQueryPool::ReleaseQuery(TRefCountPtr<FRHIRenderQuery>&& Qu
 		static int dbg = 0;
 		dbg++;
 	}
-	check(IsInRenderingThread());
+	check(IsInParallelRenderingThread());
 	//Hard to validate because of Resource resurrection, better to remove GetQueryRef entirely
 	//checkf(Query.IsValid() && Query.GetRefCount() <= 2, TEXT("Query has been released but reference still held: use FRHIPooledRenderQuery::GetQueryRef() with extreme caution"));
 	
@@ -534,52 +740,94 @@ void FDynamicRHI::RHICheckViewportHDRStatus(FRHIViewport* Viewport)
 {
 }
 
+void* FDynamicRHI::RHILockBufferMGPU(FRHICommandListBase& RHICmdList, FRHIBuffer* Buffer, uint32 GPUIndex, uint32 Offset, uint32 Size, EResourceLockMode LockMode)
+{
+	// Fall through to single GPU case
+	check(GPUIndex == 0);
+	return RHILockBuffer(RHICmdList, Buffer, Offset, Size, LockMode);
+}
 
-FShaderResourceViewInitializer::FShaderResourceViewInitializer(FRHIVertexBuffer* InVertexBuffer, EPixelFormat InFormat, uint32 InStartOffsetBytes, uint32 InNumElements)
-	: VertexBufferInitializer({ InVertexBuffer, InStartOffsetBytes, InNumElements, InFormat }), Type(EType::VertexBufferSRV)
+void FDynamicRHI::RHIUnlockBufferMGPU(FRHICommandListBase& RHICmdList, FRHIBuffer* Buffer, uint32 GPUIndex)
+{
+	// Fall through to single GPU case
+	check(GPUIndex == 0);
+	RHIUnlockBuffer(RHICmdList, Buffer);
+}
+
+FShaderResourceViewInitializer::FShaderResourceViewInitializer(FRHIBuffer* InBuffer, EPixelFormat InFormat, uint32 InStartOffsetBytes, uint32 InNumElements)
+	: BufferInitializer({ InBuffer, InStartOffsetBytes, InNumElements, InFormat }), Type(EType::VertexBufferSRV)
 {
 	check(InStartOffsetBytes % RHIGetMinimumAlignmentForBufferBackedSRV(InFormat) == 0);
-	/*if (!VertexBufferInitializer.IsWholeResource())
+	/*if (!BufferInitializer.IsWholeResource())
 	{
 		const uint32 Stride = GPixelFormats[InFormat].BlockBytes;
-		check((VertexBufferInitializer.NumElements * Stride + VertexBufferInitializer.StartOffsetBytes)  <= VertexBufferInitializer.VertexBuffer->GetSize());
+		check((BufferInitializer.NumElements * Stride + BufferInitializer.StartOffsetBytes) <= BufferInitializer.Buffer->GetSize());
 	}*/
+
+	InitType();
 }
 
-FShaderResourceViewInitializer::FShaderResourceViewInitializer(FRHIVertexBuffer* InVertexBuffer, EPixelFormat InFormat)
-	: VertexBufferInitializer({ InVertexBuffer, 0, UINT32_MAX, InFormat }), Type(EType::VertexBufferSRV) 
+FShaderResourceViewInitializer::FShaderResourceViewInitializer(FRHIBuffer* InBuffer, EPixelFormat InFormat)
+	: BufferInitializer({ InBuffer, 0, UINT32_MAX, InFormat }), Type(EType::VertexBufferSRV) 
 {
+	InitType();
 }
 
-FShaderResourceViewInitializer::FShaderResourceViewInitializer(FRHIStructuredBuffer* InStructuredBuffer, uint32 InStartOffsetBytes, uint32 InNumElements)
-	: StructuredBufferInitializer(FStructuredBufferShaderResourceViewInitializer{ InStructuredBuffer, InStartOffsetBytes, InNumElements }), Type(EType::StructuredBufferSRV)
+FShaderResourceViewInitializer::FShaderResourceViewInitializer(FRHIBuffer* InBuffer, uint32 InStartOffsetBytes, uint32 InNumElements)
+	: BufferInitializer({ InBuffer, InStartOffsetBytes, InNumElements, PF_Unknown }), Type(EType::StructuredBufferSRV)
 {
-	check(InStartOffsetBytes % InStructuredBuffer->GetStride() == 0);
-	if (!StructuredBufferInitializer.IsWholeResource())
+	const uint32 Stride = EnumHasAnyFlags(InBuffer->GetUsage(), BUF_AccelerationStructure) 
+		? 1 // Acceleration structure buffers don't have a stride as they are opaque and not indexable
+		: InBuffer->GetStride();
+
+	check(InStartOffsetBytes % Stride == 0);
+	if (!BufferInitializer.IsWholeResource())
 	{
-		const uint32 Stride = StructuredBufferInitializer.StructuredBuffer->GetStride();
-		check((StructuredBufferInitializer.NumElements * Stride + StructuredBufferInitializer.StartOffsetBytes)  <= StructuredBufferInitializer.StructuredBuffer->GetSize());
+		check((BufferInitializer.NumElements * Stride + BufferInitializer.StartOffsetBytes) <= BufferInitializer.Buffer->GetSize());
+	}
+
+	InitType();
+}
+
+FShaderResourceViewInitializer::FShaderResourceViewInitializer(FRHIBuffer* InBuffer)
+	: BufferInitializer({ InBuffer, 0, UINT32_MAX }), Type(EType::StructuredBufferSRV)
+{
+	InitType();
+}
+
+FRawBufferShaderResourceViewInitializer::FRawBufferShaderResourceViewInitializer(FRHIBuffer* InBuffer)
+	: FShaderResourceViewInitializer(nullptr)
+{
+	check(GRHISupportsRawViewsForAnyBuffer);
+
+	Type = EType::RawBufferSRV;
+
+	BufferInitializer.Buffer = InBuffer;
+	BufferInitializer.Format = PF_Unknown;
+	BufferInitializer.StartOffsetBytes = 0;
+	BufferInitializer.NumElements = UINT32_MAX; // Whole resource
+}
+
+void FShaderResourceViewInitializer::InitType()
+{
+	if (BufferInitializer.Buffer)
+	{
+		EBufferUsageFlags Usage = BufferInitializer.Buffer->GetUsage();
+		if (EnumHasAnyFlags(Usage, BUF_VertexBuffer))
+		{
+			Type = EType::VertexBufferSRV;
+		}
+		else if (EnumHasAnyFlags(Usage, BUF_IndexBuffer))
+		{
+			Type = EType::IndexBufferSRV;
+		}
+		else if (EnumHasAnyFlags(Usage, BUF_AccelerationStructure))
+		{
+			Type = EType::AccelerationStructureSRV;
+		}
+		else
+		{
+			Type = EType::StructuredBufferSRV;
+		}
 	}
 }
-
-FShaderResourceViewInitializer::FShaderResourceViewInitializer(FRHIStructuredBuffer* InStructuredBuffer)
-	: StructuredBufferInitializer(FStructuredBufferShaderResourceViewInitializer{ InStructuredBuffer, 0, UINT32_MAX }), Type(EType::StructuredBufferSRV) 
-{
-}
-
-FShaderResourceViewInitializer::FShaderResourceViewInitializer(FRHIIndexBuffer* InIndexBuffer, uint32 InStartOffsetBytes, uint32 InNumElements)
-	: IndexBufferInitializer(FIndexBufferShaderResourceViewInitializer{ InIndexBuffer, InStartOffsetBytes, InNumElements }), Type(EType::IndexBufferSRV)
-{
-	check(InStartOffsetBytes % RHIGetMinimumAlignmentForBufferBackedSRV(InIndexBuffer->GetStride() == 2 ? PF_R16_UINT : PF_R32_UINT) == 0);
-	if (!IndexBufferInitializer.IsWholeResource())
-	{
-		const uint32 Stride = IndexBufferInitializer.IndexBuffer->GetStride();
-		check((IndexBufferInitializer.NumElements * Stride + IndexBufferInitializer.StartOffsetBytes) <= IndexBufferInitializer.IndexBuffer->GetSize());
-	}
-}
-
-FShaderResourceViewInitializer::FShaderResourceViewInitializer(FRHIIndexBuffer* InIndexBuffer)
-	: IndexBufferInitializer(FIndexBufferShaderResourceViewInitializer{ InIndexBuffer, 0, UINT32_MAX }), Type(EType::IndexBufferSRV) 
-{
-}
-

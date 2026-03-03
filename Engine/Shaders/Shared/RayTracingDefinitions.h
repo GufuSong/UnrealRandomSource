@@ -1,7 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 /*================================================================================================
-	RayTracingDefinitions.ush: used in ray tracing shaders and C++ code to define common constants
+	RayTracingDefinitions.h: used in ray tracing shaders and C++ code to define common constants
 	!!! Changing this file requires recompilation of the engine !!!
 =================================================================================================*/
 
@@ -9,7 +9,7 @@
 
 // Change this to force recompilation of all ray tracing shaders (use https://www.random.org/cgi-bin/randbyte?nbytes=4&format=h)
 // This avoids changing the global ShaderVersion.ush and forcing recompilation of all shaders in the engine (only RT shaders will be affected)
-#define RAY_TRACING_SHADER_VERSION 0x7034a1ef 
+#define RAY_TRACING_SHADER_VERSION 0x4502E713
 
 #define RAY_TRACING_REGISTER_SPACE_LOCAL  0 // default register space for hit group (closest hit, any hit, intersection) shader resources
 #define RAY_TRACING_REGISTER_SPACE_GLOBAL 1 // register space for ray generation and miss shaders 
@@ -19,6 +19,9 @@
 #define RAY_TRACING_MASK_TRANSLUCENT				0x02    // Opaque and alpha tested meshes and particles (e.g. used by translucency tracing pass)
 #define RAY_TRACING_MASK_THIN_SHADOW				0x04    // Whether the thin geometry (e.g. hair) is visible for shadow rays
 #define RAY_TRACING_MASK_SHADOW						0x08    // Whether the geometry is visible for shadow rays
+#define RAY_TRACING_MASK_SCENE_CAPTURE				0x10    // Whether the geometry is visible when rendering scene capture views
+#define RAY_TRACING_MASK_FAR_FIELD					0x20
+#define RAY_TRACING_MASK_HAIR_STRANDS               0x40    // For primary ray tracing against hair
 #define RAY_TRACING_MASK_ALL						0xFF
 
 #define RAY_TRACING_SHADER_SLOT_MATERIAL	0
@@ -30,8 +33,8 @@
 #define RAY_TRACING_NUM_MISS_SHADER_SLOTS		2
 
 #define RAY_TRACING_LIGHT_COUNT_MAXIMUM		256
+#define RAY_TRACING_DECAL_COUNT_MAXIMUM		256
 
 #define RAY_TRACING_MAX_ALLOWED_RECURSION_DEPTH 1   // Only allow ray tracing from RayGen shader
 #define RAY_TRACING_MAX_ALLOWED_ATTRIBUTE_SIZE  8   // Sizeof 2 floats (barycentrics)
 #define RAY_TRACING_MAX_ALLOWED_PAYLOAD_SIZE    64  // Our maximum allowed payload size (sizeof FPackedMaterialClosestHitPayload)
-

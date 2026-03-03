@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "Experimental/ConcurrentLinearAllocator.h"
+
 #if ENABLE_RHI_VALIDATION
 extern RHI_API bool GRHIValidationEnabled;
 #else
@@ -15,12 +17,23 @@ const bool GRHIValidationEnabled = false;
 #if ENABLE_RHI_VALIDATION
 
 class FRHIUniformBuffer;
+class FValidationRHI;
+struct FRHITextureCreateDesc;
 
 // Forward declaration of function defined in RHIUtilities.h
 static inline bool IsStencilFormat(EPixelFormat Format);
 
 namespace RHIValidation
 {
+	struct FStaticUniformBuffers
+	{
+		TArray<FRHIUniformBuffer*> Bindings;
+		bool bInSetPipelineStateCall{};
+
+		void Reset();
+		void ValidateSetShaderUniformBuffer(FRHIUniformBuffer* UniformBuffer);
+	};
+
 	static bool IsValidCopyFormat(EPixelFormat SourceFormat, EPixelFormat DestFormat)
 	{
 		if (SourceFormat == DestFormat)
@@ -97,13 +110,6 @@ namespace RHIValidation
 				&& ArraySlice == kWholeResource
 				&& PlaneIndex == kWholeResource;
 		}
-
-		inline FString ToString() const
-		{
-			return IsWholeResource()
-				? FString(TEXT("Whole Resource"))
-				: FString::Printf(TEXT("Mip %d, Slice %d, Plane %d"), MipIndex, ArraySlice, PlaneIndex);
-		}
 	};
 
 	struct FState
@@ -139,39 +145,41 @@ namespace RHIValidation
 
 	struct FSubresourceState
 	{
-		FState PreviousState;
-		FState CurrentState;
-		EResourceTransitionFlags Flags = EResourceTransitionFlags::None;
-
-		// True when a BeginTransition has been issued, and false when the transition has been ended.
-		bool bTransitioning = false;
-
-		// True when the resource has been used within a Begin/EndUAVOverlap region.
-		bool bUsedWithAllUAVsOverlap = false;
-		
-		// True if the calling code explicitly enabled overlapping on this UAV.
-		bool bExplicitAllowUAVOverlap = false;
-		bool bUsedWithExplicitUAVsOverlap = false;
-
-		// Pointer to the previous create/begin transition backtraces if logging is enabled for this resource.
-		void* CreateTransitionBacktrace = nullptr;
-		void* BeginTransitionBacktrace = nullptr;
-
-		FSubresourceState()
+		struct FPipelineState
 		{
-			CurrentState.Access = ERHIAccess::Unknown;
+			FPipelineState()
+			{
+				Current.Access = ERHIAccess::Unknown;
+				Current.Pipelines = ERHIPipeline::Graphics;
+				Previous = Current;
+			}
 
-			// Resource can initially be accessed on any pipe without a transition.
-			CurrentState.Pipelines = ERHIPipeline::All;
+			FState Previous;
+			FState Current;
+			EResourceTransitionFlags Flags = EResourceTransitionFlags::None;
 
-			PreviousState = CurrentState;
-		}
+			// True when a BeginTransition has been issued, and false when the transition has been ended.
+			bool bTransitioning = false;
 
-		void BeginTransition   (FResource* Resource, FSubresourceIndex const& SubresourceIndex, const FState& CurrentStateFromRHI, const FState& TargetState, EResourceTransitionFlags NewFlags, void* CreateTrace);
-		void EndTransition     (FResource* Resource, FSubresourceIndex const& SubresourceIndex, void* CreateTrace);
+			// True when the resource has been used within a Begin/EndUAVOverlap region.
+			bool bUsedWithAllUAVsOverlap = false;
+
+			// True if the calling code explicitly enabled overlapping on this UAV.
+			bool bExplicitAllowUAVOverlap = false;
+			bool bUsedWithExplicitUAVsOverlap = false;
+
+			// Pointer to the previous create/begin transition backtraces if logging is enabled for this resource.
+			void* CreateTransitionBacktrace = nullptr;
+			void* BeginTransitionBacktrace = nullptr;
+		};
+
+		TRHIPipelineArray<FPipelineState> States;
+
+		void BeginTransition   (FResource* Resource, FSubresourceIndex const& SubresourceIndex, const FState& CurrentStateFromRHI, const FState& TargetState, EResourceTransitionFlags NewFlags, ERHIPipeline Pipeline, void* CreateTrace);
+		void EndTransition     (FResource* Resource, FSubresourceIndex const& SubresourceIndex, const FState& CurrentStateFromRHI, const FState& TargetState, ERHIPipeline Pipeline, void* CreateTrace);
 		void Assert            (FResource* Resource, FSubresourceIndex const& SubresourceIndex, const FState& RequiredState, bool bAllowAllUAVsOverlap);
-		void SpecificUAVOverlap(FResource* Resource, FSubresourceIndex const& SubresourceIndex, bool bAllow);
-		void* Log              (FResource* Resource, FSubresourceIndex const& SubresourceIndex, void* CreateTrace, const TCHAR* Type, const TCHAR* LogStr);
+		void AssertTracked     (FResource* Resource, FSubresourceIndex const& SubresourceIndex, const FState& TrackedState);
+		void SpecificUAVOverlap(FResource* Resource, FSubresourceIndex const& SubresourceIndex, ERHIPipeline Pipeline, bool bAllow);
 	};
 
 	struct FSubresourceRange
@@ -228,6 +236,36 @@ namespace RHIValidation
 		}
 	};
 
+	struct FTransientState
+	{
+		FTransientState() = default;
+
+		enum class EStatus : uint8
+		{
+			None,
+			Acquired,
+			Discarded
+		};
+
+		FTransientState(ERHIAccess InitialAccess)
+			: bTransient(InitialAccess == ERHIAccess::Discard)
+		{}
+
+		void* AcquireBacktrace = nullptr;
+		void* DiscardBacktrace = nullptr;
+
+		bool bTransient = false;
+		EStatus Status = EStatus::None;
+
+		FORCEINLINE bool IsAcquired() const { return Status == EStatus::Acquired; }
+		FORCEINLINE bool IsDiscarded() const { return Status == EStatus::Discarded; }
+
+		void Acquire(FResource* Resource, void* CreateTrace);
+		void Discard(FResource* Resource, void* CreateTrace);
+
+		static void AliasingOverlap(FResource* ResourceBefore, FResource* ResourceAfter, void* CreateTrace);
+	};
+
 	class FResource
 	{
 		friend FTracker;
@@ -235,11 +273,15 @@ namespace RHIValidation
 		friend FOperation;
 		friend FSubresourceState;
 		friend FSubresourceRange;
+		friend FTransientState;
+		friend FValidationRHI;
 
 	protected:
 		uint32 NumMips = 0;
 		uint32 NumArraySlices = 0;
 		uint32 NumPlanes = 0;
+		FTransientState TransientState;
+		ERHIAccess TrackedAccess = ERHIAccess::Unknown;
 
 	private:
 		FString DebugName;
@@ -259,7 +301,7 @@ namespace RHIValidation
 
 		ELoggingMode LoggingMode = ELoggingMode::None;
 
-		void SetDebugName(const TCHAR* Name, const TCHAR* Suffix = nullptr);
+		RHI_API void SetDebugName(const TCHAR* Name, const TCHAR* Suffix = nullptr);
 		inline const TCHAR* GetDebugName() const { return DebugName.Len() ? *DebugName : nullptr; }
 
 		inline bool IsBarrierTrackingInitialized() const { return NumMips > 0 && NumArraySlices > 0; }
@@ -275,25 +317,57 @@ namespace RHIValidation
 			check(RefCount >= 0);
 		}
 
+		inline ERHIAccess GetTrackedAccess() const
+		{
+			return TrackedAccess;
+		}
+
+		inline FSubresourceRange GetWholeResourceRange()
+		{
+			checkSlow(NumMips > 0 && NumArraySlices > 0 && NumPlanes > 0);
+
+			FSubresourceRange SubresourceRange;
+			SubresourceRange.MipIndex = 0;
+			SubresourceRange.ArraySlice = 0;
+			SubresourceRange.PlaneIndex = 0;
+			SubresourceRange.NumMips = NumMips;
+			SubresourceRange.NumArraySlices = NumArraySlices;
+			SubresourceRange.NumPlanes = NumPlanes;
+			return SubresourceRange;
+		}
+
+		inline FResourceIdentity GetWholeResourceIdentity()
+		{
+			FResourceIdentity Identity;
+			Identity.Resource = this;
+			Identity.SubresourceRange = GetWholeResourceRange();
+			return Identity;
+		}
+
 	protected:
 		inline void InitBarrierTracking(int32 InNumMips, int32 InNumArraySlices, int32 InNumPlanes, ERHIAccess InResourceState, const TCHAR* InDebugName)
 		{
-			if (!IsBarrierTrackingInitialized())
+			checkSlow(InNumMips > 0 && InNumArraySlices > 0 && InNumPlanes > 0);
+			check(InResourceState != ERHIAccess::Unknown);
+
+			NumMips = InNumMips;
+			NumArraySlices = InNumArraySlices;
+			NumPlanes = InNumPlanes;
+			TransientState = FTransientState(InResourceState);
+			TrackedAccess = InResourceState;
+
+			for (ERHIPipeline Pipeline : GetRHIPipelines())
 			{
-				checkSlow(InNumMips > 0 && InNumArraySlices > 0 && InNumPlanes > 0);
-				check(InResourceState != ERHIAccess::Unknown);
+				auto& State = WholeResourceState.States[Pipeline];
 
-				NumMips = InNumMips;
-				NumArraySlices = InNumArraySlices;
-				NumPlanes = InNumPlanes;
+				State.Current.Access = InResourceState;
+				State.Current.Pipelines = Pipeline;
+				State.Previous = State.Current;
+			}
 
-				WholeResourceState.CurrentState.Access = InResourceState;
-				WholeResourceState.PreviousState = WholeResourceState.CurrentState;
-
-				if (InDebugName != nullptr)
-				{
-					SetDebugName(InDebugName);
-				}
+			if (InDebugName != nullptr)
+			{
+				SetDebugName(InDebugName);
 			}
 		}
 	};
@@ -315,21 +389,11 @@ namespace RHIValidation
 		{
 			FResource::InitBarrierTracking(1, 1, 1, InResourceState, InDebugName);
 		}
+	};
 
-		inline FResourceIdentity GetWholeResourceIdentity()
-		{
-			checkSlow(NumMips == 1 && NumArraySlices == 1 && NumPlanes == 1);
-
-			FResourceIdentity Identity;
-			Identity.Resource = this;
-			Identity.SubresourceRange.MipIndex = 0;
-			Identity.SubresourceRange.ArraySlice = 0;
-			Identity.SubresourceRange.PlaneIndex = 0;
-			Identity.SubresourceRange.NumMips = 1;
-			Identity.SubresourceRange.NumArraySlices = 1;
-			Identity.SubresourceRange.NumPlanes = 1;
-			return Identity;
-		}
+	class FAccelerationStructureResource : public FBufferResource
+	{
+	public:
 	};
 
 	class FTextureResource
@@ -340,11 +404,23 @@ namespace RHIValidation
 		FResource PRIVATE_TrackerResource;
 
 	public:
+		FTextureResource() = default;
+		RHI_API FTextureResource(FRHITextureCreateDesc const& CreateDesc);
+
 		virtual ~FTextureResource() {}
 
 		virtual FResource* GetTrackerResource() { return &PRIVATE_TrackerResource; }
 
-		inline void InitBarrierTracking(int32 InNumMips, int32 InNumArraySlices, EPixelFormat PixelFormat, uint32 Flags, ERHIAccess InResourceState, const TCHAR* InDebugName)
+		void InitBarrierTracking(FRHITextureCreateDesc const& CreateDesc);
+
+		inline bool IsBarrierTrackingInitialized() const
+		{
+			// @todo: clean up const_cast once FRHITextureReference is removed and
+			// we don't need to keep a separate PRIVATE_TrackerResource object.
+			return const_cast<FTextureResource*>(this)->GetTrackerResource()->IsBarrierTrackingInitialized();
+		}
+
+		inline void InitBarrierTracking(int32 InNumMips, int32 InNumArraySlices, EPixelFormat PixelFormat, ETextureCreateFlags Flags, ERHIAccess InResourceState, const TCHAR* InDebugName)
 		{
 			FResource* Resource = GetTrackerResource();
 			if (!Resource)
@@ -411,7 +487,7 @@ namespace RHIValidation
 			}
 			else
 			{
-				checkSlow(Info.MipIndex < uint32(Resource->NumMips));
+				check(Info.MipIndex < uint32(Resource->NumMips));
 				Identity.SubresourceRange.MipIndex = Info.MipIndex;
 				Identity.SubresourceRange.NumMips = 1;
 			}
@@ -423,7 +499,7 @@ namespace RHIValidation
 			}
 			else
 			{
-				checkSlow(Info.ArraySlice < uint32(Resource->NumArraySlices));
+				check(Info.ArraySlice < uint32(Resource->NumArraySlices));
 				Identity.SubresourceRange.ArraySlice = Info.ArraySlice;
 				Identity.SubresourceRange.NumArraySlices = 1;
 			}
@@ -435,7 +511,7 @@ namespace RHIValidation
 			}
 			else
 			{
-				checkSlow(Info.PlaneSlice < uint32(Resource->NumPlanes));
+				check(Info.PlaneSlice < uint32(Resource->NumPlanes));
 				Identity.SubresourceRange.PlaneIndex = Info.PlaneSlice;
 				Identity.SubresourceRange.NumPlanes = 1;
 			}
@@ -445,19 +521,7 @@ namespace RHIValidation
 
 		inline FResourceIdentity GetWholeResourceIdentity()
 		{
-			FResource* Resource = GetTrackerResource();
-
-			checkSlow(Resource->NumMips > 0 && Resource->NumArraySlices > 0 && Resource->NumPlanes > 0);
-
-			FResourceIdentity Identity;
-			Identity.Resource = Resource;
-			Identity.SubresourceRange.MipIndex = 0;
-			Identity.SubresourceRange.ArraySlice = 0;
-			Identity.SubresourceRange.PlaneIndex = 0;
-			Identity.SubresourceRange.NumMips = Resource->NumMips;
-			Identity.SubresourceRange.NumArraySlices = Resource->NumArraySlices;
-			Identity.SubresourceRange.NumPlanes = Resource->NumPlanes;
-			return Identity;
+			return GetTrackerResource()->GetWholeResourceIdentity();
 		}
 
 		inline FResourceIdentity GetWholeResourceIdentitySRV()
@@ -474,6 +538,17 @@ namespace RHIValidation
 
 	struct FView
 	{
+		FView()
+		{
+			ResetViewIdentity();
+		}
+
+		void ResetViewIdentity()
+		{
+			ViewIdentity.Resource = nullptr;
+			ViewIdentity.SubresourceRange = FSubresourceRange(0, 0, 0, 0, 0, 0);
+		}
+
 		FResourceIdentity ViewIdentity;
 	};
 
@@ -500,24 +575,33 @@ namespace RHIValidation
 	{
 		BeginTransition,
 		EndTransition,
+		SetTrackedAccess,
+		AliasingOverlap,
+		AcquireTransient,
+		DiscardTransient,
 		Assert,
 		Rename,
 		Signal,
 		Wait,
 		AllUAVsOverlap,
-		SpecificUAVOverlap
+		SpecificUAVOverlap,
+		PushBreadcrumb,
+		PopBreadcrumb
 	};
 
 	struct FUniformBufferResource
 	{
 		uint64 AllocatedFrameID = 0;
+		bool bContainsNullContents = false;
 		EUniformBufferUsage UniformBufferUsage;
 		void* AllocatedCallstack;
 
-		void InitLifetimeTracking(uint64 FrameID, EUniformBufferUsage Usage);
+		void InitLifetimeTracking(uint64 FrameID, const void* Contents, EUniformBufferUsage Usage);
 		void UpdateAllocation(uint64 FrameID);
 		void ValidateLifeTime();
-	};	
+	};
+
+	using FBreadcrumbStack = TArray<const TCHAR*, FConcurrentLinearArrayAllocator>;
 
 	struct FOperation
 	{
@@ -537,8 +621,35 @@ namespace RHIValidation
 			struct
 			{
 				FResourceIdentity Identity;
+				FState PreviousState;
+				FState NextState;
 				void* CreateBacktrace;
 			} Data_EndTransition;
+
+			struct
+			{
+				FResource* Resource;
+				ERHIAccess Access;
+			} Data_SetTrackedAccess;
+
+			struct
+			{
+				FResource* ResourceBefore;
+				FResource* ResourceAfter;
+				void* CreateBacktrace;
+			} Data_AliasingOverlap;
+
+			struct
+			{
+				FResource* Resource;
+				void* CreateBacktrace;
+			} Data_AcquireTransient;
+
+			struct
+			{
+				FResource* Resource;
+				void* CreateBacktrace;
+			} Data_DiscardTransient;
 
 			struct
 			{
@@ -556,11 +667,13 @@ namespace RHIValidation
 			struct
 			{
 				FFence* Fence;
+				ERHIPipeline Pipeline;
 			} Data_Signal;
 
 			struct
 			{
 				FFence* Fence;
+				ERHIPipeline Pipeline;
 			} Data_Wait;
 
 			struct
@@ -573,13 +686,24 @@ namespace RHIValidation
 				FResourceIdentity Identity;
 				bool bAllow;
 			} Data_SpecificUAVOverlap;
+
+			struct
+			{
+				TCHAR* Breadcrumb;
+			} Data_PushBreadcrumb;
 		};
 
-		RHI_API EReplayStatus Replay(bool& bAllowAllUAVsOverlap) const;
+		RHI_API EReplayStatus Replay(ERHIPipeline Pipeline, bool& bAllowAllUAVsOverlap, FBreadcrumbStack& Breadcrumbs) const;
 
 		static inline FOperation BeginTransitionResource(FResourceIdentity Identity, FState PreviousState, FState NextState, EResourceTransitionFlags Flags, void* CreateBacktrace)
 		{
-			Identity.Resource->AddOpRef();
+			for (ERHIPipeline Pipeline : GetRHIPipelines())
+			{
+				if (EnumHasAnyFlags(PreviousState.Pipelines, Pipeline))
+				{
+					Identity.Resource->AddOpRef();
+				}
+			}
 
 			FOperation Op;
 			Op.Type = EOpType::BeginTransition;
@@ -591,14 +715,68 @@ namespace RHIValidation
 			return MoveTemp(Op);
 		}
 
-		static inline FOperation EndTransitionResource(FResourceIdentity Identity, void* CreateBacktrace)
+		static inline FOperation EndTransitionResource(FResourceIdentity Identity, FState PreviousState, FState NextState, void* CreateBacktrace)
 		{
-			Identity.Resource->AddOpRef();
+			for (ERHIPipeline Pipeline : GetRHIPipelines())
+			{
+				if (EnumHasAnyFlags(NextState.Pipelines, Pipeline))
+				{
+					Identity.Resource->AddOpRef();
+				}
+			}
 
 			FOperation Op;
 			Op.Type = EOpType::EndTransition;
 			Op.Data_EndTransition.Identity = Identity;
+			Op.Data_EndTransition.PreviousState = PreviousState;
+			Op.Data_EndTransition.NextState = NextState;
 			Op.Data_EndTransition.CreateBacktrace = CreateBacktrace;
+			return MoveTemp(Op);
+		}
+
+		static inline FOperation SetTrackedAccess(FResource* Resource, ERHIAccess Access)
+		{
+			Resource->AddOpRef();
+
+			FOperation Op;
+			Op.Type = EOpType::SetTrackedAccess;
+			Op.Data_SetTrackedAccess.Resource = Resource;
+			Op.Data_SetTrackedAccess.Access = Access;
+			return MoveTemp(Op);
+		}
+
+		static inline FOperation AliasingOverlap(FResource* ResourceBefore, FResource* ResourceAfter, void* CreateBacktrace)
+		{
+			ResourceBefore->AddOpRef();
+			ResourceAfter->AddOpRef();
+
+			FOperation Op;
+			Op.Type = EOpType::AliasingOverlap;
+			Op.Data_AliasingOverlap.ResourceBefore = ResourceBefore;
+			Op.Data_AliasingOverlap.ResourceAfter = ResourceAfter;
+			Op.Data_AliasingOverlap.CreateBacktrace = CreateBacktrace;
+			return Op;
+		}
+
+		static inline FOperation AcquireTransientResource(FResource* Resource, void* CreateBacktrace)
+		{
+			Resource->AddOpRef();
+
+			FOperation Op;
+			Op.Type = EOpType::AcquireTransient;
+			Op.Data_AcquireTransient.Resource = Resource;
+			Op.Data_AcquireTransient.CreateBacktrace = CreateBacktrace;
+			return MoveTemp(Op);
+		}
+
+		static inline FOperation DiscardTransientResource(FResource* Resource, void* CreateBacktrace)
+		{
+			Resource->AddOpRef();
+
+			FOperation Op;
+			Op.Type = EOpType::DiscardTransient;
+			Op.Data_DiscardTransient.Resource = Resource;
+			Op.Data_DiscardTransient.CreateBacktrace = CreateBacktrace;
 			return MoveTemp(Op);
 		}
 
@@ -620,29 +798,26 @@ namespace RHIValidation
 			FOperation Op;
 			Op.Type = EOpType::Rename;
 			Op.Data_Rename.Resource = Resource;
-
-			int32 NameLen = FCString::Strlen(NewName);
-			Op.Data_Rename.DebugName = new TCHAR[NameLen + 1];
-			FMemory::Memcpy(Op.Data_Rename.DebugName, NewName, NameLen * sizeof(TCHAR));
-			Op.Data_Rename.DebugName[NameLen] = 0;
-
+			AllocStringCopy(Op.Data_Rename.DebugName, NewName);
 			Op.Data_Rename.Suffix = Suffix;
 			return MoveTemp(Op);
 		}
 
-		static inline FOperation Signal(FFence* Fence)
+		static inline FOperation Signal(FFence* Fence, ERHIPipeline Pipeline)
 		{
 			FOperation Op;
 			Op.Type = EOpType::Signal;
 			Op.Data_Signal.Fence = Fence;
+			Op.Data_Signal.Pipeline = Pipeline;
 			return MoveTemp(Op);
 		}
 
-		static inline FOperation Wait(FFence* Fence)
+		static inline FOperation Wait(FFence* Fence, ERHIPipeline Pipeline)
 		{
 			FOperation Op;
 			Op.Type = EOpType::Wait;
 			Op.Data_Wait.Fence = Fence;
+			Op.Data_Wait.Pipeline = Pipeline;
 			return MoveTemp(Op);
 		}
 
@@ -664,19 +839,45 @@ namespace RHIValidation
 			Op.Data_SpecificUAVOverlap.bAllow = bAllow;
 			return MoveTemp(Op);
 		}
+
+		static inline FOperation PushBreadcrumb(const TCHAR* Breadcrumb)
+		{
+			FOperation Op;
+			Op.Type = EOpType::PushBreadcrumb;
+			AllocStringCopy(Op.Data_PushBreadcrumb.Breadcrumb, Breadcrumb);
+			return Op;
+		}
+
+		static inline FOperation PopBreadcrumb()
+		{
+			FOperation Op;
+			Op.Type = EOpType::PopBreadcrumb;
+			return Op;
+		}
+
+	private:
+		static inline void AllocStringCopy(TCHAR*& OutString, const TCHAR* InString)
+		{
+			int32 Len = FCString::Strlen(InString);
+			OutString = new TCHAR[Len + 1];
+			FMemory::Memcpy(OutString, InString, Len * sizeof(TCHAR));
+			OutString[Len] = 0;
+		}
 	};
 
 	struct FOperationsList
 	{
-		TArray<FOperation> Operations;
+		using ListType = TArray<FOperation, FConcurrentLinearArrayAllocator>;
+
+		ListType Operations;
 		int32 OperationPos = 0;
 
-		inline EReplayStatus Replay(bool& bAllowAllUAVsOverlap)
+		inline EReplayStatus Replay(ERHIPipeline Pipeline, bool& bAllowAllUAVsOverlap, FBreadcrumbStack& Breadcrumbs)
 		{
 			EReplayStatus Status = EReplayStatus::Normal;
 			for (; OperationPos < Operations.Num(); ++OperationPos)
 			{
-				Status |= Operations[OperationPos].Replay(bAllowAllUAVsOverlap);
+				Status |= Operations[OperationPos].Replay(Pipeline, bAllowAllUAVsOverlap, Breadcrumbs);
 				if (EnumHasAllFlags(Status, EReplayStatus::Waiting))
 				{
 					break;
@@ -720,10 +921,27 @@ namespace RHIValidation
 		struct FUAVTracker
 		{
 		private:
-			FUnorderedAccessView* UAVs[MaxSimultaneousUAVs] = {};
+			TArray<FUnorderedAccessView*> UAVs;
 
 		public:
-			inline FUnorderedAccessView*& operator[](int32 Slot) { return UAVs[Slot]; }
+			FUAVTracker()
+			{
+				UAVs.Reserve(MaxSimultaneousUAVs);
+			}
+
+			inline FUnorderedAccessView*& operator[](int32 Slot)
+			{
+				if (Slot >= UAVs.Num())
+				{
+					UAVs.SetNumZeroed(Slot + 1);
+				}
+				return UAVs[Slot];
+			}
+
+			inline void Reset()
+			{
+				UAVs.SetNum(0, false);
+			}
 
 			inline void DrawOrDispatch(FTracker* BarrierTracker, const FState& RequiredState)
 			{
@@ -733,7 +951,7 @@ namespace RHIValidation
 				uint32 NumUniqueIdentities = 0;
 				FResourceIdentity UniqueIdentities[MaxSimultaneousUAVs];
 
-				for (int32 UAVIndex = 0; UAVIndex < MaxSimultaneousUAVs; ++UAVIndex)
+				for (int32 UAVIndex = 0; UAVIndex < UAVs.Num(); ++UAVIndex)
 				{
 					if (UAVs[UAVIndex])
 					{
@@ -748,6 +966,7 @@ namespace RHIValidation
 
 						if (!bFound)
 						{
+							check(NumUniqueIdentities < UE_ARRAY_COUNT(UniqueIdentities));
 							UniqueIdentities[NumUniqueIdentities++] = Identity;
 
 							// Assert unique resources have the required state.
@@ -765,7 +984,7 @@ namespace RHIValidation
 
 		inline void AddOp(const FOperation& Op);
 
-		inline void AddOps(const TArray<FOperation>& Ops)
+		inline void AddOps(const FOperationsList::ListType& Ops)
 		{
 			for (const FOperation& Op : Ops)
 			{
@@ -780,6 +999,21 @@ namespace RHIValidation
 		FOperationsList Finalize()
 		{
 			return MoveTemp(CurrentList);
+		}
+
+		inline void PushBreadcrumb(const TCHAR* Breadcrumb)
+		{
+			AddOp(FOperation::PushBreadcrumb(Breadcrumb));
+		}
+
+		inline void PopBreadcrumb()
+		{
+			AddOp(FOperation::PopBreadcrumb());
+		}
+
+		inline void SetTrackedAccess(FResource* Resource, ERHIAccess Access)
+		{
+			AddOp(FOperation::SetTrackedAccess(Resource, Access));
 		}
 
 		inline void Rename(FResource* Resource, const TCHAR* NewName, const TCHAR* Suffix = nullptr)
@@ -809,7 +1043,7 @@ namespace RHIValidation
 			// This function exists due to the implicit transitions that RHI functions make (e.g. RHICopyToResolveTarget).
 			// It should be removed when we eventually remove all implicit transitions from the RHI.
 			AddOp(FOperation::BeginTransitionResource(Identity, PreviousState, NextState, Flags, nullptr));
-			AddOp(FOperation::EndTransitionResource(Identity, nullptr));
+			AddOp(FOperation::EndTransitionResource(Identity, PreviousState, NextState, nullptr));
 		}
 
 		inline void AllUAVsOverlap(bool bAllow)
@@ -835,7 +1069,7 @@ namespace RHIValidation
 
 		inline void ResetUAVState(EUAVMode Mode)
 		{
-			UAVTrackers[int32(Mode)] = {};
+			UAVTrackers[int32(Mode)].Reset();
 		}
 
 		inline void ResetAllUAVState()
@@ -874,6 +1108,8 @@ namespace RHIValidation
 			bool bAllowAllUAVsOverlap = false;
 
 			FOperationsList Ops;
+			TArray<const TCHAR*, FConcurrentLinearArrayAllocator> Breadcrumbs;
+
 		} static RHI_API OpQueues[int32(ERHIPipeline::Num)];
 	};
 

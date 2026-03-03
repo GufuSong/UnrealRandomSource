@@ -65,9 +65,17 @@ float3 XYZ_2_LinearRGB( float3 XYZ )
 // CIE LAB
 // https://en.wikipedia.org/wiki/Lab_color_space
 //------------------------------------------------------------------
+// Assume XYZ is in nominal range to reduce the operation on a constant coefficient 100.
+// E.g., whilte RGB (1, 1, 1) maps to XYZ (0.95047, 1.00, 1.08883)
+// for a reference white of D65. LAB is still in the original range.
+// Use XYZ_WHITE_REF_DXX_NOMINAL instead for LinearRGB_2_LAB() and LAB_2_LinearRGB().
+// E.g.,
+// LinearRGB_2_LAB((1.0f, 1.0f, 1.0f), XYZ_WHITE_REF_D65_NOMINAL) = (100.0f, 0.0f, 0.0f)
 
 static const float3 XYZ_WHITE_REF_D65 = float3(95.047, 100.0, 108.883);
 static const float3 XYZ_WHITE_REF_D50 = float3(96.6797, 100.0, 82.5188);
+static const float3 XYZ_WHITE_REF_D65_NOMINAL = float3(0.95047, 1.00, 1.08883);
+static const float3 XYZ_WHITE_REF_D50_NOMINAL = float3(0.966797, 1.00, 0.825188);
 static const float XYZ_2_LAB_DELTA_SQUARED = 0.04280618311; // (6/29)^3
 static const float XYZ_2_LAB_DELTA_CUBED = 0.00885645167; // (6/29)^3
 
@@ -143,6 +151,11 @@ float3 LAB_2_LinearRGB( float3 LAB, float3 ReferenceWhite)
 // Multiplier that get applied for ALU optimisation purposes on the luma, when converting LinearRGB to YCoCg.
 #define LINEARRGB_2_YCOCG_LUMA_MULTIPLIER 4.0
 
+// YCoCg ranges: 
+//  - Y  in [0, LINEARRGB_2_YCOCG_LUMA_MULTIPLIER]
+//  - Co in [-2, 2]
+//  - Cg in [-2, 2]
+
 float3 LinearRGB_2_YCoCg(float3 RGB)
 {
 	float Y = dot(RGB, float3(1, 2, 1));
@@ -187,4 +200,70 @@ float3 LinearRGB_2_LCoCg(float3 RGB)
 float3 LCoCg_2_LinearRGB(float3 LCoCg)
 {
 	return YCoCg_2_LinearRGB(LCoCg_2_YCoCg(LCoCg));
+}
+
+// NormalisedYCoCg has Y, Co and Cg values mapped to [0, 1]
+float3 LinearRGB_2_NormalisedYCoCg(float3 RGB)
+{
+	return LinearRGB_2_YCoCg(RGB) * float3(1.0f / LINEARRGB_2_YCOCG_LUMA_MULTIPLIER, 0.25f, 0.25f) + float3(0.0f, 0.5f, 0.5f);
+}
+
+float3 NormalisedYCoCg_2_LinearRGB(float3 YCoCg)
+{
+	return YCoCg_2_LinearRGB(YCoCg * float3(LINEARRGB_2_YCOCG_LUMA_MULTIPLIER, 4.0f, 4.0f) + float3(0.0f, -2.0f, -2.0f));
+}
+
+//------------------------------------------------------------------
+// HSV
+//------------------------------------------------------------------
+
+float3 HUE_2_LinearRGB(in float H)
+{
+	float R = abs(H * 6 - 3) - 1;
+	float G = 2 - abs(H * 6 - 2);
+	float B = 2 - abs(H * 6 - 4);
+	return saturate(float3(R, G, B));
+}
+
+float3 HSV_2_LinearRGB(in float3 HSV)
+{
+	float3 RGB = HUE_2_LinearRGB(HSV.x);
+	return ((RGB - 1) * HSV.y + 1) * HSV.z;
+}
+
+float3 RGB_2_HCV(in float3 RGB)
+{
+	// Based on work by Sam Hocevar and Emil Persson
+	float4 P = (RGB.g < RGB.b)	? float4(RGB.bg, -1.0f, 2.0f / 3.0f): float4(RGB.gb, 0.0f, -1.0f / 3.0f);
+	float4 Q = (RGB.r < P.x)	? float4(P.xyw, RGB.r)				: float4(RGB.r, P.yzx);
+	float Chroma = Q.x - min(Q.w, Q.y);
+	float Hue = abs((Q.w - Q.y) / (6.0f * Chroma + 1e-10f) + Q.z);
+	return float3(Hue, Chroma, Q.x);
+}
+
+float3 LinearRGB_2_HSV(in float3 RGB)
+{
+	float3 HCV = RGB_2_HCV(RGB);
+	float s = HCV.y / (HCV.z + 1e-10f);
+	return float3(HCV.x, s, HCV.z);
+}
+
+//------------------------------------------------------------------
+// LCH
+//------------------------------------------------------------------
+
+float3 LAB_2_LCH(float3 LAB)
+{
+	float3 LCH;
+	LCH.x = LAB.x;
+	LCH.y = length(LAB.yz);
+	float HInDegree0To360 = 0.0f;
+
+	if (LAB.z != 0 || LAB.y != 0)
+	{
+		HInDegree0To360 = atan2(LAB.z, LAB.y) * 180 / 3.1415926535897932f;
+		HInDegree0To360 += lerp(0, 360.0f, HInDegree0To360 < 0);
+	}
+	LCH.z = HInDegree0To360;
+	return LCH;
 }

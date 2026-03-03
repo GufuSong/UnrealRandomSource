@@ -3,8 +3,9 @@
 #pragma once
 
 #include "GlobalShader.h"
-#include "ShaderParameterStruct.h"
+#include "RHIDefinitions.h"
 #include "ShaderParameterMacros.h"
+#include "ShaderParameterStruct.h"
 
 #if RHI_RAYTRACING
 
@@ -27,7 +28,7 @@ public:
 	{}
 };
 
-class RENDERCORE_API FOcclusionMainRG : public FBuiltInRayTracingShader
+class RENDERCORE_API UE_DEPRECATED(5.1, "Please use an explicit ray generation shader instead.") FOcclusionMainRG : public FBuiltInRayTracingShader
 {
 	DECLARE_GLOBAL_SHADER(FOcclusionMainRG);
 	SHADER_USE_ROOT_PARAMETER_STRUCT(FOcclusionMainRG, FBuiltInRayTracingShader);
@@ -39,7 +40,7 @@ class RENDERCORE_API FOcclusionMainRG : public FBuiltInRayTracingShader
 	END_SHADER_PARAMETER_STRUCT()
 };
 
-class RENDERCORE_API FIntersectionMainRG : public FBuiltInRayTracingShader
+class RENDERCORE_API UE_DEPRECATED(5.1, "Please use an explicit ray generation shader instead.") FIntersectionMainRG : public FBuiltInRayTracingShader
 {
 	DECLARE_GLOBAL_SHADER(FIntersectionMainRG);
 	SHADER_USE_ROOT_PARAMETER_STRUCT(FIntersectionMainRG, FBuiltInRayTracingShader);
@@ -51,7 +52,7 @@ class RENDERCORE_API FIntersectionMainRG : public FBuiltInRayTracingShader
 	END_SHADER_PARAMETER_STRUCT()
 };
 
-class FIntersectionMainCHS : public FBuiltInRayTracingShader
+class UE_DEPRECATED(5.1, "Please use an explicit ray generation and hit shaders instead.") FIntersectionMainCHS : public FBuiltInRayTracingShader
 {
 	DECLARE_EXPORTED_SHADER_TYPE(FIntersectionMainCHS, Global, RENDERCORE_API);
 public:
@@ -104,6 +105,44 @@ public:
 	FPackedMaterialClosestHitPayloadMS(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
 		: FBuiltInRayTracingShader(Initializer)
 	{}
+};
+
+class RENDERCORE_API FRayTracingDispatchDescCS : public FBuiltInRayTracingShader
+{
+	DECLARE_GLOBAL_SHADER(FRayTracingDispatchDescCS);
+
+public:
+	FRayTracingDispatchDescCS() = default;
+	FRayTracingDispatchDescCS(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
+		: FBuiltInRayTracingShader(Initializer)
+	{
+		DispatchDescInputParam.Bind(Initializer.ParameterMap, TEXT("DispatchDescInput"), SPF_Mandatory);
+		DispatchDescSizeDwordsParam.Bind(Initializer.ParameterMap, TEXT("DispatchDescSizeDwords"), SPF_Mandatory);
+		DispatchDescDimensionsOffsetDwordsParam.Bind(Initializer.ParameterMap, TEXT("DispatchDescDimensionsOffsetDwords"), SPF_Mandatory);
+		DimensionsBufferOffsetDwordsParam.Bind(Initializer.ParameterMap, TEXT("DimensionsBufferOffsetDwords"), SPF_Mandatory);
+		DispatchDimensionsParam.Bind(Initializer.ParameterMap, TEXT("DispatchDimensions"), SPF_Mandatory);
+		DispatchDescOutputParam.Bind(Initializer.ParameterMap, TEXT("DispatchDescOutput"), SPF_Mandatory);
+	}
+
+	static inline void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		OutEnvironment.SetDefine(TEXT("DISPATCH_DESC_MAX_SIZE_DWORDS"), DispatchDescMaxSizeDwords);
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+	}
+
+	static void Dispatch(FRHICommandList& RHICmdList,
+		const void* DispatchDescInput, uint32 DispatchDescSize, uint32 DispatchDescDimensionsOffset,
+		FRHIShaderResourceView* DispatchDimensionsSRV, uint32 DimensionsBufferOffset,
+		FRHIUnorderedAccessView* DispatchDescOutputUAV);
+
+	static constexpr uint32 DispatchDescMaxSizeDwords = 32;
+
+	LAYOUT_FIELD(FShaderParameter, DispatchDescInputParam);
+	LAYOUT_FIELD(FShaderParameter, DispatchDescSizeDwordsParam);
+	LAYOUT_FIELD(FShaderParameter, DispatchDescDimensionsOffsetDwordsParam);
+	LAYOUT_FIELD(FShaderParameter, DimensionsBufferOffsetDwordsParam);
+	LAYOUT_FIELD(FShaderResourceParameter, DispatchDimensionsParam);
+	LAYOUT_FIELD(FShaderResourceParameter, DispatchDescOutputParam);
 };
 
 #endif // RHI_RAYTRACING

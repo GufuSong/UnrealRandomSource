@@ -16,39 +16,57 @@
 #include "Misc/EnumClassFlags.h"
 #include "UniformBuffer.h"
 #include "VirtualTexturing.h"
+#include "RenderGraphDefinitions.h"
 
 class FCanvas;
+class FCanvasRenderContext;
 class FMaterial;
 class FSceneInterface;
-class FSceneRenderTargets;
 class FSceneView;
 class FSceneViewFamily;
 class FSceneTextureUniformParameters;
+class FMobileSceneTextureUniformParameters;
 class FGlobalDistanceFieldParameterData;
 struct FMeshBatch;
 struct FSynthBenchmarkResults;
+struct FSceneTextures;
 class FShader;
 class FShaderMapPointerTable;
 class FRDGBuilder;
+class FMaterialRenderProxy;
+class FViewInfo;
 template<typename ShaderType, typename PointerTableType> class TShaderRefBase;
 
-// Shortcut for the allocator used by scene rendering.
-typedef TMemStackAllocator<> SceneRenderingAllocator;
-
-class SceneRenderingBitArrayAllocator
-	: public TInlineAllocator<4,SceneRenderingAllocator>
+namespace Nanite
 {
+	struct FResources;
 };
 
-class SceneRenderingSparseArrayAllocator
-	: public TSparseArrayAllocator<SceneRenderingAllocator,SceneRenderingBitArrayAllocator>
+class FRHITransientTexture;
+
+struct FSceneRenderingBlockAllocationTag
 {
+	static constexpr uint32 BlockSize = 64 * 1024;		// Blocksize used to allocate from
+	static constexpr bool AllowOversizedBlocks = true;  // The allocator supports oversized Blocks and will store them in a seperate Block with counter 1
+	static constexpr bool RequiresAccurateSize = true;  // GetAllocationSize returning the accurate size of the allocation otherwise it could be relaxed to return the size to the end of the Block
+	static constexpr bool InlineBlockAllocation = false;  // Inline or Noinline the BlockAllocation which can have an impact on Performance
+	static constexpr const char* TagName = "SceneRenderingAllocator";
+
+	using Allocator = TBlockAllocationLockFreeCache<BlockSize, FOsAllocator>;
 };
 
-class SceneRenderingSetAllocator
-	: public TSetAllocator<SceneRenderingSparseArrayAllocator,TInlineAllocator<1,SceneRenderingAllocator> >
-{
-};
+using FSceneRenderingBulkObjectAllocator = TConcurrentLinearBulkObjectAllocator<FSceneRenderingBlockAllocationTag>;
+
+template <typename T>
+using FSceneRenderingAllocatorObject = TConcurrentLinearObject<T, FSceneRenderingBlockAllocationTag>;
+
+using FSceneRenderingAllocator = TConcurrentLinearAllocator<FSceneRenderingBlockAllocationTag>;
+using FSceneRenderingArrayAllocator = TConcurrentLinearArrayAllocator<FSceneRenderingBlockAllocationTag>;
+
+using SceneRenderingAllocator = TConcurrentLinearArrayAllocator<FSceneRenderingBlockAllocationTag>;
+using SceneRenderingBitArrayAllocator = TConcurrentLinearBitArrayAllocator<FSceneRenderingBlockAllocationTag>;
+using SceneRenderingSparseArrayAllocator = TConcurrentLinearSparseArrayAllocator<FSceneRenderingBlockAllocationTag>;
+using SceneRenderingSetAllocator = TConcurrentLinearSetAllocator<FSceneRenderingBlockAllocationTag>;
 
 /** All necessary data to create a render target from the pooled render targets. */
 struct FPooledRenderTargetDesc
@@ -59,9 +77,15 @@ public:
 	FPooledRenderTargetDesc()
 		: PackedBits(0)
 	{
-		AutoWritable = true;
 		check(!IsValid());
 	}
+
+PRAGMA_DISABLE_DEPRECATION_WARNINGS
+	FPooledRenderTargetDesc(const FPooledRenderTargetDesc&) = default;
+	FPooledRenderTargetDesc(FPooledRenderTargetDesc&&) = default;
+	FPooledRenderTargetDesc& operator=(const FPooledRenderTargetDesc&) = default;
+	FPooledRenderTargetDesc& operator=(FPooledRenderTargetDesc&&) = default;
+PRAGMA_ENABLE_DEPRECATION_WARNINGS
 
 	/**
 	 * Factory function to create 2D texture description
@@ -74,7 +98,7 @@ public:
 		ETextureCreateFlags InFlags,
 		ETextureCreateFlags InTargetableFlags,
 		bool bInForceSeparateTargetAndShaderResource,
-		uint16 InNumMips = 1,
+		uint8 InNumMips = 1,
 		bool InAutowritable = true,
 		bool InCreateRTWriteMask = false,
 		bool InCreateFmask = false)
@@ -92,14 +116,46 @@ public:
 		NewDesc.NumMips = InNumMips;
 		NewDesc.NumSamples = 1;
 		NewDesc.Format = InFormat;
-		NewDesc.Flags = InFlags;
-		NewDesc.TargetableFlags = InTargetableFlags;
-		NewDesc.bForceSeparateTargetAndShaderResource = bInForceSeparateTargetAndShaderResource;
+		NewDesc.Flags = InFlags | InTargetableFlags;
 		NewDesc.DebugName = TEXT("UnknownTexture2D");
-		NewDesc.AutoWritable = InAutowritable;
-		NewDesc.bCreateRenderTargetWriteMask = InCreateRTWriteMask;
-		NewDesc.bCreateRenderTargetFmask = InCreateFmask;
 		check(NewDesc.Is2DTexture());
+		return NewDesc;
+	}
+
+	/**
+ * Factory function to create 2D array texture description
+ * @param InFlags bit mask combined from elements of ETextureCreateFlags e.g. TexCreate_UAV
+ */
+	static FPooledRenderTargetDesc Create2DArrayDesc(
+		FIntPoint InExtent,
+		EPixelFormat InFormat,
+		const FClearValueBinding& InClearValue,
+		ETextureCreateFlags InFlags,
+		ETextureCreateFlags InTargetableFlags,
+		bool bInForceSeparateTargetAndShaderResource,
+		uint16 InArraySize,
+		uint8 InNumMips = 1,
+		bool InAutowritable = true,
+		bool InCreateRTWriteMask = false,
+		bool InCreateFmask = false)
+	{
+		check(InExtent.X);
+		check(InExtent.Y);
+
+		FPooledRenderTargetDesc NewDesc;
+		NewDesc.ClearValue = InClearValue;
+		NewDesc.Extent = InExtent;
+		NewDesc.Depth = 0;
+		NewDesc.ArraySize = InArraySize;
+		NewDesc.bIsArray = true;
+		NewDesc.bIsCubemap = false;
+		NewDesc.NumMips = InNumMips;
+		NewDesc.NumSamples = 1;
+		NewDesc.Format = InFormat;
+		NewDesc.Flags = InFlags | InTargetableFlags;
+		NewDesc.DebugName = TEXT("UnknownTexture2DArray");
+		check(NewDesc.Is2DTexture());
+
 		return NewDesc;
 	}
 
@@ -110,13 +166,13 @@ public:
 	static FPooledRenderTargetDesc CreateVolumeDesc(
 		uint32 InSizeX,
 		uint32 InSizeY,
-		uint32 InSizeZ,
+		uint16 InSizeZ,
 		EPixelFormat InFormat,
 		const FClearValueBinding& InClearValue,
 		ETextureCreateFlags InFlags,
 		ETextureCreateFlags InTargetableFlags,
 		bool bInForceSeparateTargetAndShaderResource,
-		uint16 InNumMips = 1,
+		uint8 InNumMips = 1,
 		bool InAutowritable = true)
 	{
 		check(InSizeX);
@@ -132,11 +188,8 @@ public:
 		NewDesc.NumMips = InNumMips;
 		NewDesc.NumSamples = 1;
 		NewDesc.Format = InFormat;
-		NewDesc.Flags = InFlags;
-		NewDesc.TargetableFlags = InTargetableFlags;
-		NewDesc.bForceSeparateTargetAndShaderResource = bInForceSeparateTargetAndShaderResource;
+		NewDesc.Flags = InFlags | InTargetableFlags;
 		NewDesc.DebugName = TEXT("UnknownTextureVolume");
-		NewDesc.AutoWritable = InAutowritable;
 		check(NewDesc.Is3DTexture());
 		return NewDesc;
 	}
@@ -152,8 +205,8 @@ public:
 		ETextureCreateFlags InFlags,
 		ETextureCreateFlags InTargetableFlags,
 		bool bInForceSeparateTargetAndShaderResource,
-		uint32 InArraySize = 1,
-		uint16 InNumMips = 1,
+		uint16 InArraySize = 1,
+		uint8 InNumMips = 1,
 		bool InAutowritable = true)
 	{
 		check(InExtent);
@@ -169,11 +222,8 @@ public:
 		NewDesc.NumMips = InNumMips;
 		NewDesc.NumSamples = 1;
 		NewDesc.Format = InFormat;
-		NewDesc.Flags = InFlags;
-		NewDesc.TargetableFlags = InTargetableFlags;
-		NewDesc.bForceSeparateTargetAndShaderResource = bInForceSeparateTargetAndShaderResource;
+		NewDesc.Flags = InFlags | InTargetableFlags;
 		NewDesc.DebugName = TEXT("UnknownTextureCube");
-		NewDesc.AutoWritable = InAutowritable;
 		check(NewDesc.IsCubemap());
 
 		return NewDesc;
@@ -190,8 +240,8 @@ public:
 		ETextureCreateFlags InFlags,
 		ETextureCreateFlags InTargetableFlags,
 		bool bInForceSeparateTargetAndShaderResource,
-		uint32 InArraySize,
-		uint16 InNumMips = 1,
+		uint16 InArraySize,
+		uint8 InNumMips = 1,
 		bool InAutowritable = true)
 	{
 		check(InExtent);
@@ -206,11 +256,8 @@ public:
 		NewDesc.NumMips = InNumMips;
 		NewDesc.NumSamples = 1;
 		NewDesc.Format = InFormat;
-		NewDesc.Flags = InFlags;
-		NewDesc.TargetableFlags = InTargetableFlags;
-		NewDesc.bForceSeparateTargetAndShaderResource = bInForceSeparateTargetAndShaderResource;
+		NewDesc.Flags = InFlags | InTargetableFlags;
 		NewDesc.DebugName = TEXT("UnknownTextureCubeArray");
-		NewDesc.AutoWritable = InAutowritable;
 		check(NewDesc.IsCubemap());
 
 		return NewDesc;
@@ -230,8 +277,8 @@ public:
 		
 		return ClearValue == rhs.ClearValue
 			&& LhsFlags == RhsFlags
-			&& TargetableFlags == rhs.TargetableFlags
 			&& Format == rhs.Format
+			&& UAVFormat == rhs.UAVFormat
 			&& Extent == rhs.Extent
 			&& Depth == rhs.Depth
 			&& ArraySize == rhs.ArraySize
@@ -278,7 +325,7 @@ public:
 		}
 
 		return Extent.X != 0 && NumMips != 0 && NumSamples >=1 && NumSamples <=16 && Format != PF_Unknown
-			&& ((TargetableFlags & TexCreate_UAV) == 0 || GMaxRHIFeatureLevel == ERHIFeatureLevel::SM5 || GMaxRHIFeatureLevel == ERHIFeatureLevel::ES3_1);
+			&& (EnumHasAnyFlags(Flags, TexCreate_UAV) || GMaxRHIFeatureLevel >= ERHIFeatureLevel::SM5 || GMaxRHIFeatureLevel == ERHIFeatureLevel::ES3_1);
 	}
 
 	FIntVector GetSize() const
@@ -296,13 +343,13 @@ public:
 
 		FString FlagsString = TEXT("");
 
-		ETextureCreateFlags LocalFlags = Flags | TargetableFlags;
+		ETextureCreateFlags LocalFlags = Flags;
 
-		if(LocalFlags & TexCreate_RenderTargetable)
+		if(EnumHasAnyFlags(LocalFlags, TexCreate_RenderTargetable))
 		{
 			FlagsString += TEXT(" RT");
 		}
-		if(LocalFlags & TexCreate_SRGB)
+		if(EnumHasAnyFlags(LocalFlags, TexCreate_SRGB))
 		{
 			FlagsString += TEXT(" sRGB");
 		}
@@ -310,19 +357,14 @@ public:
 		{
 			FlagsString += FString::Printf(TEXT(" %dxMSAA"), NumSamples);
 		}
-		if(LocalFlags & TexCreate_UAV)
+		if(EnumHasAnyFlags(LocalFlags, TexCreate_UAV))
 		{
 			FlagsString += TEXT(" UAV");
 		}
 
-		if(LocalFlags & TexCreate_FastVRAM)
+		if(EnumHasAnyFlags(LocalFlags, TexCreate_FastVRAM))
 		{
 			FlagsString += TEXT(" VRam");
-		}
-
-		if (LocalFlags & TexCreate_Transient)
-		{
-			FlagsString += TEXT(" Transient");
 		}
 
 		FString ArrayString;
@@ -356,13 +398,9 @@ public:
 		// Usually we don't want to propagate MSAA samples.
 		NumSamples = 1;
 
-		bForceSeparateTargetAndShaderResource = false;
-		bForceSharedTargetAndShaderResource = false;
-		AutoWritable = true;
-
 		// Remove UAV flag for rendertargets that don't need it (some formats are incompatible)
-		TargetableFlags |= TexCreate_RenderTargetable;
-		TargetableFlags &= (~TexCreate_UAV);
+		Flags |= TexCreate_RenderTargetable;
+		Flags &= (~TexCreate_UAV);
 	}
 
 	/** only set a pointer to memory that never gets released */
@@ -372,9 +410,12 @@ public:
 	/** The flags that must be set on both the shader-resource and the targetable texture. bit mask combined from elements of ETextureCreateFlags e.g. TexCreate_UAV */
 	ETextureCreateFlags Flags = TexCreate_None;
 	/** The flags that must be set on the targetable texture. bit mask combined from elements of ETextureCreateFlags e.g. TexCreate_UAV */
+	UE_DEPRECATED(5.0, "TargetableFlags has been deprecated. Use Flags instead.")
 	ETextureCreateFlags TargetableFlags = TexCreate_None;
 	/** Texture format e.g. PF_B8G8R8A8 */
 	EPixelFormat Format = PF_Unknown;
+	/** Texture format used when creating the UAV (if TexCreate_UAV is also passed in TargetableFlags, ignored otherwise). PF_Unknown == use default (same as Format) */
+	EPixelFormat UAVFormat = PF_Unknown;
 	/** In pixels, (0,0) if not set, (x,0) for cube maps, todo: make 3d int vector for volume textures */
 	FIntPoint Extent = FIntPoint::ZeroValue;
 	/** 0, unless it's texture array or volume texture */
@@ -395,14 +436,19 @@ public:
 			/** true if a cubemap texture */
 			uint8 bIsCubemap : 1;
 			/** Whether the shader-resource and targetable texture must be separate textures. */
+			UE_DEPRECATED(5.0, "bForceSeparateTargetAndShaderResource has been deprecated. Do not use.")
 			uint8 bForceSeparateTargetAndShaderResource : 1;
 			/** Whether the shader-resource and targetable texture must be the same resource. */
+			UE_DEPRECATED(5.0, "bForceSharedTargetAndShaderResource has been deprecated. Do not use.")
 			uint8 bForceSharedTargetAndShaderResource : 1;
 			/** automatically set to writable via barrier during */
+			UE_DEPRECATED(5.0, "AutoWritable has been deprecated. Do not use.")
 			uint8 AutoWritable : 1;
 			/** create render target write mask (supported only on specific platforms) */
+			UE_DEPRECATED(5.0, "bCreateRenderTargetWriteMask has been deprecated. Do not use.")
 			uint8 bCreateRenderTargetWriteMask : 1;
 			/** create render target fmask (supported only on specific platforms) */
+			UE_DEPRECATED(5.0, "bCreateRenderTargetFmask has been deprecated. Do not use.")
 			uint8 bCreateRenderTargetFmask : 1;
 			/** Unused flag. */
 			uint8 bReserved0 : 1;
@@ -412,7 +458,7 @@ public:
 };
 
 /** Enum to select between the two RHI textures on a pooled render target. */
-enum class ERenderTargetTexture : uint8
+enum class UE_DEPRECATED(5.0, "ERenderTargetTexture is deprecated. IPooledRenderTarget now only has shared texture.") ERenderTargetTexture : uint8
 {
 	/** Maps to the targetable RHI texture on a pooled render target item. */
 	Targetable,
@@ -436,13 +482,18 @@ struct FSceneRenderTargetItem
 		,	UAV(InUAV)
 	{}
 
+PRAGMA_DISABLE_DEPRECATION_WARNINGS
+	FSceneRenderTargetItem(const FSceneRenderTargetItem&) = default;
+	FSceneRenderTargetItem(FSceneRenderTargetItem&&) = default;
+	FSceneRenderTargetItem& operator=(const FSceneRenderTargetItem&) = default;
+	FSceneRenderTargetItem& operator=(FSceneRenderTargetItem&&) = default;
+PRAGMA_ENABLE_DEPRECATION_WARNINGS
+
 	void SafeRelease()
 	{
 		TargetableTexture.SafeRelease();
 		ShaderResourceTexture.SafeRelease();
 		UAV.SafeRelease();
-		RTWriteMaskSRV.SafeRelease();
-		FmaskSRV.SafeRelease();
 	}
 
 	bool IsValid() const
@@ -452,10 +503,12 @@ struct FSceneRenderTargetItem
 			|| UAV != 0;
 	}
 
-	FRHITexture* GetRHI(ERenderTargetTexture Texture) const
-	{
-		return Texture == ERenderTargetTexture::Targetable ? TargetableTexture : ShaderResourceTexture;
-	}
+	FRHITexture* GetRHI() const { return TargetableTexture; }
+
+	UE_DEPRECATED(5.0, "GetRHI with ERenderTargetTexture is deprecated. Use GetRHI() instead.")
+PRAGMA_DISABLE_DEPRECATION_WARNINGS
+	FRHITexture* GetRHI(ERenderTargetTexture) const { return TargetableTexture; }
+PRAGMA_ENABLE_DEPRECATION_WARNINGS
 
 	/** The 2D or cubemap texture that may be used as a render or depth-stencil target. */
 	FTextureRHIRef TargetableTexture;
@@ -465,9 +518,22 @@ struct FSceneRenderTargetItem
 	
 	/** only created if requested through the flag. */
 	FUnorderedAccessViewRHIRef UAV;
-	
+
+	UE_DEPRECATED(5.0, "RTWriteMaskSRV is deprecated. Use RDG instead.")
 	FShaderResourceViewRHIRef RTWriteMaskSRV;
+
+	UE_DEPRECATED(5.0, "FmaskSRV is deprecated. Use RDG instead.")
 	FShaderResourceViewRHIRef FmaskSRV;
+
+	/** only created if requested through meta data access flags */
+	UE_DEPRECATED(5.0, "HTileUAV is deprecated. Use RDG instead.")
+	FUnorderedAccessViewRHIRef HTileUAV;
+
+	UE_DEPRECATED(5.0, "HTileSRV is deprecated. Use RDG instead.")
+	FShaderResourceViewRHIRef  HTileSRV;
+
+	UE_DEPRECATED(5.0, "StencilUAV is deprecated. Use RDG instead.")
+	FUnorderedAccessViewRHIRef StencilUAV;
 };
 
 /**
@@ -479,43 +545,50 @@ struct IPooledRenderTarget
 
 	/** Checks if the reference count indicated that the rendertarget is unused and can be reused. */
 	virtual bool IsFree() const = 0;
+	
 	/** Get all the data that is needed to create the render target. */
 	virtual const FPooledRenderTargetDesc& GetDesc() const = 0;
-	/** @param InName must not be 0 */
-	virtual void SetDebugName(const TCHAR *InName) = 0;
+	
 	/**
 	 * Only for debugging purpose
 	 * @return in bytes
 	 **/
 	virtual uint32 ComputeMemorySize() const = 0;
+
 	/** Get the low level internals (texture/surface) */
+	UE_DEPRECATED(5.1, "GetRenderTargetItem is deprecated. Use GetRHI() and GetUAV() instead.")
 	inline FSceneRenderTargetItem& GetRenderTargetItem() { return RenderTargetItem; }
+
 	/** Get the low level internals (texture/surface) */
+	UE_DEPRECATED(5.1, "GetRenderTargetItem is deprecated. Use GetRHI() and GetUAV() instead.")
 	inline const FSceneRenderTargetItem& GetRenderTargetItem() const { return RenderTargetItem; }
+
 	/** Returns if the render target is tracked by a pool. */
 	virtual bool IsTracked() const = 0;
-	/** Returns true if the render target is compatible with RDG. */
-	virtual bool IsCompatibleWithRDG() const { return false; }
+
+	/** Returns a transient texture if this is a container for one. */
+	virtual FRHITransientTexture* GetTransientTexture() const { return nullptr; }
 
 	// Refcounting
 	virtual uint32 AddRef() const = 0;
 	virtual uint32 Release() = 0;
 	virtual uint32 GetRefCount() const = 0;
 
-	FORCEINLINE FRHITexture* GetTargetableRHI() const
-	{
-		return RenderTargetItem.TargetableTexture.GetReference();
-	}
+	FRHITexture* GetRHI() const { return RenderTargetItem.TargetableTexture; }
 
-	FORCEINLINE FRHITexture* GetShaderResourceRHI() const
-	{
-		return RenderTargetItem.ShaderResourceTexture.GetReference();
-	}
+	UE_DEPRECATED(5.0, "Use GetRHI instead.")
+	FRHITexture* GetTargetableRHI() const { return GetRHI(); }
 
-	FORCEINLINE FRHITexture* GetRHI(ERenderTargetTexture Texture) const
-	{
-		return Texture == ERenderTargetTexture::Targetable ? GetTargetableRHI() : GetShaderResourceRHI();
-	}
+	UE_DEPRECATED(5.0, "Use GetRHI instead.")
+	FRHITexture* GetShaderResourceRHI() const { return GetRHI(); }
+
+	UE_DEPRECATED(5.0, "Use GetRHI without ERenderTargetTexture instead.")
+PRAGMA_DISABLE_DEPRECATION_WARNINGS
+	FRHITexture* GetRHI(ERenderTargetTexture) const { return GetRHI(); }
+PRAGMA_ENABLE_DEPRECATION_WARNINGS
+
+	UE_DEPRECATED(5.0, "SetDebugName has been deprecated.")
+	virtual void SetDebugName(const TCHAR* InName) {}
 
 protected:
 
@@ -551,15 +624,18 @@ public:
 	FIntRect ViewportRect;
 	FMatrix ViewMatrix;
 	FMatrix ProjMatrix;
-	FRHITexture2D* DepthTexture = nullptr;
-	FRHITexture2D* NormalTexture = nullptr;
-	FRHITexture2D* VelocityTexture = nullptr;
-	FRHITexture2D* SmallDepthTexture = nullptr;
-	FRHICommandListImmediate* RHICmdList = nullptr;
+	FRDGTexture* ColorTexture = nullptr;
+	FRDGTexture* DepthTexture = nullptr;
+	FRDGTexture* NormalTexture = nullptr;
+	FRDGTexture* VelocityTexture = nullptr;
+	FRDGTexture* SmallDepthTexture = nullptr;
+	FRDGBuilder* GraphBuilder = nullptr;
 	FRHIUniformBuffer* ViewUniformBuffer = nullptr;
-	TUniformBufferRef<FSceneTextureUniformParameters> SceneTexturesUniformParams;
+	TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTexturesUniformParams = nullptr;
+	TRDGUniformBufferRef<FMobileSceneTextureUniformParameters> MobileSceneTexturesUniformParams = nullptr;
 	const FGlobalDistanceFieldParameterData* GlobalDistanceFieldParams = nullptr;
 	void* Uid = nullptr; // A unique identifier for the view.
+	const FViewInfo* View = nullptr; 
 };
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnPostOpaqueRender, class FPostOpaqueRenderParameters&);
 typedef FOnPostOpaqueRender::FDelegate FPostOpaqueRenderDelegate;
@@ -594,7 +670,7 @@ class FPixelInspectorRequest
 public:
 	FPixelInspectorRequest()
 	{
-		SourceViewportUV = FVector2D(-1, -1);
+		SourceViewportUV = FVector2f(-1, -1);
 		BufferIndex = -1;
 		RenderingCommandSend = false;
 		RequestComplete = true;
@@ -606,7 +682,7 @@ public:
 		PreExposure = 1;
 	}
 
-	void SetRequestData(FVector2D SrcViewportUV, int32 TargetBufferIndex, int32 ViewUniqueId, int32 GBufferFormat, bool StaticLightingEnable, float InPreExposure)
+	void SetRequestData(FVector2f SrcViewportUV, int32 TargetBufferIndex, int32 ViewUniqueId, int32 GBufferFormat, bool StaticLightingEnable, float InPreExposure)
 	{
 		SourceViewportUV = SrcViewportUV;
 		BufferIndex = TargetBufferIndex;
@@ -630,7 +706,7 @@ public:
 	int32 FrameCountAfterRenderingCommandSend;
 	int32 RequestTickSinceCreation;
 	bool RequestComplete;
-	FVector2D SourceViewportUV;
+	FVector2f SourceViewportUV;
 	int32 BufferIndex;
 	int32 ViewId;
 
@@ -648,6 +724,33 @@ public:
 	virtual void BeginRenderView(const FSceneView* View, bool bShouldWaitForJobs = true) {}
 	virtual void EndFrame() {}
 };
+
+/**
+ */
+class IScenePrimitiveRenderingContext
+{
+public:
+	virtual ~IScenePrimitiveRenderingContext()
+	{
+	}
+};
+
+struct FScenePrimitiveRenderingContextScopeHelper
+{
+	FScenePrimitiveRenderingContextScopeHelper(IScenePrimitiveRenderingContext* InScenePrimitiveRenderingContext)
+	: ScenePrimitiveRenderingContext(InScenePrimitiveRenderingContext)
+	{
+	}
+
+	~FScenePrimitiveRenderingContextScopeHelper()
+	{
+		// GPUCULL_TODO: Is new/delete reasonable here?
+		delete ScenePrimitiveRenderingContext;
+	}
+
+	IScenePrimitiveRenderingContext* ScenePrimitiveRenderingContext;
+};
+
 
 /**
  * The public interface of the renderer module.
@@ -682,23 +785,30 @@ public:
 	virtual void UpdateStaticDrawListsForMaterials(const TArray<const FMaterial*>& Materials) = 0;
 
 	/** Allocates a new instance of the private scene manager implementation of FSceneViewStateInterface */
-	virtual class FSceneViewStateInterface* AllocateViewState() = 0;
+	virtual class FSceneViewStateInterface* AllocateViewState(ERHIFeatureLevel::Type FeatureLevel) = 0;
+	virtual class FSceneViewStateInterface* AllocateViewState(ERHIFeatureLevel::Type FeatureLevel, FSceneViewStateInterface* ShareOriginTarget) = 0;
+
+	UE_DEPRECATED(5.0, "AllocateViewState must be called with an appropriate RHI Feature Level")
+	inline FSceneViewStateInterface* AllocateViewState()
+	{
+		return AllocateViewState(GMaxRHIFeatureLevel);
+	}
 
 	/** @return The number of lights that affect a primitive. */
 	virtual uint32 GetNumDynamicLightsAffectingPrimitive(const class FPrimitiveSceneInfo* PrimitiveSceneInfo,const class FLightCacheInterface* LCI) = 0;
 
-	/** Forces reallocation of scene render targets. */
-	virtual void ReallocateSceneRenderTargets() = 0;
+	UE_DEPRECATED(5.0, "ReallocateSceneRenderTargets is deprecated and no longer necessary. Please remove.")
+	virtual void ReallocateSceneRenderTargets() {}
 
 	virtual void OnWorldCleanup(UWorld* World, bool bSessionEnded, bool bCleanupResources, bool bWorldChanged) = 0;
 
-	/** Sets the buffer size of the render targets. */
-	virtual void SceneRenderTargetsSetBufferSize(uint32 SizeX, uint32 SizeY) = 0;
+	UE_DEPRECATED(5.0, "SceneRenderTargetsSetBufferSize is deprecated and no longer necessary. Please remove.")
+	virtual void SceneRenderTargetsSetBufferSize(uint32 SizeX, uint32 SizeY) {}
 
 	virtual void InitializeSystemTextures(FRHICommandListImmediate& RHICmdList) = 0;
 
 	/** Draws a tile mesh element with the specified view. */
-	virtual void DrawTileMesh(FRHICommandListImmediate& RHICmdList, struct FMeshPassProcessorRenderState& DrawRenderState, const FSceneView& View, FMeshBatch& Mesh, bool bIsHitTesting, const class FHitProxyId& HitProxyId, bool bUse128bitRT = false) = 0;
+	virtual void DrawTileMesh(FCanvasRenderContext& RenderContext, struct FMeshPassProcessorRenderState& DrawRenderState, const FSceneView& View, FMeshBatch& Mesh, bool bIsHitTesting, const class FHitProxyId& HitProxyId, bool bUse128bitRT = false) = 0;
 
 	virtual const TSet<FSceneInterface*>& GetAllocatedScenes() = 0;
 
@@ -753,7 +863,7 @@ public:
 	virtual void RemoveOverlayRenderDelegate(FDelegateHandle OverlayRenderDelegate) = 0;
 
 	/** Delegate that is called upon resolving scene color. */
-	DECLARE_MULTICAST_DELEGATE_TwoParams(FOnResolvedSceneColor, FRHICommandListImmediate& /*RHICmdList*/, class FSceneRenderTargets& /*SceneContext*/);
+	DECLARE_MULTICAST_DELEGATE_TwoParams(FOnResolvedSceneColor, FRDGBuilder& /*GraphBuilder*/, const FSceneTextures& /*SceneTextures*/);
 
 	/** Accessor for post scene color resolve delegates */
 	virtual FOnResolvedSceneColor& GetResolvedSceneColorCallbacks() = 0;
@@ -775,16 +885,45 @@ public:
 	virtual uint32 RemoveAllVirtualTextureProducerDestroyedCallbacks(const void* Baton) = 0;
 	virtual void ReleaseVirtualTexturePendingResources() = 0;
 
-	/**	Provided a list of packed virtual texture tile ids, let the VT system request them. Note this should be called as long as the tiles are needed.*/
 	virtual void RequestVirtualTextureTiles(const FVector2D& InScreenSpaceSize, int32 InMipLevel) = 0;
-	virtual void RequestVirtualTextureTilesForRegion(IAllocatedVirtualTexture* AllocatedVT, const FVector2D& InScreenSpaceSize, const FIntRect& InTextureRegion, int32 InMipLevel) = 0;
+	virtual void RequestVirtualTextureTiles(const FMaterialRenderProxy* InMaterialRenderProxy, const FVector2D& InScreenSpaceSize, ERHIFeatureLevel::Type InFeatureLevel) = 0;
+	virtual void RequestVirtualTextureTilesForRegion(IAllocatedVirtualTexture* AllocatedVT, const FVector2D& InScreenSpaceSize, const FVector2D& InViewportPosition, const FVector2D& InViewportSize, const FVector2D& InUV0, const FVector2D& InUV1, int32 InMipLevel) = 0;
 
 	/** Ensure that any tiles requested by 'RequestVirtualTextureTilesForRegion' are loaded, must be called from render thread */
 	virtual void LoadPendingVirtualTextureTiles(FRHICommandListImmediate& RHICmdList, ERHIFeatureLevel::Type FeatureLevel) = 0;
 
+	/** Allocate a buffer and record all virtual texture page requests until the next call to either SetVirtualTextureRequestRecordBuffer or GetVirtualTextureRequestRecordBuffer. */
+	virtual void SetVirtualTextureRequestRecordBuffer(uint64 Handle) = 0;
+	/** Fetch the virtual texture page requests recorded since the last call to SetVirtualTextureRequestRecordBuffer. Returns the handle that was passed in. */
+	virtual uint64 GetVirtualTextureRequestRecordBuffer(TSet<uint64>& OutPageRequests) = 0;
+	/**	Request an array of virtual texture page requests that was captured with SetVirtualTextureRequestRecordBuffer. Note that the array will be moved and ownership is taken. */
+	virtual void RequestVirtualTextureTiles(TArray<uint64>&& InPageRequests) = 0;
+
 	/** Evict all data from virtual texture caches*/
 	virtual void FlushVirtualTextureCache() = 0;
 
+	/** Allocate a buffer and record all nanite page requests until the next call to either SetNaniteRequestRecordBuffer or GetNaniteRequestRecordBuffer. */
+	virtual void SetNaniteRequestRecordBuffer(uint64 Handle) = 0;
+	/** Fetch the page requests recorded since the last call to SetNaniteRequestRecordBuffer. Returns the handle that was passed in. */
+	virtual uint64 GetNaniteRequestRecordBuffer(TArray<uint32>& OutRequestData) = 0;
+	/**	Request Nanite pages that were captured with SetNaniteRequestRecordBuffer. Note that the array will be moved and ownership is taken. */
+	virtual void RequestNanitePages(TArrayView<uint32> InRequestData) = 0;
+
+	/**	Start prefetching streaming data for Nanite resource that will soon be used for rendering. TODO: Implement callback mechanism */
+	virtual void PrefetchNaniteResource(const Nanite::FResources* Resource, uint32 NumFramesUntilRender) = 0;
+
 	virtual void RegisterPersistentViewUniformBufferExtension(IPersistentViewUniformBufferExtension* Extension) = 0;
+
+	/**
+	 * Prepare Scene primitive rendering and return context. Ensures all primitives that are created are commited and GPU-Scene is updated and allocates a dynamic primitive context.
+	 * The intended use is for stand-alone rendering that involves Scene proxies (that then may need the machinery to render GPU-Scene aware primitives.
+	 */
+	virtual IScenePrimitiveRenderingContext* BeginScenePrimitiveRendering(FRDGBuilder& GraphBuilder, FSceneViewFamily* ViewFamily) = 0;
+
+	/** Mark all the current scenes as needing to restart path tracer accumulation */
+	virtual void InvalidatePathTracedOutput() = 0;
+
+	/** Experimental:  Render multiple view families in a single scene render call.  All families must reference the same FScene.  Scene Capture not yet supported. */
+	virtual void BeginRenderingViewFamilies(FCanvas* Canvas, TArrayView<FSceneViewFamily*> ViewFamilies) = 0;
 };
 

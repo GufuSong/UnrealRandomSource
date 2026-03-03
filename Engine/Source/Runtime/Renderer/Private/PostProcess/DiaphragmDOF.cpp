@@ -17,7 +17,7 @@
 #include "ScenePrivate.h"
 #include "ClearQuad.h"
 #include "SpriteIndexBuffer.h"
-#include "TemporalAA.h"
+#include "PostProcess/TemporalAA.h"
 #include "SceneTextureParameters.h"
 #include "TranslucentRendering.h"
 
@@ -264,7 +264,7 @@ const int32 kMaxMipLevelCount = 4;
 const int32 kMinGatheringRingCount = 3;
 
 /** Maximum number of ring for slight out of focus pass. Same as USH's MAX_RECOMBINE_ABS_COC_RADIUS. */
-const int32 kMaxSlightOutOfFocusRingCount = 3;
+const int32 kMaxSlightOutOfFocusCocRadius = 3;
 
 /** Maximum quality level of the recombine pass. */
 const int32 kMaxRecombineQuality = 2;
@@ -390,15 +390,15 @@ const TCHAR* GetEventName(EDiaphragmDOFDilateCocMode e)
 }
 
 // Returns X and Y for F(M) = saturate(M * X + Y) so that F(LowM) = 0 and F(HighM) = 1
-FVector2D GenerateSaturatedAffineTransformation(float LowM, float HighM)
+FVector2f GenerateSaturatedAffineTransformation(float LowM, float HighM)
 {
 	float X = 1.0f / (HighM - LowM);
-	return FVector2D(X, -X * LowM);
+	return FVector2f(X, -X * LowM);
 }
 
 // Affine transformtations that always return 0 or 1.
-const FVector2D kContantlyPassingAffineTransformation(0, 1);
-const FVector2D kContantlyBlockingAffineTransformation(0, 0);
+const FVector2f kContantlyPassingAffineTransformation(0, 1);
+const FVector2f kContantlyBlockingAffineTransformation(0, 0);
 
 
 /** Base shader class for diaphragm DOF. */
@@ -471,7 +471,6 @@ class FDDOFLayerProcessingDim  : SHADER_PERMUTATION_ENUM_CLASS("DIM_LAYER_PROCES
 class FDDOFGatherRingCountDim  : SHADER_PERMUTATION_RANGE_INT("DIM_GATHER_RING_COUNT", kMinGatheringRingCount, 3);
 class FDDOFGatherQualityDim    : SHADER_PERMUTATION_ENUM_CLASS("DIM_GATHER_QUALITY", EDiaphragmDOFGatherQuality);
 class FDDOFPostfilterMethodDim : SHADER_PERMUTATION_ENUM_CLASS("DIM_POSTFILTER_METHOD", EDiaphragmDOFPostfilterMethod);
-class FDDOFClampInputUVDim     : SHADER_PERMUTATION_BOOL("DIM_CLAMP_INPUT_UV");
 class FDDOFRGBColorBufferDim   : SHADER_PERMUTATION_BOOL("DIM_RGB_COLOR_BUFFER");
 
 class FDDOFBokehSimulationDim  : SHADER_PERMUTATION_ENUM_CLASS("DIM_BOKEH_SIMULATION", EDiaphragmDOFBokehSimulation);
@@ -618,8 +617,13 @@ END_SHADER_PARAMETER_STRUCT()
 
 
 BEGIN_SHADER_PARAMETER_STRUCT(FDOFCocModelShaderParameters, )
-	SHADER_PARAMETER(FVector4, CocModelParameters)
-	SHADER_PARAMETER(FVector2D, DepthBlurParameters)
+	SHADER_PARAMETER(float, CocInfinityRadius)
+	SHADER_PARAMETER(float, CocMinRadius)
+	SHADER_PARAMETER(float, CocMaxRadius)
+	SHADER_PARAMETER(float, CocSqueeze)
+	SHADER_PARAMETER(float, CocInvSqueeze)
+	SHADER_PARAMETER(float, DepthBlurRadius)
+	SHADER_PARAMETER(float, DepthBlurExponent)
 END_SHADER_PARAMETER_STRUCT()
 
 void SetCocModelParameters(
@@ -627,12 +631,20 @@ void SetCocModelParameters(
 	const DiaphragmDOF::FPhysicalCocModel& CocModel,
 	float CocRadiusBasis = 1.0f)
 {
-	OutParameters->CocModelParameters.X = CocRadiusBasis * CocModel.InfinityBackgroundCocRadius;
-	OutParameters->CocModelParameters.Y = CocRadiusBasis * CocModel.MinForegroundCocRadius;
-	OutParameters->CocModelParameters.Z = CocRadiusBasis * CocModel.MaxBackgroundCocRadius;
-	OutParameters->DepthBlurParameters.X = CocModel.DepthBlurExponent;
-	OutParameters->DepthBlurParameters.Y = CocRadiusBasis * CocModel.MaxDepthBlurRadius;
+	OutParameters->CocInfinityRadius = CocRadiusBasis * CocModel.InfinityBackgroundCocRadius;
+	OutParameters->CocMinRadius = CocRadiusBasis * CocModel.MinForegroundCocRadius;
+	OutParameters->CocMaxRadius = CocRadiusBasis * CocModel.MaxBackgroundCocRadius;
+	OutParameters->CocSqueeze = CocModel.Squeeze;
+	OutParameters->CocInvSqueeze = 1.0f / CocModel.Squeeze;
+	OutParameters->DepthBlurRadius = CocRadiusBasis * CocModel.MaxDepthBlurRadius;
+	OutParameters->DepthBlurExponent = CocModel.DepthBlurExponent;
 }
+
+
+BEGIN_SHADER_PARAMETER_STRUCT(FDOFTileDecisionParameters, )
+	SHADER_PARAMETER(float, MinGatherRadius)
+	SHADER_PARAMETER(float, SlightOutOfFocusRadiusBoundary)
+END_SHADER_PARAMETER_STRUCT()
 
 } // namespace
 
@@ -645,7 +657,7 @@ namespace
 /** Returns whether hybrid scattering is supported. */
 static FORCEINLINE bool SupportsHybridScatter(EShaderPlatform ShaderPlatform)
 {
-	return !IsSwitchPlatform(ShaderPlatform);
+	return !!FDataDrivenShaderPlatformInfo::GetSupportsDOFHybridScattering(ShaderPlatform);
 }
 
 
@@ -676,10 +688,7 @@ static FORCEINLINE bool SupportsRGBColorBuffer(EShaderPlatform ShaderPlatform)
 	}
 
 	// There is high number of UAV to write in reduce pass.
-	return ShaderPlatform == SP_PS4
-		|| ShaderPlatform == SP_XBOXONE_D3D12
-		|| ShaderPlatform == SP_VULKAN_SM5
-		|| FDataDrivenShaderPlatformInfo::GetSupportsRGBColorBuffer(ShaderPlatform);
+	return FDataDrivenShaderPlatformInfo::GetSupportsRGBColorBuffer(ShaderPlatform);
 }
 
 
@@ -697,7 +706,7 @@ class FDiaphragmDOFSetupCS : public FDiaphragmDOFShader
 		SHADER_PARAMETER_STRUCT_INCLUDE(FDOFCocModelShaderParameters, CocModel)
 
 		SHADER_PARAMETER(FIntRect, ViewportRect)
-		SHADER_PARAMETER(FVector2D, CocRadiusBasis) // TODO: decompose
+		SHADER_PARAMETER(FVector2f, CocRadiusBasis) // TODO: decompose
 
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
@@ -719,17 +728,17 @@ class FDiaphragmDOFCocFlattenCS : public FDiaphragmDOFShader
 	
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(FIntRect, ViewportRect)
-		SHADER_PARAMETER(FVector2D, ThreadIdToBufferUV)
-		SHADER_PARAMETER(FVector2D, MaxBufferUV)
+		SHADER_PARAMETER(FVector2f, ThreadIdToBufferUV)
+		SHADER_PARAMETER(FVector2f, MaxBufferUV)
 		
 		SHADER_PARAMETER_STRUCT_INCLUDE(FDOFCommonShaderParameters, CommonParameters)
 		SHADER_PARAMETER_STRUCT(FDOFGatherInputTextures, GatherInput)
 		SHADER_PARAMETER_STRUCT(FDOFTileClassificationUAVs, TileOutput)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static_assert(FSceneViewScreenPercentageConfig::kMinTAAUpsampleResolutionFraction == 0.5f,
+	static_assert(ISceneViewFamilyScreenPercentage::kMinTAAUpsampleResolutionFraction == 0.5f,
 		"Gather4 shader permutation assumes with min TAAU screen percentage = 50%.");
-	static_assert(FSceneViewScreenPercentageConfig::kMaxTAAUpsampleResolutionFraction == 2.0f,
+	static_assert(ISceneViewFamilyScreenPercentage::kMaxTAAUpsampleResolutionFraction == 2.0f,
 		"Gather4 shader permutation assumes with max TAAU screen percentage = 200%.");
 };
 
@@ -770,10 +779,10 @@ class FDiaphragmDOFDownsampleCS : public FDiaphragmDOFShader
 	
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(FIntRect, ViewportRect)
-		SHADER_PARAMETER(FVector2D, MaxBufferUV)
+		SHADER_PARAMETER(FVector2f, MaxBufferUV)
 		SHADER_PARAMETER(float, OutputCocRadiusMultiplier)
 
-		SHADER_PARAMETER(FVector4, GatherInputSize)
+		SHADER_PARAMETER(FVector4f, GatherInputSize)
 		SHADER_PARAMETER_STRUCT(FDOFGatherInputTextures, GatherInput)
 
 		SHADER_PARAMETER_STRUCT_INCLUDE(FDOFCommonShaderParameters, CommonParameters)
@@ -854,19 +863,20 @@ class FDiaphragmDOFReduceCS : public FDiaphragmDOFShader
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(FIntRect, ViewportRect)
-		SHADER_PARAMETER(FVector2D, MaxInputBufferUV)
+		SHADER_PARAMETER(FVector2f, MaxInputBufferUV)
 		SHADER_PARAMETER(int32, MaxScatteringGroupCount)
 		SHADER_PARAMETER(float, PreProcessingToProcessingCocRadiusFactor)
 		SHADER_PARAMETER(float, MinScatteringCocRadius)
 		SHADER_PARAMETER(float, NeighborCompareMaxColor)
+		SHADER_PARAMETER(float, CocSqueeze)
 		
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, EyeAdaptationTexture)
 		SHADER_PARAMETER_STRUCT_INCLUDE(FDOFCommonShaderParameters, CommonParameters)
 
-		SHADER_PARAMETER(FVector4, GatherInputSize)
+		SHADER_PARAMETER(FVector4f, GatherInputSize)
 		SHADER_PARAMETER_STRUCT(FDOFGatherInputSRVs, GatherInput)
 		
-		SHADER_PARAMETER(FVector4, QuarterResGatherInputSize)
+		SHADER_PARAMETER(FVector4f, QuarterResGatherInputSize)
 		SHADER_PARAMETER_STRUCT(FDOFGatherInputTextures, QuarterResGatherInput)
 
 		SHADER_PARAMETER_STRUCT_ARRAY(FDOFGatherInputUAVs, OutputMips, [kMaxMipLevelCount])
@@ -930,8 +940,10 @@ class FDiaphragmDOFBuildBokehLUTCS : public FDiaphragmDOFShader
 		SHADER_PARAMETER(float, CocRadiusToIncircleRadius)
 		SHADER_PARAMETER(float, DiaphragmBladeRadius)
 		SHADER_PARAMETER(float, DiaphragmBladeCenterOffset)
+		SHADER_PARAMETER(float, CocSqueeze)
+		SHADER_PARAMETER(float, CocInvSqueeze)
 
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWStructuredBuffer<float4>, BokehLUTOutput)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, BokehLUTOutput)
 	END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -945,7 +957,6 @@ class FDiaphragmDOFGatherCS : public FDiaphragmDOFShader
 		FDDOFGatherRingCountDim,
 		FDDOFBokehSimulationDim,
 		FDDOFGatherQualityDim,
-		FDDOFClampInputUVDim,
 		FDDOFRGBColorBufferDim>;
 
 	static FPermutationDomain RemapPermutation(FPermutationDomain PermutationVector)
@@ -953,19 +964,12 @@ class FDiaphragmDOFGatherCS : public FDiaphragmDOFShader
 		// There is a lot of permutation, so no longer compile permutation.
 		if (1)
 		{
-			// Alway clamp input buffer UV.
-			PermutationVector.Set<FDDOFClampInputUVDim>(true);
-
 			// Alway simulate bokeh generically.
 			if (PermutationVector.Get<FDDOFBokehSimulationDim>() == EDiaphragmDOFBokehSimulation::SimmetricBokeh)
 			{
 				PermutationVector.Set<FDDOFBokehSimulationDim>(EDiaphragmDOFBokehSimulation::GenericBokeh);
 			}
 		}
-
-		// Slight out of focus only need 3 rings.
-		if (PermutationVector.Get<FDDOFLayerProcessingDim>() == EDiaphragmDOFLayerProcessing::SlightOutOfFocus)
-			PermutationVector.Set<FDDOFGatherRingCountDim>(kMaxSlightOutOfFocusRingCount);
 
 		return PermutationVector;
 	}
@@ -1030,10 +1034,6 @@ class FDiaphragmDOFGatherCS : public FDiaphragmDOFShader
 		}
 		else if (PermutationVector.Get<FDDOFLayerProcessingDim>() == EDiaphragmDOFLayerProcessing::SlightOutOfFocus)
 		{
-			// Slight out of focus gather pass does not need large radius since only accumulating only
-			// abs(CocRadius) < kMaxSlightOutOfFocusRingCount.
-			if (PermutationVector.Get<FDDOFGatherRingCountDim>() > kMaxSlightOutOfFocusRingCount) return false;
-
 			// Slight out of focus don't need to output CocVariance since there is no hybrid scattering.
 			if (PermutationVector.Get<FDDOFGatherQualityDim>() == EDiaphragmDOFGatherQuality::HighQualityWithHybridScatterOcclusion) return false;
 
@@ -1043,9 +1043,11 @@ class FDiaphragmDOFGatherCS : public FDiaphragmDOFShader
 			// Slight out of focus doesn't have cinematic quality, yet.
 			if (PermutationVector.Get<FDDOFGatherQualityDim>() == EDiaphragmDOFGatherQuality::Cinematic) return false;
 
+			// Number of rings is dynamic in the shader.
+			if (PermutationVector.Get<FDDOFGatherRingCountDim>() != kMinGatheringRingCount) return false;
+
 			// Storing Coc independently of RGB is only supported for RecombineQuality == 0.
-			if (PermutationVector.Get<FDDOFRGBColorBufferDim>())
-				return false;
+			if (PermutationVector.Get<FDDOFRGBColorBufferDim>()) return false;
 		}
 		else if (PermutationVector.Get<FDDOFLayerProcessingDim>() == EDiaphragmDOFLayerProcessing::BackgroundOnly)
 		{
@@ -1072,33 +1074,32 @@ class FDiaphragmDOFGatherCS : public FDiaphragmDOFShader
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
 	{
-		// The gathering pass shader code gives a really hard time to the HLSL compiler. To improve
-		// iteration time on the shader, only pass down a /O1 instead of /O3.
-		if (Parameters.Platform == SP_PCD3D_SM5)
-		{
-			OutEnvironment.CompilerFlags.Add(CFLAG_StandardOptimization);
-		}
-
 		FDiaphragmDOFShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+
+		// This shader takes a very long time to compile with FXC, so we pre-compile it with DXC first and then forward the optimized HLSL to FXC.
+		OutEnvironment.CompilerFlags.Add(CFLAG_PrecompileWithDXC);
 	}
 
 	
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER(FVector4, ViewportSize)
+		SHADER_PARAMETER(FVector4f, ViewportSize)
 		SHADER_PARAMETER(FIntRect, ViewportRect)
-		SHADER_PARAMETER(FVector2D, TemporalJitterPixels)
-		SHADER_PARAMETER(FVector2D, DispatchThreadIdToInputBufferUV)
-		SHADER_PARAMETER(FVector2D, ConsiderCocRadiusAffineTransformation0)
-		SHADER_PARAMETER(FVector2D, ConsiderCocRadiusAffineTransformation1)
-		SHADER_PARAMETER(FVector2D, ConsiderAbsCocRadiusAffineTransformation)
-		SHADER_PARAMETER(FVector2D, InputBufferUVToOutputPixel)
+		SHADER_PARAMETER(FVector2f, TemporalJitterPixels)
+		SHADER_PARAMETER(FVector2f, DispatchThreadIdToInputBufferUV)
+		SHADER_PARAMETER(FVector2f, ConsiderCocRadiusAffineTransformation0)
+		SHADER_PARAMETER(FVector2f, ConsiderCocRadiusAffineTransformation1)
+		SHADER_PARAMETER(FVector2f, ConsiderAbsCocRadiusAffineTransformation)
+		SHADER_PARAMETER(FVector2f, InputBufferUVToOutputPixel)
 		SHADER_PARAMETER(float, MipBias)
 		SHADER_PARAMETER(float, MaxRecombineAbsCocRadius)
-		
+		SHADER_PARAMETER(float, CocSqueeze)
+		SHADER_PARAMETER(float, CocInvSqueeze)
+
+		SHADER_PARAMETER_STRUCT_INCLUDE(FDOFTileDecisionParameters, TileDecisionParameters)
 		SHADER_PARAMETER_STRUCT_INCLUDE(FDOFCommonShaderParameters, CommonParameters)
 
-		SHADER_PARAMETER(FVector4, GatherInputSize)
-		SHADER_PARAMETER(FVector2D, GatherInputViewportSize)
+		SHADER_PARAMETER(FVector4f, GatherInputSize)
+		SHADER_PARAMETER(FVector2f, GatherInputViewportSize)
 		SHADER_PARAMETER_STRUCT(FDOFGatherInputTextures, GatherInput)
 
 		SHADER_PARAMETER_STRUCT(FDOFTileClassificationTextures, TileClassification)
@@ -1106,6 +1107,7 @@ class FDiaphragmDOFGatherCS : public FDiaphragmDOFShader
 
 		SHADER_PARAMETER_STRUCT(FDOFConvolutionUAVs, ConvolutionOutput)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ScatterOcclusionOutput)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DebugOutput)
 	END_SHADER_PARAMETER_STRUCT()
 }; // class FDiaphragmDOFGatherCS
 
@@ -1139,33 +1141,36 @@ class FDiaphragmDOFPostfilterCS : public FDiaphragmDOFShader
 	
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(FIntRect, ViewportRect)
-		SHADER_PARAMETER(FVector2D, MaxInputBufferUV)
-		SHADER_PARAMETER(float, MinGatherRadius)
+		SHADER_PARAMETER(FVector2f, MaxInputBufferUV)
 		
+		SHADER_PARAMETER_STRUCT_INCLUDE(FDOFTileDecisionParameters, TileDecisionParameters)
 		SHADER_PARAMETER_STRUCT_INCLUDE(FDOFCommonShaderParameters, CommonParameters)
 
-		SHADER_PARAMETER(FVector4, ConvolutionInputSize)
+		SHADER_PARAMETER(FVector4f, ConvolutionInputSize)
 		SHADER_PARAMETER_STRUCT(FDOFConvolutionTextures, ConvolutionInput)
 
 		SHADER_PARAMETER_STRUCT(FDOFTileClassificationTextures, TileClassification)
 		SHADER_PARAMETER_STRUCT(FDOFConvolutionUAVs, ConvolutionOutput)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DebugOutput)
 	END_SHADER_PARAMETER_STRUCT()
 }; // class FDiaphragmDOFPostfilterCS
 
 BEGIN_SHADER_PARAMETER_STRUCT(FDOFHybridScatterParameters, )
-	SHADER_PARAMETER(FVector4, ViewportSize)
+	SHADER_PARAMETER(FVector4f, ViewportSize)
 	SHADER_PARAMETER(float, CocRadiusToCircumscribedRadius)
 	SHADER_PARAMETER(float, ScatteringScaling)
+	SHADER_PARAMETER(float, CocSqueeze)
+	SHADER_PARAMETER(float, CocInvSqueeze)
 	
 	SHADER_PARAMETER_STRUCT_INCLUDE(FDOFCommonShaderParameters, CommonParameters)
 	
-	SHADER_PARAMETER(FVector4, ScatterOcclusionSize)
+	SHADER_PARAMETER(FVector4f, ScatterOcclusionSize)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ScatterOcclusion)
 
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, BokehLUT)
 
-	SHADER_PARAMETER_RDG_BUFFER(Buffer<uint>, IndirectDrawParameter)
 	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, ScatterDrawList)
+	RDG_BUFFER_ACCESS(IndirectDrawParameter, ERHIAccess::IndirectArgs)
 
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
@@ -1260,10 +1265,11 @@ class FDiaphragmDOFRecombineCS : public FDiaphragmDOFShader
 		SHADER_PARAMETER_STRUCT_INCLUDE(FDOFCocModelShaderParameters, CocModel)
 
 		SHADER_PARAMETER(FIntRect, ViewportRect)
-		SHADER_PARAMETER(FVector4, ViewportSize)
-		SHADER_PARAMETER(FVector2D, TemporalJitterPixels)
-		SHADER_PARAMETER(FVector2D, DOFBufferUVMax)
-		SHADER_PARAMETER(FVector4, SeparateTranslucencyBilinearUVMinMax)
+		SHADER_PARAMETER(FVector4f, ViewportSize)
+		SHADER_PARAMETER(FVector2f, TemporalJitterPixels)
+		SHADER_PARAMETER(FVector2f, DOFBufferUVMax)
+		SHADER_PARAMETER(FVector4f, SeparateTranslucencyBilinearUVMinMax)
+		SHADER_PARAMETER(int32, SeparateTranslucencyUpscaling)
 		
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, BokehLUT)
 
@@ -1272,16 +1278,20 @@ class FDiaphragmDOFRecombineCS : public FDiaphragmDOFShader
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneSeparateCoc)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneSeparateTranslucency)
-		SHADER_PARAMETER_SAMPLER(SamplerState, SceneSeparateTranslucencySampler)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneSeparateTranslucencyModulateColor)
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, LowResDepthTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, FullResDepthTexture)
 
 		// Half res convolution textures.
-		SHADER_PARAMETER(FVector4, ConvolutionInputSize)
+		SHADER_PARAMETER(FVector4f, ConvolutionInputSize)
 		SHADER_PARAMETER_STRUCT(FDOFConvolutionTextures, ForegroundConvolution)
 		SHADER_PARAMETER_STRUCT(FDOFConvolutionTextures, ForegroundHoleFillingConvolution)
 		SHADER_PARAMETER_STRUCT(FDOFConvolutionTextures, SlightOutOfFocusConvolution)
 		SHADER_PARAMETER_STRUCT(FDOFConvolutionTextures, BackgroundConvolution)
+		SHADER_PARAMETER(FVector2f, SeparateTranslucencyTextureLowResExtentInverse)
 
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture<float4>, SceneColorOutput)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, SceneColorOutput)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DebugOutput)
 	END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -1311,8 +1321,8 @@ bool DiaphragmDOF::IsEnabled(const FViewInfo& View)
 		DiaphragmDOF::IsSupported(View.GetShaderPlatform()) &&
 		View.Family->EngineShowFlags.DepthOfField &&
 		bDepthOfFieldRequestedByCVar &&
-		View.FinalPostProcessSettings.DepthOfFieldFstop > 0 &&
-		View.FinalPostProcessSettings.DepthOfFieldFocalDistance > 0;
+		!(View.Family->EngineShowFlags.PathTracing && View.FinalPostProcessSettings.PathTracingEnableReferenceDOF) &&
+		((View.FinalPostProcessSettings.DepthOfFieldFstop > 0.f && View.FinalPostProcessSettings.DepthOfFieldFocalDistance > 0.f) || View.FinalPostProcessSettings.DepthOfFieldDepthBlurRadius > 0.f);
 }
 
 FRDGTextureRef DiaphragmDOF::AddPasses(
@@ -1320,7 +1330,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 	const FSceneTextureParameters& SceneTextures,
 	const FViewInfo& View,
 	FRDGTextureRef InputSceneColor,
-	const FSeparateTranslucencyTextures& SeparateTranslucencyTextures)
+	const FTranslucencyPassResources& TranslucencyPassResources)
 {
 	if (View.Family->EngineShowFlags.VisualizeDOF)
 	{
@@ -1361,7 +1371,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 
 	// Slight out of focus is not supporting with DOF's TAA upsampling, because of the brute force
 	// kernel used in GatherCS for slight out of focus stability buffer.
-	const bool bSupportsSlightOutOfFocus = View.PrimaryScreenPercentageMethod != EPrimaryScreenPercentageMethod::TemporalUpscale;
+	const bool bSupportsSlightOutOfFocus = true; // View.PrimaryScreenPercentageMethod != EPrimaryScreenPercentageMethod::TemporalUpscale;
 
 	// Quality setting for the recombine pass.
 	const int32 RecombineQuality = bSupportsSlightOutOfFocus ? FMath::Clamp(CVarRecombineQuality.GetValueOnRenderThread(), 0, kMaxRecombineQuality) : 0;
@@ -1427,7 +1437,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 		TAAParameters.SetupViewRect(View, PrefilteringResolutionDivisor);
 		TAAParameters.TopLeftCornerViewRects();
 
-		TAAParameters.bUseFast = CVarDOFTemporalAAQuality.GetValueOnRenderThread() == 0;
+		TAAParameters.Quality = CVarDOFTemporalAAQuality.GetValueOnRenderThread() == 0 ? ETAAQuality::Medium : ETAAQuality::High;
 	}
 
 	// Size of the view in GatherColorSetup.
@@ -1435,7 +1445,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 	FIntPoint PreprocessViewSize = FIntPoint::DivideAndRoundUp(FullResViewSize, PrefilteringResolutionDivisor);
 	FIntPoint GatheringViewSize = PreprocessViewSize;
 
-	if (View.AntiAliasingMethod == AAM_TemporalAA && ViewState)
+	if (IsTemporalAccumulationBasedMethod(View.AntiAliasingMethod) && ViewState)
 	{
 		PreprocessViewSize = FIntPoint::DivideAndRoundUp(TAAParameters.OutputViewRect.Size(), PrefilteringResolutionDivisor);
 	}
@@ -1477,6 +1487,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 	RDG_GPU_STAT_SCOPE(GraphBuilder, DepthOfField);
 	RDG_EVENT_SCOPE(GraphBuilder, "DOF(Alpha=%s)", bProcessSceneAlpha ? TEXT("Yes") : TEXT("No"));
 
+	bool bGatherBackground = MaxBackgroundCocRadius > kMinimalAbsGatherPassCocRadius;
 	bool bGatherForeground = AbsMaxForegroundCocRadius > kMinimalAbsGatherPassCocRadius;
 	
 	const bool bEnableGatherBokehSettings = (
@@ -1485,12 +1496,12 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 	const bool bEnableScatterBokehSettings = CVarEnableScatterBokehSettings.GetValueOnRenderThread() == 1;
 	const bool bEnableSlightOutOfFocusBokeh = bSupportGatheringBokehSimulation && bRecombineDoesSlightOutOfFocus && CVarEnableRecombineBokehSettings.GetValueOnRenderThread();
 		
-	// Setup all the desciptors.
+	// Setup all the descriptors.
 	FRDGTextureDesc FullResDesc;
 	{
 		FullResDesc = InputSceneColor->Desc;
 
-		// Reset so that the number of samples of decsriptor becomes 1, which is totally legal still with MSAA because
+		// Reset so that the number of samples of descriptor becomes 1, which is totally legal still with MSAA because
 		// the scene color will already be resolved to ShaderResource texture that is always 1. This is to work around
 		// hack that MSAA will have targetable texture with MSAA != shader resource, and still have descriptor indicating
 		// the number of samples of the targetable resource.
@@ -1532,8 +1543,8 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 
 	// Setup at lower resolution from full resolution scene color and scene depth.
 	{
-		FullResGatherInputTextures = CreateTextures(GraphBuilder, FullResGatherInputDescs, TEXT("DOFFullResSetup"));
-		HalfResGatherInputTextures = CreateTextures(GraphBuilder, HalfResGatherInputDescs, TEXT("DOFHalfResSetup"));
+		FullResGatherInputTextures = CreateTextures(GraphBuilder, FullResGatherInputDescs, TEXT("DOF.FullResSetup"));
+		HalfResGatherInputTextures = CreateTextures(GraphBuilder, HalfResGatherInputDescs, TEXT("DOF.HalfResSetup"));
 
 		bool bOutputFullResolution = bRecombineDoesSlightOutOfFocus && !bProcessSceneAlpha;
 		bool bOutputHalfResolution = true; // TODO: there is a useless shader permutation.
@@ -1568,7 +1579,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			PassParameters->CommonParameters = CommonParameters;
 			SetCocModelParameters(&PassParameters->CocModel, CocModel, CocRadiusBasis);
 			PassParameters->ViewportRect = FIntRect(FIntPoint::ZeroValue, PassViewSize);
-			PassParameters->CocRadiusBasis = FVector2D(GatheringViewSize.X, PreprocessViewSize.X);
+			PassParameters->CocRadiusBasis = FVector2f(GatheringViewSize.X, PreprocessViewSize.X);
 			PassParameters->SceneColorTexture = InputSceneColor;
 			PassParameters->SceneDepthTexture = SceneTextures.SceneDepthTexture;
 		
@@ -1615,7 +1626,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 	}
 	
 	// TAA the setup for the convolution to be temporally stable.
-	if (View.AntiAliasingMethod == AAM_TemporalAA && ViewState)
+	if (IsTemporalAccumulationBasedMethod(View.AntiAliasingMethod) && ViewState)
 	{
 		TAAParameters.SceneDepthTexture = SceneTextures.SceneDepthTexture;
 		TAAParameters.SceneVelocityTexture = SceneTextures.GBufferVelocityTexture;
@@ -1660,18 +1671,18 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			FIntPoint SrcSize = HalfResGatherInputTextures.SceneColor->Desc.Extent;
 
 			static const TCHAR* OutputDebugNames[2] = {
-				TEXT("DOFFlattenFgdCoc"),
-				TEXT("DOFFlattenBgdCoc"),
+				TEXT("DOF.FlattenFgdCoc"),
+				TEXT("DOF.FlattenBgdCoc"),
 			};
 			FlattenedTileClassificationTextures = CreateTextures(GraphBuilder, TileClassificationDescs, OutputDebugNames);
 
 			FDiaphragmDOFCocFlattenCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDiaphragmDOFCocFlattenCS::FParameters>();
 			PassParameters->CommonParameters = CommonParameters;
 			PassParameters->ViewportRect = FIntRect(0, 0, GatheringViewSize.X, GatheringViewSize.Y);
-			PassParameters->ThreadIdToBufferUV = FVector2D(
+			PassParameters->ThreadIdToBufferUV = FVector2f(
 				PreprocessViewSize.X / float(GatheringViewSize.X * SrcSize.X),
 				PreprocessViewSize.Y / float(GatheringViewSize.Y * SrcSize.Y));
-			PassParameters->MaxBufferUV = FVector2D(
+			PassParameters->MaxBufferUV = FVector2f(
 				(PreprocessViewSize.X - 1.0f) / float(SrcSize.X),
 				(PreprocessViewSize.Y - 1.0f) / float(SrcSize.Y));
 			PassParameters->GatherInput = HalfResGatherInputTextures;
@@ -1707,13 +1718,13 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 		{
 			FDOFTileClassificationDescs OutputDescs = TileClassificationDescs;
 			const TCHAR* OutputDebugNames[2] = {
-				TEXT("DOFDilateFgdCoc"),
-				TEXT("DOFDilateBgdCoc"),
+				TEXT("DOF.DilateFgdCoc"),
+				TEXT("DOF.DilateBgdCoc"),
 			};
 			if (Mode == EDiaphragmDOFDilateCocMode::MinForegroundAndMaxBackground)
 			{
-				OutputDebugNames[0] = TEXT("DOFDilateMinFgdCoc");
-				OutputDebugNames[1] = TEXT("DOFDilateMaxBgdCoc");
+				OutputDebugNames[0] = TEXT("DOF.DilateMinFgdCoc");
+				OutputDebugNames[1] = TEXT("DOF.DilateMaxBgdCoc");
 				OutputDescs.Foreground.Format = PF_R16F;
 				OutputDescs.Background.Format = PF_R16F;
 			}
@@ -1871,7 +1882,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 				ReducedGatherInputDescs.SeparateCoc.Format = PF_R16F;
 			}
 
-			ReducedGatherInputTextures = CreateTextures(GraphBuilder, ReducedGatherInputDescs, TEXT("DOFReduce"));
+			ReducedGatherInputTextures = CreateTextures(GraphBuilder, ReducedGatherInputDescs, TEXT("DOF.Reduce"));
 		}
 
 		// Downsample the gather color setup to have faster neighborhood comparisons.
@@ -1888,7 +1899,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 				if (bRGBBufferSeparateCocBuffer && !bProcessSceneAlpha)
 					QuarterResGatherInputDescs.SceneColor.Format = PF_FloatR11G11B10;
 			
-				QuarterResGatherInputTextures = CreateTextures(GraphBuilder, QuarterResGatherInputDescs, TEXT("DOFDownsample"));
+				QuarterResGatherInputTextures = CreateTextures(GraphBuilder, QuarterResGatherInputDescs, TEXT("DOF.Downsample"));
 			}
 
 			FIntPoint PassViewSize = FIntPoint::DivideAndRoundUp(PreprocessViewSize, 2);
@@ -1896,12 +1907,12 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			FDiaphragmDOFDownsampleCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDiaphragmDOFDownsampleCS::FParameters>();
 			PassParameters->CommonParameters = CommonParameters;
 			PassParameters->ViewportRect = FIntRect(0, 0, PassViewSize.X, PassViewSize.Y);
-			PassParameters->MaxBufferUV = FVector2D(
+			PassParameters->MaxBufferUV = FVector2f(
 				(PreprocessViewSize.X - 0.5f) / float(SrcSize.X),
 				(PreprocessViewSize.Y - 0.5f) / float(SrcSize.Y));
 			PassParameters->OutputCocRadiusMultiplier = PreProcessingToProcessingCocRadiusFactor;
 
-			PassParameters->GatherInputSize = FVector4(SrcSize.X, SrcSize.Y, 1.0f / SrcSize.X, 1.0f / SrcSize.Y);
+			PassParameters->GatherInputSize = FVector4f(SrcSize.X, SrcSize.Y, 1.0f / SrcSize.X, 1.0f / SrcSize.Y);
 			PassParameters->GatherInput = HalfResGatherInputTextures;
 
 			PassParameters->OutDownsampledGatherInput = CreateUAVs(GraphBuilder, QuarterResGatherInputTextures);
@@ -1922,9 +1933,9 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 
 			FRDGBufferDesc DrawListDescs = FRDGBufferDesc::CreateStructuredDesc(sizeof(float) * 4, 5 * MaxScatteringGroupCount);
 			if (bForegroundHybridScattering)
-				ForegroundScatterDrawListBuffer = GraphBuilder.CreateBuffer(DrawListDescs, TEXT("DOFForegroundDrawList"));
+				ForegroundScatterDrawListBuffer = GraphBuilder.CreateBuffer(DrawListDescs, TEXT("DOF.ForegroundDrawList"));
 			if (bBackgroundHybridScattering)
-				BackgroundScatterDrawListBuffer = GraphBuilder.CreateBuffer(DrawListDescs, TEXT("DOFBackgroundDrawList"));
+				BackgroundScatterDrawListBuffer = GraphBuilder.CreateBuffer(DrawListDescs, TEXT("DOF.BackgroundDrawList"));
 		}
 		
 		// Number of mip level that has been reduced.
@@ -1944,21 +1955,22 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 
 			FDiaphragmDOFReduceCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDiaphragmDOFReduceCS::FParameters>();
 			PassParameters->ViewportRect = FIntRect(0, 0, PassViewSize.X, PassViewSize.Y);
-			PassParameters->MaxInputBufferUV = FVector2D(
+			PassParameters->MaxInputBufferUV = FVector2f(
 				(PreprocessViewSize.X - 0.5f) / SrcSize.X,
 				(PreprocessViewSize.Y - 0.5f) / SrcSize.Y);
 			PassParameters->MaxScatteringGroupCount = MaxScatteringGroupCount;
 			PassParameters->PreProcessingToProcessingCocRadiusFactor = PreProcessingToProcessingCocRadiusFactor;
 			PassParameters->MinScatteringCocRadius = MinScatteringCocRadius;
 			PassParameters->NeighborCompareMaxColor = CVarScatterNeighborCompareMaxColor.GetValueOnRenderThread();
+			PassParameters->CocSqueeze = CocModel.Squeeze;
 			
 			PassParameters->EyeAdaptationTexture = GetEyeAdaptationTexture(GraphBuilder, View);
 			PassParameters->CommonParameters = CommonParameters;
 
-			PassParameters->GatherInputSize = FVector4(SrcSize.X, SrcSize.Y, 1.0f / SrcSize.X, 1.0f / SrcSize.Y);
+			PassParameters->GatherInputSize = FVector4f(SrcSize.X, SrcSize.Y, 1.0f / SrcSize.X, 1.0f / SrcSize.Y);
 			PassParameters->GatherInput = CreateSRVs(GraphBuilder, HalfResGatherInputTextures);
 			
-			PassParameters->QuarterResGatherInputSize = FVector4(SrcSize.X / 2, SrcSize.Y / 2, 2.0f / SrcSize.X, 2.0f / SrcSize.Y);
+			PassParameters->QuarterResGatherInputSize = FVector4f(SrcSize.X / 2, SrcSize.Y / 2, 2.0f / SrcSize.X, 2.0f / SrcSize.Y);
 			PassParameters->QuarterResGatherInput = QuarterResGatherInputTextures;
 
 			for (int32 MipLevel = 0; MipLevel < ProcessingMipLevelCount; MipLevel++)
@@ -1996,9 +2008,10 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 		// Complete the reduction.
 		while (ReducedMipLevelCount < MipLevelCount)
 		{
-			int32 ProcessingMipLevelCount = FMath::Min(MipLevelCount - ReducedMipLevelCount, MaxReductionMipLevelCount);
+			int32 ProcessingMipLevelCount = FMath::Min(MipLevelCount - ReducedMipLevelCount, IsPostProcessingWithAlphaChannelSupported() ? 2 : (kMaxMipLevelCount - 1));
 			int32 InputMipLevel = ReducedMipLevelCount - 1;
 
+			FIntPoint GatherInputExtent = ReducedGatherInputTextures.SceneColor->Desc.Extent;
 			FIntPoint PassViewSize = FIntPoint::DivideAndRoundUp(PreprocessViewSize, 1 << InputMipLevel);
 
 			FDiaphragmDOFReduceCS::FPermutationDomain PermutationVector;
@@ -2008,15 +2021,15 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 
 			FDiaphragmDOFReduceCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDiaphragmDOFReduceCS::FParameters>();
 			PassParameters->ViewportRect = FIntRect(0, 0, PassViewSize.X, PassViewSize.Y);
-			PassParameters->MaxInputBufferUV = FVector2D(
-				(PreprocessViewSize.X - 0.5f) / SrcSize.X,
-				(PreprocessViewSize.Y - 0.5f) / SrcSize.Y);
+			PassParameters->MaxInputBufferUV = FVector2f(
+				(PreprocessViewSize.X - 0.5f) / GatherInputExtent.X,
+				(PreprocessViewSize.Y - 0.5f) / GatherInputExtent.Y);
 
 			PassParameters->EyeAdaptationTexture = GetEyeAdaptationTexture(GraphBuilder, View);
 			PassParameters->CommonParameters = CommonParameters;
 
 			float InputMipLevelPow2 = 1 << InputMipLevel;
-			PassParameters->GatherInputSize = FVector4(SrcSize.X / InputMipLevelPow2, SrcSize.Y / InputMipLevelPow2, InputMipLevelPow2 / SrcSize.X, InputMipLevelPow2 / SrcSize.Y);
+			PassParameters->GatherInputSize = FVector4f(GatherInputExtent.X / InputMipLevelPow2, GatherInputExtent.Y / InputMipLevelPow2, InputMipLevelPow2 / GatherInputExtent.X, InputMipLevelPow2 / GatherInputExtent.Y);
 			PassParameters->GatherInput = CreateSRVs(GraphBuilder, ReducedGatherInputTextures, InputMipLevel);
 
 			for (int32 MipLevel = 0; MipLevel < ProcessingMipLevelCount; MipLevel++)
@@ -2025,19 +2038,16 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			}
 
 			TShaderMapRef<FDiaphragmDOFReduceCS> ComputeShader(View.ShaderMap, PermutationVector);
-			ClearUnusedGraphResources(ComputeShader, PassParameters);
-			GraphBuilder.AddPass(
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
 				RDG_EVENT_NAME("DOF Reduce(Mips=[%d;%d]%s) %dx%d",
 					ReducedMipLevelCount,
 					ReducedMipLevelCount + ProcessingMipLevelCount - 1,
 					bRGBBufferSeparateCocBuffer ? TEXT(" R11G11B10") : TEXT(""),
 					PassViewSize.X, PassViewSize.Y),
+				ComputeShader,
 				PassParameters,
-				ERDGPassFlags::Compute,
-				[PassParameters, ComputeShader, PassViewSize](FRHICommandList& RHICmdList)
-			{
-				FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader, *PassParameters, FComputeShaderUtils::GetGroupCount(PassViewSize, kDefaultGroupSize));
-			});
+				FComputeShaderUtils::GetGroupCount(PassViewSize, kDefaultGroupSize));
 
 			ReducedMipLevelCount += ProcessingMipLevelCount;
 		}
@@ -2078,9 +2088,9 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 		}
 
 		static const TCHAR* const DebugNames[] = {
-			TEXT("DOFScatterBokehLUT"),
-			TEXT("DOFRecombineBokehLUT"),
-			TEXT("DOFGatherBokehLUT"),
+			TEXT("DOF.ScatterBokehLUT"),
+			TEXT("DOF.RecombineBokehLUT"),
+			TEXT("DOF.GatherBokehLUT"),
 		};
 
 		FRDGTextureDesc BokehLUTDesc = FRDGTextureDesc::Create2D(
@@ -2102,6 +2112,8 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 		PassParameters->CocRadiusToIncircleRadius = BokehModel.CocRadiusToIncircleRadius;
 		PassParameters->DiaphragmBladeRadius = BokehModel.RoundedBlades.DiaphragmBladeRadius;
 		PassParameters->DiaphragmBladeCenterOffset = BokehModel.RoundedBlades.DiaphragmBladeCenterOffset;
+		PassParameters->CocSqueeze = CocModel.Squeeze;
+		PassParameters->CocInvSqueeze = 1.0f / CocModel.Squeeze;
 		PassParameters->BokehLUTOutput = GraphBuilder.CreateUAV(BokehLUT);
 			
 		TShaderMapRef<FDiaphragmDOFBuildBokehLUTCS> ComputeShader(View.ShaderMap, PermutationVector);
@@ -2140,6 +2152,9 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			/** Bokeh simulation to do. */
 			EDiaphragmDOFBokehSimulation BokehSimulation;
 		
+			/** Number of rings. */
+			int32 RingCount;
+
 			/** Whether there is a scattering pass. */
 			bool bHasScatterPass = false;
 
@@ -2169,13 +2184,13 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 				{
 					const TCHAR* DebugName = nullptr;
 					if (ConvolutionSettings.LayerProcessing == EDiaphragmDOFLayerProcessing::ForegroundOnly)
-						DebugName = TEXT("DOFGatherForeground");
+						DebugName = TEXT("DOF.GatherForeground");
 					else if (ConvolutionSettings.LayerProcessing == EDiaphragmDOFLayerProcessing::ForegroundHoleFilling)
-						DebugName = TEXT("DOFGatherForegroundFill");
+						DebugName = TEXT("DOF.GatherForegroundFill");
 					else if (ConvolutionSettings.LayerProcessing == EDiaphragmDOFLayerProcessing::BackgroundOnly)
-						DebugName = TEXT("DOFGatherBackground");
+						DebugName = TEXT("DOF.GatherBackground");
 					else if (ConvolutionSettings.LayerProcessing == EDiaphragmDOFLayerProcessing::SlightOutOfFocus)
-						DebugName = TEXT("DOFGatherFocus");
+						DebugName = TEXT("DOF.GatherFocus");
 					else
 						check(0);
 
@@ -2201,7 +2216,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			
 					const TCHAR* DebugName = nullptr;
 					if (ConvolutionSettings.LayerProcessing == EDiaphragmDOFLayerProcessing::BackgroundOnly)
-						DebugName = TEXT("DOFScatterOcclusionBackground");
+						DebugName = TEXT("DOF.ScatterOcclusionBackground");
 					else
 						check(0);
 			
@@ -2217,23 +2232,22 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 
 			FDiaphragmDOFGatherCS::FPermutationDomain PermutationVector;
 			PermutationVector.Set<FDDOFLayerProcessingDim>(ConvolutionSettings.LayerProcessing);
-			PermutationVector.Set<FDDOFGatherRingCountDim>(HalfResRingCount);
+			PermutationVector.Set<FDDOFGatherRingCountDim>(ConvolutionSettings.RingCount);
 			PermutationVector.Set<FDDOFGatherQualityDim>(ConvolutionSettings.QualityConfig);
 			PermutationVector.Set<FDDOFBokehSimulationDim>(ConvolutionSettings.BokehSimulation);
-			PermutationVector.Set<FDDOFClampInputUVDim>(ReduceOutputRectMip0 != SrcSize);
 			PermutationVector.Set<FDDOFRGBColorBufferDim>(bRGBBufferSeparateCocBuffer);
 			PermutationVector = FDiaphragmDOFGatherCS::RemapPermutation(PermutationVector);
 
 			// Affine transformtation to control whether a CocRadius is considered or not.
-			FVector2D ConsiderCocRadiusAffineTransformation0 = kContantlyPassingAffineTransformation;
-			FVector2D ConsiderCocRadiusAffineTransformation1 = kContantlyPassingAffineTransformation;
-			FVector2D ConsiderAbsCocRadiusAffineTransformation = kContantlyPassingAffineTransformation;
+			FVector2f ConsiderCocRadiusAffineTransformation0 = kContantlyPassingAffineTransformation;
+			FVector2f ConsiderCocRadiusAffineTransformation1 = kContantlyPassingAffineTransformation;
+			FVector2f ConsiderAbsCocRadiusAffineTransformation = kContantlyPassingAffineTransformation;
 			{
 				// Gathering scalability.
 				const float GatheringScalingDownFactor = float(PreprocessViewSize.X) / float(GatheringViewSize.X);
 
 				// Coc radius considered.
-				const float RecombineCocRadiusBorder = GatheringScalingDownFactor * (kMaxSlightOutOfFocusRingCount - 1.0f);
+				const float RecombineCocRadiusBorder = GatheringScalingDownFactor * (kMaxSlightOutOfFocusCocRadius - 1.0f);
 
 				if (ConvolutionSettings.LayerProcessing == EDiaphragmDOFLayerProcessing::ForegroundOnly)
 				{
@@ -2268,25 +2282,29 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			}
 
 			FDiaphragmDOFGatherCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDiaphragmDOFGatherCS::FParameters>();
-			PassParameters->ViewportSize = FVector4(GatheringViewSize.X, GatheringViewSize.Y, 1.0f / GatheringViewSize.X, 1.0f / GatheringViewSize.Y);
+			PassParameters->ViewportSize = FVector4f(GatheringViewSize.X, GatheringViewSize.Y, 1.0f / GatheringViewSize.X, 1.0f / GatheringViewSize.Y);
 			PassParameters->ViewportRect = FIntRect(0, 0, GatheringViewSize.X, GatheringViewSize.Y);
-			PassParameters->TemporalJitterPixels = View.TemporalJitterPixels;
-			PassParameters->DispatchThreadIdToInputBufferUV = FVector2D(
+			PassParameters->TemporalJitterPixels = FVector2f(View.TemporalJitterPixels);	// LWC_TODO: Precision loss
+			PassParameters->DispatchThreadIdToInputBufferUV = FVector2f(
 				float(PreprocessViewSize.X) / float(GatheringViewSize.X * SrcSize.X),
 				float(PreprocessViewSize.Y) / float(GatheringViewSize.Y * SrcSize.Y));;
 			PassParameters->ConsiderCocRadiusAffineTransformation0 = ConsiderCocRadiusAffineTransformation0;
 			PassParameters->ConsiderCocRadiusAffineTransformation1 = ConsiderCocRadiusAffineTransformation1;
 			PassParameters->ConsiderAbsCocRadiusAffineTransformation = ConsiderAbsCocRadiusAffineTransformation;
-			PassParameters->InputBufferUVToOutputPixel = FVector2D(
+			PassParameters->InputBufferUVToOutputPixel = FVector2f(
 				float(SrcSize.X * GatheringViewSize.X) / float(PreprocessViewSize.X),
 				float(SrcSize.Y * GatheringViewSize.Y) / float(PreprocessViewSize.Y));
 			PassParameters->MipBias = FMath::Log2(float(PreprocessViewSize.X) / float(GatheringViewSize.X));
-			PassParameters->MaxRecombineAbsCocRadius = 3.0 * float(PreprocessViewSize.X) / float(GatheringViewSize.X);
+			PassParameters->MaxRecombineAbsCocRadius = float(kMaxSlightOutOfFocusCocRadius) / PreProcessingToProcessingCocRadiusFactor;
+			PassParameters->CocSqueeze = CocModel.Squeeze;
+			PassParameters->CocInvSqueeze = 1.0f / CocModel.Squeeze;
 
+			PassParameters->TileDecisionParameters.MinGatherRadius = PassParameters->MaxRecombineAbsCocRadius - 1;
+			PassParameters->TileDecisionParameters.SlightOutOfFocusRadiusBoundary = float(kMaxSlightOutOfFocusCocRadius) / PreProcessingToProcessingCocRadiusFactor;
 			PassParameters->CommonParameters = CommonParameters;
 		
-			PassParameters->GatherInputSize = FVector4(SrcSize.X, SrcSize.Y, 1.0f / SrcSize.X, 1.0f / SrcSize.Y);
-			PassParameters->GatherInputViewportSize = FVector2D(PreprocessViewSize.X, PreprocessViewSize.Y);
+			PassParameters->GatherInputSize = FVector4f(SrcSize.X, SrcSize.Y, 1.0f / SrcSize.X, 1.0f / SrcSize.Y);
+			PassParameters->GatherInputViewportSize = FVector2f(PreprocessViewSize.X, PreprocessViewSize.Y);
 			PassParameters->GatherInput = ReducedGatherInputTextures;
 		
 			PassParameters->TileClassification = TileClassificationTextures;
@@ -2297,16 +2315,24 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			{
 				PassParameters->ScatterOcclusionOutput = GraphBuilder.CreateUAV(*ScatterOcclusionTexture);
 			}
+
+			{
+				FRDGTextureDesc DebugDesc = FRDGTextureDesc::Create2D(
+					RefBufferSize,
+					PF_FloatRGBA,
+					FClearValueBinding::None,
+					TexCreate_ShaderResource | TexCreate_UAV);
+				PassParameters->DebugOutput = GraphBuilder.CreateUAV(GraphBuilder.CreateTexture(DebugDesc, TEXT("Debug.DOF.Gather")));
+			}
 			
 			TShaderMapRef<FDiaphragmDOFGatherCS> ComputeShader(View.ShaderMap, PermutationVector);
 			FComputeShaderUtils::AddPass(
 				GraphBuilder,
-				RDG_EVENT_NAME("DOF Gather(%s %s Bokeh=%s Rings=%d%s%s) %dx%d",
+				RDG_EVENT_NAME("DOF Gather(%s %s Bokeh=%s Rings=%d%s) %dx%d",
 					GetEventName(ConvolutionSettings.LayerProcessing),
 					GetEventName(ConvolutionSettings.QualityConfig),
 					GetEventName(ConvolutionSettings.BokehSimulation),
 					int32(PermutationVector.Get<FDDOFGatherRingCountDim>()),
-					PermutationVector.Get<FDDOFClampInputUVDim>() ? TEXT(" ClampUV") : TEXT(""),
 					PermutationVector.Get<FDDOFRGBColorBufferDim>() ? TEXT(" R11G11B10") : TEXT(""),
 					GatheringViewSize.X, GatheringViewSize.Y),
 				ComputeShader,
@@ -2351,17 +2377,26 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 
 			FDiaphragmDOFPostfilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDiaphragmDOFPostfilterCS::FParameters>();
 			PassParameters->ViewportRect = FIntRect(0, 0, GatheringViewSize.X, GatheringViewSize.Y);
-			PassParameters->MaxInputBufferUV = FVector2D(
+			PassParameters->MaxInputBufferUV = FVector2f(
 				(GatheringViewSize.X - 0.5f) / float(RefBufferSize.X),
 				(GatheringViewSize.Y - 0.5f) / float(RefBufferSize.Y));
-			PassParameters->MinGatherRadius = MaxRecombineAbsCocRadius - 1;
+			PassParameters->TileDecisionParameters.MinGatherRadius = MaxRecombineAbsCocRadius - 1;
 			PassParameters->CommonParameters = CommonParameters;
 
-			PassParameters->ConvolutionInputSize = FVector4(RefBufferSize.X, RefBufferSize.Y, 1.0f / RefBufferSize.X, 1.0f / RefBufferSize.Y);
+			PassParameters->ConvolutionInputSize = FVector4f(RefBufferSize.X, RefBufferSize.Y, 1.0f / RefBufferSize.X, 1.0f / RefBufferSize.Y);
 			PassParameters->ConvolutionInput = *ConvolutionTextures;
 
 			PassParameters->TileClassification = TileClassificationTextures;
 			PassParameters->ConvolutionOutput = CreateUAVs(GraphBuilder, NewConvolutionTextures);
+			
+			{
+				FRDGTextureDesc DebugDesc = FRDGTextureDesc::Create2D(
+					RefBufferSize,
+					PF_FloatRGBA,
+					FClearValueBinding::None,
+					TexCreate_ShaderResource | TexCreate_UAV);
+				PassParameters->DebugOutput = GraphBuilder.CreateUAV(GraphBuilder.CreateTexture(DebugDesc, TEXT("Debug.DOF.PostFilter")));
+			}
 
 			TShaderMapRef<FDiaphragmDOFPostfilterCS> ComputeShader(View.ShaderMap, PermutationVector);
 			FComputeShaderUtils::AddPass(
@@ -2404,13 +2439,15 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			TShaderMapRef<FDiaphragmDOFHybridScatterPS> PixelShader(View.ShaderMap, PermutationVector);
 
 			FDOFHybridScatterParameters* PassParameters = GraphBuilder.AllocParameters<FDOFHybridScatterParameters>();
-			PassParameters->ViewportSize = FVector4(GatheringViewSize.X, GatheringViewSize.Y, 1.0f / GatheringViewSize.X, 1.0f / GatheringViewSize.Y);
+			PassParameters->ViewportSize = FVector4f(GatheringViewSize.X, GatheringViewSize.Y, 1.0f / GatheringViewSize.X, 1.0f / GatheringViewSize.Y);
 			PassParameters->CocRadiusToCircumscribedRadius = BokehModel.CocRadiusToCircumscribedRadius;
 			PassParameters->ScatteringScaling = float(GatheringViewSize.X) / float(PreprocessViewSize.X);
+			PassParameters->CocSqueeze = CocModel.Squeeze;
+			PassParameters->CocInvSqueeze = 1.0 / CocModel.Squeeze;
 			PassParameters->CommonParameters = CommonParameters;
 			if (bEnableScatterBokehSettings)
 				PassParameters->BokehLUT = ScatteringBokehLUT;
-			PassParameters->ScatterOcclusionSize = FVector4(RefBufferSize.X, RefBufferSize.Y, 1.0f / RefBufferSize.X, 1.0f / RefBufferSize.Y);
+			PassParameters->ScatterOcclusionSize = FVector4f(RefBufferSize.X, RefBufferSize.Y, 1.0f / RefBufferSize.X, 1.0f / RefBufferSize.Y);
 			PassParameters->ScatterOcclusion = ScatterOcclusionTexture;
 			PassParameters->IndirectDrawParameter = DrawIndirectParametersBuffer;
 			PassParameters->ScatterDrawList = GraphBuilder.CreateSRV(ScatterDrawList);
@@ -2429,10 +2466,6 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 				ERDGPassFlags::Raster,
 				[PassParameters, VertexShader, PixelShader, GatheringViewSize, DrawIndirectParametersOffset](FRHICommandList& RHICmdList)
 			{
-#if PLATFORM_REQUIRES_UAV_TO_RTV_TEXTURE_CACHE_FLUSH_WORKAROUND
-				RHICmdList.RHIFlushTextureCacheBOP(PassParameters->RenderTargets[0].GetTexture()->GetRHI());
-#endif // #if PLATFORM_REQUIRES_UAV_TO_RTV_TEXTURE_CACHE_FLUSH_WORKAROUND
-
 				RHICmdList.SetViewport(0, 0, 0.0f, GatheringViewSize.X, GatheringViewSize.Y, 1.0f);
 
 				FGraphicsPipelineStateInitializer GraphicsPSOInit;
@@ -2444,7 +2477,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 				GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
 				GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
 				GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
-				SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit);
+				SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
 
 				SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), *PassParameters);
 				SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), *PassParameters);
@@ -2476,6 +2509,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			FConvolutionSettings ConvolutionSettings;
 			ConvolutionSettings.LayerProcessing = EDiaphragmDOFLayerProcessing::ForegroundOnly;
 			ConvolutionSettings.PostfilterMethod = PostfilterMethod;
+			ConvolutionSettings.RingCount = HalfResRingCount;
 			ConvolutionSettings.bHasScatterPass = bForegroundHybridScattering;
 
 			if (bEnableGatherBokehSettings)
@@ -2500,6 +2534,7 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			FConvolutionSettings ConvolutionSettings;
 			ConvolutionSettings.LayerProcessing = EDiaphragmDOFLayerProcessing::ForegroundHoleFilling;
 			ConvolutionSettings.PostfilterMethod = PostfilterMethod;
+			ConvolutionSettings.RingCount = HalfResRingCount;
 			
 			FRDGTextureRef ScatterOcclusionTexture = nullptr;
 			AddGatherPass(ConvolutionSettings, /* BokehLUT = */ nullptr, &ForegroundHoleFillingConvolutionTextures, &ScatterOcclusionTexture);
@@ -2513,6 +2548,9 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			if (bEnableSlightOutOfFocusBokeh)
 				ConvolutionSettings.BokehSimulation = BokehSimulation;
 
+			// Number of rings is dynamic in shader.
+			ConvolutionSettings.RingCount = kMinGatheringRingCount;
+
 			FRDGTextureRef ScatterOcclusionTexture = nullptr;
 			AddGatherPass(
 				ConvolutionSettings,
@@ -2521,10 +2559,12 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 		}
 
 		// Wire background gathering passes.
+		if (bGatherBackground)
 		{
 			FConvolutionSettings ConvolutionSettings;
 			ConvolutionSettings.LayerProcessing = EDiaphragmDOFLayerProcessing::BackgroundOnly;
 			ConvolutionSettings.PostfilterMethod = PostfilterMethod;
+			ConvolutionSettings.RingCount = HalfResRingCount;
 			ConvolutionSettings.bHasScatterPass = bBackgroundHybridScattering;
 
 			if (bEnableGatherBokehSettings)
@@ -2559,50 +2599,91 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 			FRDGTextureDesc Desc = InputSceneColor->Desc;
 			Desc.Reset();
 			Desc.Flags |= TexCreate_UAV;
-			NewSceneColor = GraphBuilder.CreateTexture(Desc, TEXT("DOFRecombine"));
+			NewSceneColor = GraphBuilder.CreateTexture(Desc, TEXT("DOF.Recombine"));
 		}
 
-		const FSeparateTranslucencyDimensions SeparateTranslucencyDimensions = SeparateTranslucencyTextures.GetDimensions();
-		const FIntRect SeparateTranslucencyRect = SeparateTranslucencyDimensions.GetViewport(View.ViewRect).Rect;
-		const bool bScaleSeparateTranslucency = SeparateTranslucencyDimensions.Scale != 1.0f;
+		bool bScaleSeparateTranslucency = false;
+		FScreenPassTextureViewport SeparateTranslucencyViewport;
+		if (TranslucencyPassResources.IsValid())
+		{
+			SeparateTranslucencyViewport = TranslucencyPassResources.GetTextureViewport();
+			bScaleSeparateTranslucency = SeparateTranslucencyViewport.Rect.Size() != FullResViewSize;
+		}
+		else
+		{
+			SeparateTranslucencyViewport = FScreenPassTextureViewport(FIntPoint(0, 0), FIntRect(0, 0, 1, 1));
+		}
 
 		FIntRect PassViewRect = View.ViewRect;
 
 		FDiaphragmDOFRecombineCS::FPermutationDomain PermutationVector;
-		PermutationVector.Set<FDDOFLayerProcessingDim>(bGatherForeground ? EDiaphragmDOFLayerProcessing::ForegroundAndBackground : EDiaphragmDOFLayerProcessing::BackgroundOnly); // TODO.
+		if (bGatherForeground && bGatherBackground)
+		{
+			PermutationVector.Set<FDDOFLayerProcessingDim>(EDiaphragmDOFLayerProcessing::ForegroundAndBackground);
+		}
+		else if (bGatherForeground && !bGatherBackground)
+		{
+			PermutationVector.Set<FDDOFLayerProcessingDim>(EDiaphragmDOFLayerProcessing::ForegroundOnly);
+		}
+		else if (!bGatherForeground && bGatherBackground)
+		{
+			PermutationVector.Set<FDDOFLayerProcessingDim>(EDiaphragmDOFLayerProcessing::BackgroundOnly);
+		}
+		else
+		{
+			PermutationVector.Set<FDDOFLayerProcessingDim>(EDiaphragmDOFLayerProcessing::BackgroundOnly);
+		}
+
 		if (bEnableSlightOutOfFocusBokeh)
 			PermutationVector.Set<FDDOFBokehSimulationDim>(BokehSimulation);
 		PermutationVector.Set<FDiaphragmDOFRecombineCS::FQualityDim>(RecombineQuality);
 
-		FRDGTextureRef SeparateTranslucency = SeparateTranslucencyTextures.GetColorForRead(GraphBuilder);
+		FRDGTextureRef SeparateTranslucency = TranslucencyPassResources.GetColorForRead(GraphBuilder);
+		FRDGTextureRef SeparateTranslucencyDepth = TranslucencyPassResources.GetDepthForRead(GraphBuilder);
+		FRDGTextureRef SeparateTranslucencyModulateColor = TranslucencyPassResources.GetColorModulateForRead(GraphBuilder);
 
 		FDiaphragmDOFRecombineCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDiaphragmDOFRecombineCS::FParameters>();
 		PassParameters->CommonParameters = CommonParameters;
 		SetCocModelParameters(&PassParameters->CocModel, CocModel, /* CocRadiusBasis = */ PassViewRect.Width() * 0.5f);
 
 		PassParameters->ViewportRect = PassViewRect;
-		PassParameters->ViewportSize = FVector4(PassViewRect.Width(), PassViewRect.Height(), 1.0f / PassViewRect.Width(), 1.0f / PassViewRect.Height());
-		PassParameters->TemporalJitterPixels = View.TemporalJitterPixels;
-		PassParameters->DOFBufferUVMax = FVector2D(
+		PassParameters->ViewportSize = FVector4f(PassViewRect.Width(), PassViewRect.Height(), 1.0f / PassViewRect.Width(), 1.0f / PassViewRect.Height());
+		PassParameters->TemporalJitterPixels = FVector2f(View.TemporalJitterPixels);	// LWC_TODO: Precision loss
+		PassParameters->DOFBufferUVMax = FVector2f(
 			(GatheringViewSize.X - 0.5f) / float(RefBufferSize.X),
 			(GatheringViewSize.Y - 0.5f) / float(RefBufferSize.Y));
-		
-		PassParameters->SeparateTranslucencyBilinearUVMinMax.X = (SeparateTranslucencyRect.Min.X + 0.5f) / float(SeparateTranslucencyDimensions.Extent.X);
-		PassParameters->SeparateTranslucencyBilinearUVMinMax.Y = (SeparateTranslucencyRect.Min.Y + 0.5f) / float(SeparateTranslucencyDimensions.Extent.Y);
-		PassParameters->SeparateTranslucencyBilinearUVMinMax.Z = (SeparateTranslucencyRect.Max.X - 0.5f) / float(SeparateTranslucencyDimensions.Extent.X);
-		PassParameters->SeparateTranslucencyBilinearUVMinMax.W = (SeparateTranslucencyRect.Max.Y - 0.5f) / float(SeparateTranslucencyDimensions.Extent.Y);
+
+		PassParameters->SeparateTranslucencyBilinearUVMinMax.X = (SeparateTranslucencyViewport.Rect.Min.X + 0.5f) / float(SeparateTranslucencyViewport.Extent.X);
+		PassParameters->SeparateTranslucencyBilinearUVMinMax.Y = (SeparateTranslucencyViewport.Rect.Min.Y + 0.5f) / float(SeparateTranslucencyViewport.Extent.Y);
+		PassParameters->SeparateTranslucencyBilinearUVMinMax.Z = (SeparateTranslucencyViewport.Rect.Max.X - 0.5f) / float(SeparateTranslucencyViewport.Extent.X);
+		PassParameters->SeparateTranslucencyBilinearUVMinMax.W = (SeparateTranslucencyViewport.Rect.Max.Y - 0.5f) / float(SeparateTranslucencyViewport.Extent.Y);
+		PassParameters->SeparateTranslucencyUpscaling = bScaleSeparateTranslucency ? 1 : 0;
 
 		PassParameters->SceneColorInput = FullResGatherInputTextures.SceneColor;
 		PassParameters->SceneDepthTexture = SceneTextures.SceneDepthTexture;
 		PassParameters->SceneSeparateCoc = FullResGatherInputTextures.SeparateCoc; // TODO looks useless.
 		PassParameters->SceneSeparateTranslucency = SeparateTranslucency;
-		PassParameters->SceneSeparateTranslucencySampler = bScaleSeparateTranslucency ? TStaticSamplerState<SF_Bilinear>::GetRHI() : TStaticSamplerState<SF_Point>::GetRHI();
+		PassParameters->SceneSeparateTranslucencyModulateColor = SeparateTranslucencyModulateColor;
 		
-		PassParameters->ConvolutionInputSize = FVector4(RefBufferSize.X, RefBufferSize.Y, 1.0f / RefBufferSize.X, 1.0f / RefBufferSize.Y);
+		PassParameters->ConvolutionInputSize = FVector4f(RefBufferSize.X, RefBufferSize.Y, 1.0f / RefBufferSize.X, 1.0f / RefBufferSize.Y);
 		PassParameters->ForegroundConvolution = ForegroundConvolutionTextures;
 		PassParameters->ForegroundHoleFillingConvolution = ForegroundHoleFillingConvolutionTextures;
 		PassParameters->SlightOutOfFocusConvolution = SlightOutOfFocusConvolutionTextures;
 		PassParameters->BackgroundConvolution = BackgroundConvolutionTextures;
+
+		// Separate translucency upsampling
+		PassParameters->FullResDepthTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMetaData(SceneTextures.SceneDepthTexture, ERDGTextureMetaDataAccess::Depth));
+		PassParameters->LowResDepthTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMetaData(SeparateTranslucencyDepth, ERDGTextureMetaDataAccess::Depth));
+		const FIntPoint LowResExtent = SeparateTranslucency->Desc.Extent;
+		PassParameters->SeparateTranslucencyTextureLowResExtentInverse = FVector2f(1.0f / LowResExtent.X, 1.0f / LowResExtent.Y);
+
+		if (!bGatherForeground && !bGatherBackground)
+		{
+			check(PassParameters->BackgroundConvolution.SceneColor == nullptr);
+			check(PassParameters->BackgroundConvolution.SeparateAlpha == nullptr);
+			PassParameters->BackgroundConvolution.SceneColor = GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
+			PassParameters->BackgroundConvolution.SeparateAlpha = GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
+		}
 
 		if (bEnableSlightOutOfFocusBokeh) // && ScatteringBokehLUTOutput.IsValid() && SlightOutOfFocusConvolutionOutput.IsValid())
 		{
@@ -2610,6 +2691,15 @@ FRDGTextureRef DiaphragmDOF::AddPasses(
 		}
 
 		PassParameters->SceneColorOutput = GraphBuilder.CreateUAV(NewSceneColor);
+
+		{
+			FRDGTextureDesc DebugDesc = FRDGTextureDesc::Create2D(
+				InputSceneColor->Desc.Extent,
+				PF_FloatRGBA,
+				FClearValueBinding::None,
+				TexCreate_ShaderResource | TexCreate_UAV);
+			PassParameters->DebugOutput = GraphBuilder.CreateUAV(GraphBuilder.CreateTexture(DebugDesc, TEXT("Debug.DOF.Recombine")));
+		}
 
 		TShaderMapRef<FDiaphragmDOFRecombineCS> ComputeShader(View.ShaderMap, PermutationVector);
 		FComputeShaderUtils::AddPass(

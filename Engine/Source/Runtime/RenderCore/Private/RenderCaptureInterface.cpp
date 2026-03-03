@@ -1,67 +1,76 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "RenderCaptureInterface.h"
+#include "IRenderCaptureProvider.h"
+#include "RenderGraphBuilder.h"
 #include "RenderingThread.h"
+#include "RHI.h"
 
 namespace RenderCaptureInterface
 {
-	static FOnBeginCaptureDelegate GBeginDelegates;
-	static FOnEndCaptureDelegate GEndDelegates;
-	
-	void RegisterCallbacks(FOnBeginCaptureDelegate InBeginDelegate, FOnEndCaptureDelegate InEndDelegate)
+	FScopedCapture::FScopedCapture(bool bEnable, TCHAR const* InEventName, TCHAR const* InFileName)
+		: bCapture(bEnable && IRenderCaptureProvider::IsAvailable())
+		, bEvent(InEventName != nullptr)
+		, RHICommandList(nullptr)
+		, GraphBuilder(nullptr)
 	{
-		check(!GBeginDelegates.IsBound());
-		GBeginDelegates = InBeginDelegate;
-		check(!GEndDelegates.IsBound());
-		GEndDelegates = InEndDelegate;
-	}
-
-	void UnregisterCallbacks()
-	{
-		GBeginDelegates.Unbind();
-		GEndDelegates.Unbind();
-	}
-
-	void BeginCapture(FRHICommandListImmediate* RHICommandList, TCHAR const* Name)
-	{
-		if (GBeginDelegates.IsBound())
-		{
-			GBeginDelegates.Execute(RHICommandList, Name);
-		}
-	}
-
-	void EndCapture(FRHICommandListImmediate* RHICommandList)
-	{
-		if (GEndDelegates.IsBound())
-		{
-			GEndDelegates.Execute(RHICommandList);
-		}
-	}
-
-	FScopedCapture::FScopedCapture(bool bEnable, TCHAR const* Name)
-		: bCapture(bEnable)
-		, RHICmdList(nullptr)
-	{
-		check(!IsInRenderingThread());
+		check(!GIsThreadedRendering || !IsInRenderingThread());
 
 		if (bCapture)
 		{
-			ENQUEUE_RENDER_COMMAND(CaptureCommand)([Name](FRHICommandListImmediate& RHICommandListLocal)
+			ENQUEUE_RENDER_COMMAND(BeginCaptureCommand)([bPushEvent = bEvent, EventName = FString(InEventName), FileName = FString(InFileName)](FRHICommandListImmediate& RHICommandListLocal)
 			{
-				BeginCapture(&RHICommandListLocal, Name);
+				IRenderCaptureProvider::Get().BeginCapture(&RHICommandListLocal, IRenderCaptureProvider::ECaptureFlags_Launch, FileName);
+
+				if (bPushEvent)
+				{
+					RHICommandListLocal.PushEvent(*EventName, FColor::White);
+				}
 			});
 		}
 	}
 
-	FScopedCapture::FScopedCapture(bool bEnable, FRHICommandListImmediate* RHICommandList, TCHAR const* Name)
-		: bCapture(bEnable)
-		, RHICmdList(RHICommandList)
+	FScopedCapture::FScopedCapture(bool bEnable, FRHICommandListImmediate* InRHICommandList, TCHAR const* InEventName, TCHAR const* InFileName)
+		: bCapture(bEnable && IRenderCaptureProvider::IsAvailable())
+		, bEvent(InEventName != nullptr)
+		, RHICommandList(InRHICommandList)
+		, GraphBuilder(nullptr)
 	{
-		check(IsInRenderingThread());
+		check(!GIsThreadedRendering || IsInRenderingThread());
 
 		if (bCapture)
 		{
-			BeginCapture(RHICmdList, Name);
+			IRenderCaptureProvider::Get().BeginCapture(RHICommandList, IRenderCaptureProvider::ECaptureFlags_Launch, FString(InFileName));
+		
+			if (bEvent)
+			{
+				RHICommandList->PushEvent(InEventName, FColor::White);
+			}
+		}
+	}
+
+	FScopedCapture::FScopedCapture(bool bEnable, FRDGBuilder& InGraphBuilder, TCHAR const* InEventName, TCHAR const* InFileName)
+		: bCapture(bEnable&& IRenderCaptureProvider::IsAvailable())
+		, bEvent(InEventName != nullptr)
+		, RHICommandList(nullptr)
+		, GraphBuilder(&InGraphBuilder) 
+	{
+		check(!GIsThreadedRendering || IsInRenderingThread());
+
+		if (bCapture)
+		{
+			GraphBuilder->AddPass(
+				RDG_EVENT_NAME("BeginCapture"),
+				ERDGPassFlags::None, 
+				[FileName = FString(InFileName)](FRHICommandListImmediate& RHICommandListLocal)
+				{
+					IRenderCaptureProvider::Get().BeginCapture(&RHICommandListLocal, IRenderCaptureProvider::ECaptureFlags_Launch, FString(FileName));
+				});
+
+			if (bEvent)
+			{
+				GraphBuilder->BeginEventScope(RDG_EVENT_NAME("%s", InEventName));
+			}
 		}
 	}
 
@@ -69,21 +78,48 @@ namespace RenderCaptureInterface
 	{
 		if (bCapture)
 		{
-			if (RHICmdList != nullptr)
+			if (GraphBuilder != nullptr)
 			{
-				check(IsInRenderingThread());
+				check(!GIsThreadedRendering || IsInRenderingThread());
+
+				if (bEvent)
+				{
+					GraphBuilder->EndEventScope();
+				}
+
+				GraphBuilder->AddPass(
+					RDG_EVENT_NAME("EndCapture"), 
+					ERDGPassFlags::None, 
+					[](FRHICommandListImmediate& RHICommandListLocal)
+					{
+						IRenderCaptureProvider::Get().EndCapture(&RHICommandListLocal);
+					});
+			}
+			else if (RHICommandList != nullptr)
+			{
+				check(!GIsThreadedRendering || IsInRenderingThread());
 				
-				EndCapture(RHICmdList);
+				if (bEvent)
+				{
+					RHICommandList->PopEvent();
+				}
+
+				IRenderCaptureProvider::Get().EndCapture(RHICommandList);
 			}
 			else
 			{
-				check(!IsInRenderingThread());
+				check(!GIsThreadedRendering || !IsInRenderingThread());
 
-				ENQUEUE_RENDER_COMMAND(CaptureCommand)([](FRHICommandListImmediate& RHICommandListLocal)
+				ENQUEUE_RENDER_COMMAND(EndCaptureCommand)([bPopEvent = bEvent](FRHICommandListImmediate& RHICommandListLocal)
 				{
-					EndCapture(&RHICommandListLocal);
+					if (bPopEvent)
+					{
+						RHICommandListLocal.PopEvent();
+					}
+
+					IRenderCaptureProvider::Get().EndCapture(&RHICommandListLocal);
 				});
 			}
 		}
-	}
+ 	}
 }

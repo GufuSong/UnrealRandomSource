@@ -6,12 +6,13 @@
 #include "VT/RuntimeVirtualTextureEnum.h"
 
 class FRHICommandListImmediate;
-class FRHITexture2D;
+class FRHITexture;
 class FRHIUnorderedAccessView;
 class FRDGBuilder;
 class FRDGTexture;
 class FRDGTextureUAV;
 class FScene;
+class FSceneInterface;
 class URuntimeVirtualTextureComponent;
 
 namespace RuntimeVirtualTexture
@@ -32,9 +33,12 @@ namespace RuntimeVirtualTexture
 	struct FRenderPageTarget
 	{
 		/** Physical texture to render to. */
-		FRHITexture2D* Texture = nullptr;
-		/** Unordered access view of physical texture to render to. If this exists we can render to it directly instead of using RHICopyTexture(). */
+		FRHITexture* Texture = nullptr;
+
+		UE_DEPRECATED(5.1, "UAV is deprecated. Register the pooled render target with RDG instead.")
 		FRHIUnorderedAccessView* UAV = nullptr;
+
+		struct IPooledRenderTarget* PooledRenderTarget = nullptr;
 	};
 
 	/** A single page description. Multiple of these can be placed in a single FRenderPageBatchDesc batch description. */
@@ -79,9 +83,18 @@ namespace RuntimeVirtualTexture
 		FRenderPageDesc PageDescs[EMaxRenderPageBatch];
 	};
 
-	/** Returns true if the FScene is initialized for rendering to runtime virtual textures. Always check this before calling RenderPages(). */
-	RENDERER_API bool IsSceneReadyToRender(FScene* Scene);
+	/** Returns true if the scene is initialized for rendering to runtime virtual textures. Always check this before calling RenderPages(). */
+	RENDERER_API bool IsSceneReadyToRender(FSceneInterface* Scene);
 
 	/** Render a batch of pages for a runtime virtual texture. */
+	RENDERER_API void RenderPages(FRDGBuilder& GraphBuilder, FRenderPageBatchDesc const& InDesc);
+
+	/** 
+	 * Render a batch of pages for a runtime virtual texture. 
+	 * Performs the required scene rendering setup such that it can be called from a render thread task.
+	 */
+	RENDERER_API void RenderPagesStandAlone(FRDGBuilder& GraphBuilder, FRenderPageBatchDesc const& InDesc);
+
+	UE_DEPRECATED(5.0, "This method has been refactored to use an FRDGBuilder instead.")
 	RENDERER_API void RenderPages(FRHICommandListImmediate& RHICmdList, FRenderPageBatchDesc const& InDesc);
 }

@@ -2,11 +2,28 @@
 
 #pragma once
 
+#include "Containers/Array.h"
+#include "Containers/Map.h"
+#include "Containers/UnrealString.h"
+#include "HAL/Platform.h"
+#include "HAL/PlatformCrt.h"
+#include "Misc/EnumClassFlags.h"
+#include "Misc/Optional.h"
+#include "Misc/WildcardString.h"
+#include "RHIDefinitions.h"
 #include "RenderGraph.h"
+#include "RenderGraphDefinitions.h"
+#include "RenderGraphResources.h"
+#include "RenderResource.h"
+#include "RendererInterface.h"
+#include "Templates/RefCounting.h"
 
 class FOutputDevice;
+class FRDGBuilder;
+class FRHICommandListImmediate;
+class FWildcardString;
 
-#define SUPPORTS_VISUALIZE_TEXTURE (WITH_ENGINE && !(UE_BUILD_SHIPPING || UE_BUILD_TEST))
+#define SUPPORTS_VISUALIZE_TEXTURE (WITH_ENGINE && (!(UE_BUILD_SHIPPING || UE_BUILD_TEST) || WITH_EDITOR))
 
 class RENDERCORE_API FVisualizeTexture : public FRenderResource
 {
@@ -21,8 +38,10 @@ public:
 
 	/** Creates a new checkpoint (e.g. "SceneDepth@N") for the pooled render target. A null parameter is a no-op. */
 #if SUPPORTS_VISUALIZE_TEXTURE
+	void SetCheckPoint(FRDGBuilder& GraphBuilder, IPooledRenderTarget* PooledRenderTarget);
 	void SetCheckPoint(FRHICommandListImmediate& RHICmdList, IPooledRenderTarget* PooledRenderTarget);
 #else
+	inline void SetCheckPoint(FRDGBuilder& GraphBuilder, IPooledRenderTarget* PooledRenderTarget) {}
 	inline void SetCheckPoint(FRHICommandListImmediate& RHICmdList, IPooledRenderTarget* PooledRenderTarget) {}
 #endif
 
@@ -32,14 +51,17 @@ private:
 		None				= 0,
 		SaveBitmap			= 1 << 0,
 		SaveBitmapAsStencil = 1 << 1, // stencil normally displays in the alpha channel of depth buffer visualization. This option is just for BMP writeout to get a stencil only BMP.
-		FullList			= 1 << 2,
 	};
 	FRIEND_ENUM_CLASS_FLAGS(EFlags);
 
-	enum class EDebugLogVerbosity
+	enum class ECommand
 	{
-		Default,
-		Extended
+		Unknown,
+		DisableVisualization,
+		VisualizeResource,
+		DisplayHelp,
+		DisplayPoolResourceList,
+		DisplayResourceList,
 	};
 
 	enum class EInputUVMapping
@@ -57,6 +79,12 @@ private:
 		Shadow
 	};
 
+	enum class EDisplayMode
+	{
+		MultiColomn,
+		Detailed,
+	};
+
 	enum class ESortBy
 	{
 		Index,
@@ -71,7 +99,9 @@ private:
 	};
 
 #if SUPPORTS_VISUALIZE_TEXTURE
-	void DebugLog(EDebugLogVerbosity Verbosity);
+	static void DisplayHelp(FOutputDevice &Ar);
+	void DisplayPoolResourceListToLog(ESortBy SortBy);
+	void DisplayResourceListToLog(const TOptional<FWildcardString>& Wildcard);
 
 	/** Determine whether a texture should be captured for debugging purposes and return the capture id if needed. */
 	TOptional<uint32> ShouldCapture(const TCHAR* DebugName, uint32 MipIndex);
@@ -95,7 +125,6 @@ private:
 		float SingleChannelMul = 0.0f;
 
 		EFlags Flags = EFlags::None;
-		ESortBy SortBy = ESortBy::Index;
 		EInputUVMapping InputUVMapping = EInputUVMapping::PictureInPicture;
 		EShaderOp ShaderOp = EShaderOp::Frac;
 		uint32 MipIndex = 0;
@@ -124,7 +153,7 @@ private:
 	ERHIFeatureLevel::Type FeatureLevel = ERHIFeatureLevel::SM5;
 
 	// Maps a texture name to its checkpoint version.
-	TMap<const TCHAR*, uint32> VersionCountMap;
+	TMap<FString, uint32> VersionCountMap;
 #endif
 
 	friend class FRDGBuilder;

@@ -2,11 +2,24 @@
 
 #pragma once
 
+#include "Async/TaskGraphInterfaces.h"
+#include "Containers/EnumAsByte.h"
 #include "CoreMinimal.h"
+#include "Logging/LogMacros.h"
+#include "Math/Color.h"
+#include "Math/IntVector.h"
+#include "Math/UnrealMathSSE.h"
+#include "Misc/AssertionMacros.h"
+#include "Misc/EnumClassFlags.h"
+#include "PixelFormat.h"
 #include "RHIDefinitions.h"
-#include "Templates/RefCounting.h"
 #include "Stats/Stats.h"
+#include "Stats/Stats2.h"
+#include "Templates/RefCounting.h"
+#include "Templates/TypeHash.h"
+#include "UObject/NameTypes.h"
 
+class FRDGBuilder;
 class FRHICommandListImmediate;
 class FRHIShaderResourceView;
 class FRHITexture;
@@ -17,6 +30,9 @@ union FVirtualTextureProducerHandle
 	FVirtualTextureProducerHandle() : PackedValue(0u) {}
 	explicit FVirtualTextureProducerHandle(uint32 InPackedValue) : PackedValue(InPackedValue) {}
 	FVirtualTextureProducerHandle(uint32 InIndex, uint32 InMagic) : Index(InIndex), Magic(InMagic) {}
+
+	inline bool IsValid() const { return PackedValue != 0u; }
+	inline bool IsNull() const { return PackedValue == 0u; }
 
 	uint32 PackedValue;
 	struct
@@ -44,14 +60,16 @@ inline bool operator!=(const FVirtualTextureProducerHandle& Lhs, const FVirtualT
  */
 struct FAllocatedVTDescription
 {
+	FName Name;
+
 	uint32 TileSize = 0u;
 	uint32 TileBorderSize = 0u;
+	uint32 MaxSpaceSize = 0u;
+	uint32 IndirectionTextureSize = 0u;
 	uint8 Dimensions = 0u;
 	uint8 NumTextureLayers = 0u;
-	
-	uint32 MaxSpaceSize = 0u;
 	uint8 ForceSpaceID = 0xff;
-	uint32 IndirectionTextureSize = 0u;
+	uint8 AdaptiveLevelBias = 0u;
 
 	/** Producer for each texture layer. */
 	FVirtualTextureProducerHandle ProducerHandle[VIRTUALTEXTURE_SPACE_MAXLAYERS];
@@ -104,12 +122,29 @@ inline bool operator!=(const FAllocatedVTDescription& Lhs, const FAllocatedVTDes
 	return !operator==(Lhs, Rhs);
 }
 
+inline uint32 GetTypeHash(const FAllocatedVTDescription& Description)
+{
+	uint32 Hash = GetTypeHash(Description.TileSize);
+	Hash = HashCombine(Hash, GetTypeHash(Description.TileBorderSize));
+	Hash = HashCombine(Hash, GetTypeHash(Description.Dimensions));
+	Hash = HashCombine(Hash, GetTypeHash(Description.NumTextureLayers));
+	Hash = HashCombine(Hash, GetTypeHash(Description.PackedFlags));
+	for (uint32 LayerIndex = 0u; LayerIndex < Description.NumTextureLayers; ++LayerIndex)
+	{
+		Hash = HashCombine(Hash, GetTypeHash(Description.ProducerHandle[LayerIndex].PackedValue));
+		Hash = HashCombine(Hash, GetTypeHash(Description.ProducerLayerIndex[LayerIndex]));
+	}
+	return Hash;
+}
+
 struct FVTProducerDescription
 {
 	FName Name; /** Will be name of UTexture for streaming VTs, mostly here for debugging */
+	uint32 FullNameHash;
 	
 	bool bPersistentHighestMip = true;
 	bool bContinuousUpdate = false;
+	bool bNotifyCompleted = false; /** Producer will receive OnRequestsCompleted() callbacks every frame when enabled. */
 	
 	uint32 TileSize = 0u;
 	uint32 TileBorderSize = 0u;
@@ -136,6 +171,7 @@ struct FVTProducerDescription
 	 */
 	uint8 NumTextureLayers = 0u;
 	TEnumAsByte<EPixelFormat> LayerFormat[VIRTUALTEXTURE_SPACE_MAXLAYERS] = { PF_Unknown };
+	FLinearColor LayerFallbackColor[VIRTUALTEXTURE_SPACE_MAXLAYERS] = { FLinearColor::Black };
 	
 	uint8 NumPhysicalGroups = 0u;
 	uint8 PhysicalGroupIndex[VIRTUALTEXTURE_SPACE_MAXLAYERS] = { 0 };
@@ -146,7 +182,10 @@ typedef void (FVTProducerDestroyedFunction)(const FVirtualTextureProducerHandle&
 class IVirtualTextureFinalizer
 {
 public:
-	virtual void Finalize(FRHICommandListImmediate& RHICmdList) = 0;
+	virtual void Finalize(FRDGBuilder& GraphBuilder) = 0;
+
+	UE_DEPRECATED(5.0, "This method has been refactored to use an FRDGBuilder instead.")
+	virtual void Finalize(FRHICommandListImmediate& RHICmdList) {}
 };
 
 enum class EVTRequestPageStatus
@@ -201,9 +240,16 @@ struct FVTRequestPageResult
 /** Describes a location to write a single layer of a VT tile */
 struct FVTProduceTargetLayer
 {
+PRAGMA_DISABLE_DEPRECATION_WARNINGS
+	FVTProduceTargetLayer() = default;
+	FVTProduceTargetLayer(const FVTProduceTargetLayer&) = default;
+	FVTProduceTargetLayer& operator=(const FVTProduceTargetLayer&) = default;
+PRAGMA_ENABLE_DEPRECATION_WARNINGS
+
 	/** The texture to write to. */
 	FRHITexture* TextureRHI = nullptr;
-	/** The UAV to write to. This may be nullptr if no suitable UAV can be created for the texture format.  */
+	
+	UE_DEPRECATED(5.1, "UnorderedAccessViewRHI is deprecated. Register the pooled render target with RDG instead.")
 	FRHIUnorderedAccessView* UnorderedAccessViewRHI = nullptr;
 	/**
 	 * Pooled render target. For FRDGBuilder::RegisterExternalTexture() which only accepts pooled render targets.
@@ -212,7 +258,7 @@ struct FVTProduceTargetLayer
 	 */
 	struct IPooledRenderTarget* PooledRenderTarget = nullptr;
 	/** Location within the texture to write */
-	FIntVector pPageLocation;
+	FIntVector pPageLocation = FIntVector::ZeroValue;
 };
 
 /**
@@ -272,7 +318,17 @@ public:
 		uint64 RequestHandle,
 		const FVTProduceTargetLayer* TargetLayers) = 0;
 
+	/** Collect all task graph events. */
+	virtual void GatherProducePageDataTasks(FVirtualTextureProducerHandle const& ProducerHandle, FGraphEventArray& InOutTasks) const {}
+
+	/** Collect all task graph events related to a request. */
+	virtual void GatherProducePageDataTasks(uint64 RequestHandle, FGraphEventArray& InOutTasks) const {};
+
+	/** Dump any type specific debug info. */
 	virtual void DumpToConsole(bool verbose) {}
+
+	/** Called on every virtual texture system update once all requests are completed, if bNotifyCompleted is enabled. */
+	virtual void OnRequestsCompleted() {}
 };
 
 enum class EVTPageTableFormat : uint8
@@ -306,12 +362,17 @@ public:
 		, WidthInBlocks(InWidthInBlocks)
 		, HeightInBlocks(InHeightInBlocks)
 		, DepthInTiles(InDepthInTiles)
+		, FrameDeleted(0u)
+		, NumRefs(0)
 		, PageTableFormat(EVTPageTableFormat::UInt32)
 		, SpaceID(~0u)
 		, MaxLevel(0u)
 		, VirtualAddress(~0u)
+		, VirtualPageX(~0u)
+		, VirtualPageY(~0u)
 	{}
 
+	virtual uint32 GetPersistentHash() const = 0;
 	virtual uint32 GetNumPageTableTextures() const = 0;
 	virtual FRHITexture* GetPageTableTexture(uint32 InPageTableIndex) const = 0;
 	virtual FRHITexture* GetPageTableIndirectionTexture() const = 0;
@@ -336,6 +397,8 @@ public:
 	inline uint8 GetDimensions() const { return Description.Dimensions; }
 	inline uint32 GetWidthInBlocks() const { return WidthInBlocks; }
 	inline uint32 GetHeightInBlocks() const { return HeightInBlocks; }
+	inline uint32 GetBlockWidthInTiles() const { return BlockWidthInTiles; }
+	inline uint32 GetBlockHeightInTiles() const { return BlockHeightInTiles; }
 	inline uint32 GetWidthInTiles() const { return BlockWidthInTiles * WidthInBlocks; }
 	inline uint32 GetHeightInTiles() const { return BlockHeightInTiles * HeightInBlocks; }
 	inline uint32 GetDepthInTiles() const { return DepthInTiles; }
@@ -344,12 +407,15 @@ public:
 	inline uint32 GetDepthInPixels() const { return DepthInTiles * Description.TileSize; }
 	inline uint32 GetSpaceID() const { return SpaceID; }
 	inline uint32 GetVirtualAddress() const { return VirtualAddress; }
+	inline uint32 GetVirtualPageX() const { return VirtualPageX; }
+	inline uint32 GetVirtualPageY() const { return VirtualPageY; }
 	inline uint32 GetMaxLevel() const { return MaxLevel; }
 	inline EVTPageTableFormat GetPageTableFormat() const { return PageTableFormat; }
 
 protected:
 	friend class FVirtualTextureSystem;
-	virtual void Destroy(class FVirtualTextureSystem* System) = 0;
+	virtual void Destroy(class FVirtualTextureSystem* InSystem) = 0;
+	virtual bool TryMapLockedTiles(class FVirtualTextureSystem* InSystem) const = 0;
 	virtual ~IAllocatedVirtualTexture() {}
 
 	FAllocatedVTDescription Description;
@@ -358,13 +424,16 @@ protected:
 	uint32 WidthInBlocks;
 	uint32 HeightInBlocks;
 	uint32 DepthInTiles;
-	
+	uint32 FrameDeleted;
+	int32 NumRefs;
 
 	// should be set explicitly by derived class constructor
 	EVTPageTableFormat PageTableFormat;
 	uint32 SpaceID;
 	uint32 MaxLevel;
 	uint32 VirtualAddress;
+	uint32 VirtualPageX;
+	uint32 VirtualPageY;
 };
 
 /** 

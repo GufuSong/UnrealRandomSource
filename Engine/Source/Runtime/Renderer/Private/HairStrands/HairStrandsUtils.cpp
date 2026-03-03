@@ -4,6 +4,7 @@
 #include "ScenePrivate.h"
 #include "HairStrandsCluster.h"
 #include "Rendering/SkeletalMeshRenderData.h"
+#include "HairStrandsData.h"
 
 static float GHairR = 1;
 static float GHairTT = 1;
@@ -25,7 +26,7 @@ static float GStrandHairStableRasterizationScale = 1.0f; // For no AA without TA
 static FAutoConsoleVariableRef CVarStrandHairStableRasterizationScale(TEXT("r.HairStrands.StableRasterizationScale"), GStrandHairStableRasterizationScale, TEXT("Rasterization scale to snap strand to pixel for 'stable' hair option. This value can't go below 1."), ECVF_Scalability | ECVF_RenderThreadSafe);
 
 static float GStrandHairVelocityRasterizationScale = 1.5f; // Tuned based on heavy motion example (e.g., head shaking)
-static FAutoConsoleVariableRef CVarStrandHairMaxRasterizationScale(TEXT("r.HairStrands.VelocityRasterizationScale"), GStrandHairVelocityRasterizationScale, TEXT("Rasterization scale to snap strand to pixel under high velocity"), ECVF_Scalability | ECVF_RenderThreadSafe);
+static FAutoConsoleVariableRef CVarStrandHairVelocityRasterizationScale(TEXT("r.HairStrands.VelocityRasterizationScale"), GStrandHairVelocityRasterizationScale, TEXT("Rasterization scale to snap strand to pixel under high velocity"), ECVF_Scalability | ECVF_RenderThreadSafe);
 
 static float GStrandHairShadowRasterizationScale = 1.0f;
 static FAutoConsoleVariableRef CVarStrandHairShadowRasterizationScale(TEXT("r.HairStrands.ShadowRasterizationScale"), GStrandHairShadowRasterizationScale, TEXT("Rasterization scale to snap strand to pixel in shadow view"));
@@ -33,11 +34,11 @@ static FAutoConsoleVariableRef CVarStrandHairShadowRasterizationScale(TEXT("r.Ha
 static float GDeepShadowAABBScale = 1.0f;
 static FAutoConsoleVariableRef CVarDeepShadowAABBScale(TEXT("r.HairStrands.DeepShadow.AABBScale"), GDeepShadowAABBScale, TEXT("Scaling value for loosing/tighting deep shadow bounding volume"));
 
-static int32 GHairVisibilityRectOptimEnable = 0;
+static int32 GHairVisibilityRectOptimEnable = 1;
 static FAutoConsoleVariableRef CVarHairVisibilityRectOptimEnable(TEXT("r.HairStrands.RectLightingOptim"), GHairVisibilityRectOptimEnable, TEXT("Hair Visibility use projected view rect to light only relevant pixels"));
 
 static int32 GHairStrandsComposeAfterTranslucency = 1;
-static FAutoConsoleVariableRef CVarHairStrandsComposeAfterTranslucency(TEXT("r.HairStrands.ComposeAfterTranslucency"), GHairStrandsComposeAfterTranslucency, TEXT("Compose hair rendering with scene color after the translucency pass if true. Otherwise compose hair defor the translucent objects are rendered."));
+static FAutoConsoleVariableRef CVarHairStrandsComposeAfterTranslucency(TEXT("r.HairStrands.ComposeAfterTranslucency"), GHairStrandsComposeAfterTranslucency, TEXT("0: Compose hair before translucent objects. 1: Compose hair after translucent objects, but before separate translucent objects. 2: Compose hair after all/seperate translucent objects, 3: Compose hair after translucent objects but before translucent render after DOF (which allows depth testing against hair depth)"));
 
 static float GHairDualScatteringRoughnessOverride = 0;
 static FAutoConsoleVariableRef CVarHairDualScatteringRoughnessOverride(TEXT("r.HairStrands.DualScatteringRoughness"), GHairDualScatteringRoughnessOverride, TEXT("Override all roughness for the dual scattering evaluation. 0 means no override. Default:0"));
@@ -55,9 +56,16 @@ float GetHairDualScatteringRoughnessOverride()
 	return GHairDualScatteringRoughnessOverride;
 }
 
-bool IsHairStrandsComposeAfterTranslucency()
+EHairStrandsCompositionType GetHairStrandsComposition()
 {
-	return GHairStrandsComposeAfterTranslucency > 0;
+	switch (GHairStrandsComposeAfterTranslucency)
+	{
+	case 0	: return EHairStrandsCompositionType::BeforeTranslucent;
+	case 1	: return EHairStrandsCompositionType::AfterTranslucent;
+	case 2	: return EHairStrandsCompositionType::AfterSeparateTranslucent;
+	case 3	: return EHairStrandsCompositionType::AfterTranslucentBeforeTranslucentAfterDOF;
+	default	: return EHairStrandsCompositionType::BeforeTranslucent;
+	}
 }
 
 float GetDeepShadowAABBScale()
@@ -139,61 +147,62 @@ FMinHairRadiusAtDepth1 ComputeMinStrandRadiusAtDepth1(
 	return Out;
 }
 
-void ComputeWorldToLightClip(
-	FMatrix& WorldToClipTransform,
-	FMinHairRadiusAtDepth1& MinStrandRadiusAtDepth1,
+void ComputeTranslatedWorldToLightClip(
+	const FVector& TranslatedWorldOffset,
+	FMatrix& OutTranslatedWorldToClipTransform,
+	FMinHairRadiusAtDepth1& OutMinStrandRadiusAtDepth1,
 	const FBoxSphereBounds& PrimitivesBounds,
 	const FLightSceneProxy& LightProxy,
 	const ELightComponentType LightType,
 	const FIntPoint& ShadowResolution)
 {
-	const FSphere SphereBound = PrimitivesBounds.GetSphere();
-	const float SphereRadius = SphereBound.W * GetDeepShadowAABBScale();
-	const FVector LightPosition = LightProxy.GetPosition();
+	// Translated SphereBound & translated light position
+	const FSphere TranslatedSphereBound = FSphere(PrimitivesBounds.GetSphere().Center + TranslatedWorldOffset, PrimitivesBounds.GetSphere().W);
+	const float SphereRadius = TranslatedSphereBound.W * GetDeepShadowAABBScale();
+	const FVector3f TranslatedLightPosition = FVector3f(FVector(LightProxy.GetPosition()) + TranslatedWorldOffset); // LWC_TODO: precision loss
+
 	const float MinNear = 1.0f; // 1cm, lower value than this cause precision issue. Similar value than in HairStrandsDeepShadowAllocation.usf
-	const float MinZ = FMath::Max(MinNear, FMath::Max(0.1f, FVector::Distance(LightPosition, SphereBound.Center)) - SphereBound.W);
-	const float MaxZ = FMath::Max(0.2f, FVector::Distance(LightPosition, SphereBound.Center)) + SphereBound.W;
+	const float MinZ = FMath::Max(MinNear, FMath::Max(0.1f, FVector::Distance((FVector)TranslatedLightPosition, TranslatedSphereBound.Center)) - TranslatedSphereBound.W);
+	const float MaxZ = FMath::Max(0.2f, FVector::Distance((FVector)TranslatedLightPosition, TranslatedSphereBound.Center)) + TranslatedSphereBound.W;
 	const float MaxDeepShadowFrustumHalfAngleInRad = 0.5f * FMath::DegreesToRadians(GetDeepShadowMaxFovAngle());
 
 	const float StrandHairRasterizationScale = GetDeepShadowRasterizationScale();
 	const float StrandHairStableRasterizationScale = FMath::Max(GStrandHairStableRasterizationScale, 1.0f);
-	MinStrandRadiusAtDepth1 = FMinHairRadiusAtDepth1();
-	WorldToClipTransform = FMatrix::Identity;
+	OutMinStrandRadiusAtDepth1 = FMinHairRadiusAtDepth1();
+	OutTranslatedWorldToClipTransform = FMatrix::Identity;
 	if (LightType == LightType_Directional)
 	{
-		const FVector LightDirection = LightProxy.GetDirection();
+		const FVector& LightDirection = LightProxy.GetDirection();
 		FReversedZOrthoMatrix OrthoMatrix(SphereRadius, SphereRadius, 1.f / (2 * SphereRadius), 0);
-		FLookAtMatrix LookAt(SphereBound.Center - LightDirection * SphereRadius, SphereBound.Center, FVector(0, 0, 1));
-		WorldToClipTransform = LookAt * OrthoMatrix;
+		FLookAtMatrix LookAt(TranslatedSphereBound.Center - LightDirection * SphereRadius, TranslatedSphereBound.Center, FVector(0, 0, 1));
+		OutTranslatedWorldToClipTransform = LookAt * OrthoMatrix;
 
 		const float RadiusAtDepth1 = SphereRadius / FMath::Min(ShadowResolution.X, ShadowResolution.Y);
-		MinStrandRadiusAtDepth1.Stable = RadiusAtDepth1 * StrandHairStableRasterizationScale;
-		MinStrandRadiusAtDepth1.Primary = RadiusAtDepth1 * StrandHairRasterizationScale;
-		MinStrandRadiusAtDepth1.Velocity = MinStrandRadiusAtDepth1.Primary;
+		OutMinStrandRadiusAtDepth1.Stable = RadiusAtDepth1 * StrandHairStableRasterizationScale;
+		OutMinStrandRadiusAtDepth1.Primary = RadiusAtDepth1 * StrandHairRasterizationScale;
+		OutMinStrandRadiusAtDepth1.Velocity = OutMinStrandRadiusAtDepth1.Primary;
 	}
 	else if (LightType == LightType_Spot || LightType == LightType_Point)
 	{
-		const FVector LightDirection = LightPosition - PrimitivesBounds.GetSphere().Center;
-		const float SphereDistance = FVector::Distance(LightPosition, SphereBound.Center);
+		const float SphereDistance = FVector3f::Distance(TranslatedLightPosition, (FVector3f)TranslatedSphereBound.Center);
 		float HalfFov = asin(SphereRadius / SphereDistance);
 		HalfFov = FMath::Min(HalfFov, MaxDeepShadowFrustumHalfAngleInRad);
 
 		FReversedZPerspectiveMatrix ProjMatrix(HalfFov, 1, 1, MinZ, MaxZ);
-		FLookAtMatrix WorldToLight(LightPosition, SphereBound.Center, FVector(0, 0, 1));
-		WorldToClipTransform = WorldToLight * ProjMatrix;
-		MinStrandRadiusAtDepth1 = ComputeMinStrandRadiusAtDepth1(ShadowResolution, 2 * HalfFov, 1, StrandHairRasterizationScale);
+		FLookAtMatrix TranslatedWorldToLight((FVector)TranslatedLightPosition, TranslatedSphereBound.Center, FVector(0, 0, 1));
+		OutTranslatedWorldToClipTransform = TranslatedWorldToLight * ProjMatrix;
+		OutMinStrandRadiusAtDepth1 = ComputeMinStrandRadiusAtDepth1(ShadowResolution, 2 * HalfFov, 1, StrandHairRasterizationScale);
 	}
 	else if (LightType == LightType_Rect)
 	{
-		const FVector LightDirection = LightPosition - PrimitivesBounds.GetSphere().Center;
-		const float SphereDistance = FVector::Distance(LightPosition, SphereBound.Center);
+		const float SphereDistance = FVector3f::Distance(TranslatedLightPosition, (FVector3f)TranslatedSphereBound.Center);
 		float HalfFov = asin(SphereRadius / SphereDistance);
 		HalfFov = FMath::Min(HalfFov, MaxDeepShadowFrustumHalfAngleInRad);
 
 		FReversedZPerspectiveMatrix ProjMatrix(HalfFov, 1, 1, MinZ, MaxZ);
-		FLookAtMatrix WorldToLight(LightPosition, SphereBound.Center, FVector(0, 0, 1));
-		WorldToClipTransform = WorldToLight * ProjMatrix;
-		MinStrandRadiusAtDepth1 = ComputeMinStrandRadiusAtDepth1(ShadowResolution, 2 * HalfFov, 1, StrandHairRasterizationScale);
+		FLookAtMatrix TranslatedWorldToLight((FVector)TranslatedLightPosition, TranslatedSphereBound.Center, FVector(0, 0, 1));
+		OutTranslatedWorldToClipTransform = TranslatedWorldToLight * ProjMatrix;
+		OutMinStrandRadiusAtDepth1 = ComputeMinStrandRadiusAtDepth1(ShadowResolution, 2 * HalfFov, 1, StrandHairRasterizationScale);
 	}
 }
 
@@ -213,10 +222,22 @@ FIntRect ComputeProjectedScreenRect(const FBox& B, const FViewInfo& View)
 		FVector(B.Max)
 	};
 
+	// Compute the MinP/MaxP in pixel coord, relative to View.ViewRect.Min
+	const FMatrix& WorldToView	= View.ViewMatrices.GetViewMatrix();
+	const FMatrix& ViewToProj	= View.ViewMatrices.GetProjectionMatrix();
+	const float NearClippingDistance = View.NearClippingDistance + SMALL_NUMBER;
 	for (uint32 i = 0; i < 8; ++i)
 	{
+		// Clamp position on the near plane to get valid rect even if bounds' points are behind the camera
+		FPlane P_View = WorldToView.TransformFVector4(FVector4(Vertices[i], 1.f));
+		if (P_View.Z <= NearClippingDistance)
+		{
+			P_View.Z = NearClippingDistance;
+		}
+
+		// Project from view to projective space
 		FVector2D P;
-		if (View.WorldToPixel(Vertices[i], P))
+		if (FSceneView::ProjectWorldToScreen(P_View, View.ViewRect, ViewToProj, P))
 		{
 			MinP.X = FMath::Min(MinP.X, P.X);
 			MinP.Y = FMath::Min(MinP.Y, P.Y);
@@ -225,15 +246,16 @@ FIntRect ComputeProjectedScreenRect(const FBox& B, const FViewInfo& View)
 		}
 	}
 
+	// Clamp to pixel border
 	FIntRect OutRect;
 	OutRect.Min = FIntPoint(FMath::FloorToInt(MinP.X), FMath::FloorToInt(MinP.Y));
 	OutRect.Max = FIntPoint(FMath::CeilToInt(MaxP.X),  FMath::CeilToInt(MaxP.Y));
 
 	// Clamp to screen rect
-	OutRect.Min.X = FMath::Max(View.ViewRect.Min.X, OutRect.Min.X);
-	OutRect.Min.Y = FMath::Max(View.ViewRect.Min.Y, OutRect.Min.Y);
-	OutRect.Max.X = FMath::Min(View.ViewRect.Max.X, OutRect.Max.X);
-	OutRect.Max.Y = FMath::Min(View.ViewRect.Max.Y, OutRect.Max.Y);
+	OutRect.Min.X = FMath::Clamp(OutRect.Min.X, View.ViewRect.Min.X, View.ViewRect.Max.X);
+	OutRect.Max.X = FMath::Clamp(OutRect.Max.X, View.ViewRect.Min.X, View.ViewRect.Max.X);
+	OutRect.Min.Y = FMath::Clamp(OutRect.Min.Y, View.ViewRect.Min.Y, View.ViewRect.Max.Y);
+	OutRect.Max.Y = FMath::Clamp(OutRect.Max.Y, View.ViewRect.Min.Y, View.ViewRect.Max.Y);
 
 	return OutRect;
 }
@@ -244,10 +266,13 @@ FIntRect ComputeVisibleHairStrandsMacroGroupsRect(const FIntRect& ViewRect, cons
 	FIntRect TotalRect(INT_MAX, INT_MAX, -INT_MAX, -INT_MAX);
 	if (IsHairStrandsViewRectOptimEnable())
 	{
-		for (const FHairStrandsMacroGroupData& Data : Datas.Datas)
+		for (const FHairStrandsMacroGroupData& Data : Datas)
 		{
 			TotalRect.Union(Data.ScreenRect);
 		}
+
+		// In case bounds are not initialized correct for some reason, return view rect
+		if (TotalRect.Min.X >= TotalRect.Max.X || TotalRect.Min.Y >= TotalRect.Max.Y) TotalRect = ViewRect;
 	}
 	else
 	{
@@ -262,7 +287,15 @@ bool IsHairStrandsViewRectOptimEnable()
 	return GHairVisibilityRectOptimEnable > 0;
 }
 
-EHairVisibilityVendor GetVendor()
+enum EHairVisibilityVendor
+{
+	HairVisibilityVendor_AMD,
+	HairVisibilityVendor_NVIDIA,
+	HairVisibilityVendor_INTEL,
+	HairVisibilityVendorCount
+};
+
+inline EHairVisibilityVendor GetVendor()
 {
 	return IsRHIDeviceAMD() ? HairVisibilityVendor_AMD : (IsRHIDeviceNVIDIA() ? HairVisibilityVendor_NVIDIA : HairVisibilityVendor_INTEL);
 }
@@ -289,13 +322,36 @@ FIntPoint GetVendorOptimalGroupSize2D()
 	}
 }
 
-FVector4 PackHairRenderInfo(
+FIntVector ComputeDispatchCount(uint32 ItemCount, uint32 GroupSize)
+{
+	const uint32 GroupCount = FMath::DivideAndRoundUp(ItemCount, GroupSize);
+	const uint32 DispatchCountX = FMath::FloorToInt(FMath::Sqrt(static_cast<float>(GroupCount)));
+	const uint32 DispatchCountY = DispatchCountX + FMath::DivideAndRoundUp(GroupCount - DispatchCountX * DispatchCountX, DispatchCountX);
+
+	check(DispatchCountX <= 65535);
+	check(DispatchCountY <= 65535);
+	check(GroupCount <= DispatchCountX * DispatchCountY);
+	return FIntVector(DispatchCountX, DispatchCountY, 1);
+}
+
+FIntVector ComputeDispatchCount(uint32 GroupCount)
+{
+	const uint32 DispatchCountX = FMath::FloorToInt(FMath::Sqrt(static_cast<float>(GroupCount)));
+	const uint32 DispatchCountY = DispatchCountX + FMath::DivideAndRoundUp(GroupCount - DispatchCountX * DispatchCountX, DispatchCountX);
+
+	check(DispatchCountX <= 65535);
+	check(DispatchCountY <= 65535);
+	check(GroupCount <= DispatchCountX * DispatchCountY);
+	return FIntVector(DispatchCountX, DispatchCountY, 1);
+}
+
+FVector4f PackHairRenderInfo(
 	float PrimaryRadiusAtDepth1,
 	float StableRadiusAtDepth1,
 	float VelocityRadiusAtDepth1,
 	float VelocityMagnitudeScale)
 {
-	FVector4 Out;
+	FVector4f Out;
 	Out.X = PrimaryRadiusAtDepth1;
 	Out.Y = StableRadiusAtDepth1;
 	Out.Z = VelocityRadiusAtDepth1;

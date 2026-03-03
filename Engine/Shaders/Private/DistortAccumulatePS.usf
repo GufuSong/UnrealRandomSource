@@ -20,6 +20,16 @@
 #include "/Engine/Generated/VertexFactory.ush"
 #include "DistortionCommon.ush"
 
+// STRATA_TODO enable distortion on mobile.
+#if STRATA_ENABLED && (!MATERIAL_IS_STRATA || SHADING_PATH_MOBILE)
+#undef STRATA_ENABLED
+#define STRATA_ENABLED 0
+#endif
+
+#if STRATA_ENABLED
+#include "Strata/StrataEvaluation.ush"
+#endif
+
 void ClipOccludedPixel(float PixelZ, float SceneZ)
 {
 #if	HAS_INVERTED_Z_BUFFER
@@ -37,6 +47,10 @@ void Main(
 	in float4 SvPosition	: SV_Position
 	OPTIONAL_IsFrontFace,
 	out float4 OutColor		: SV_Target0
+#if STRATA_ENABLED
+	,
+	out float4 OutVariance	: SV_Target1
+#endif
 	)
 {
 #if INSTANCED_STEREO
@@ -52,7 +66,7 @@ void Main(
 	FPixelMaterialInputs PixelMaterialInputs;
 	CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, bIsFrontFace);
 
-#if SHADING_PATH_MOBILE
+#if SHADING_PATH_MOBILE && MATERIAL_SHOULD_DISABLE_DEPTH_TEST==0
 	// Mobile specific: 
 	// distortion primtitives rendered without depth testing
 	// discard pixels that are hidden by manually comparing them to a scene depth
@@ -70,13 +84,65 @@ void Main(
 	// X = IOR, Y = Refraction Bias
 	float2 Refraction = GetMaterialRefraction(PixelMaterialInputs);
 
+
+#if STRATA_ENABLED
+
+	FStrataData StrataData = PixelMaterialInputs.FrontMaterial;
+
+	FStrataAddressing NullStrataAddressing = (FStrataAddressing)0;	// Fake unused in StrataCreateBSDFContext when using Forward inline shading
+
+	FStrataPixelHeader StrataPixelHeader = InitialiseStrataPixelHeader();
+	StrataPixelHeader.StrataTree = MaterialParameters.StrataTree;
+	StrataPixelHeader.BSDFCount = MaterialParameters.StrataTree.BSDFCount;
+	StrataPixelHeader.SharedLocalBases = MaterialParameters.SharedLocalBases;
+
+	// Retrieve rough refraction variance
+	float Sigma = 0.0f;
+	float3 RefractionWorldNormal = MaterialParameters.CameraVector;
+	FStrataTree StrataTree = StrataPixelHeader.StrataTree;
+	if (StrataTree.BSDFCount > 0)
+	{
+		const float3 V = MaterialParameters.CameraVector;
+
+		// Update tree (coverage/transmittance/luminace weights)
+		const FStrataIntegrationSettings Settings = InitStrataIntegrationSettings(false /*bForceFullyRough*/, Strata.bRoughDiffuse /*bRoughDiffuseEnabled*/, Strata.PeelLayersAboveDepth);
+		StrataUpdateTree(NullStrataAddressing, StrataPixelHeader, StrataTree, V, Settings);
+
+		RefractionWorldNormal = StrataTree.Operators[StrataData.OperatorIndex].TopDownRefractionWorldNormal;
+
+		FStrataLobeStatistic RefractionLobeStat = StrataTree.Operators[StrataData.OperatorIndex].TopDownRefractionLobeStat;
+
+		Sigma = RefractionLobeStat.Sigma;
+	}
+
+	// Write out variance (as this is more linear to accumulate than roughness)
+	OutVariance = float4(Sigma, 0.0f, 0.0f, 0.0f);
+
+	// Only allow clipping if roughness is close to 0.
+	const bool TryToClip = OutVariance.x < 0.01f;
+
 	// Compute UV distortion
 	float2 BufferUVDistortion = ComputeBufferUVDistortion(
 		MaterialParameters, PixelMaterialInputs, ResolvedView,
-		Normal, DistortionParams, ScreenUV, Refraction, true, EyeIndex);
+		RefractionWorldNormal, DistortionParams, ScreenUV, Refraction, TryToClip, EyeIndex);
 
 	// Sample depth at distortion offset
 	float2 DistortBufferUV = ScreenUV + BufferUVDistortion;
+
+#else // STRATA_ENABLED
+
+
+	// Compute UV distortion
+	float2 BufferUVDistortion = ComputeBufferUVDistortion(
+		MaterialParameters, PixelMaterialInputs, ResolvedView,
+		MaterialParameters.WorldNormal, DistortionParams, ScreenUV, Refraction, true, EyeIndex);
+
+	// Sample depth at distortion offset
+	float2 DistortBufferUV = ScreenUV + BufferUVDistortion;
+
+
+#endif // STRATA_ENABLED
+
 
 #if SHADING_PATH_MOBILE
 	// sample depth from SceneColor.A on Mobile
