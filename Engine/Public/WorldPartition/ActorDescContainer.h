@@ -1,0 +1,128 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#pragma once
+
+#include "CoreMinimal.h"
+#include "UObject/ObjectMacros.h"
+#include "UObject/Object.h"
+#include "WorldPartition/ActorDescList.h"
+#include "WorldPartition/WorldPartitionHandle.h"
+#include "WorldPartition/WorldPartitionActorDesc.h"
+#include "AssetRegistry/AssetData.h"
+#include "ActorDescContainer.generated.h"
+
+class FLinkerInstancingContext;
+class UWorldPartition;
+
+UCLASS()
+class ENGINE_API UActorDescContainer : public UObject, public FActorDescList
+{
+	GENERATED_UCLASS_BODY()
+
+#if WITH_EDITOR
+	friend struct FWorldPartitionHandleUtils;
+	friend class FWorldPartitionActorDesc;
+
+	using FNameActorDescMap = TMap<FName, TUniquePtr<FWorldPartitionActorDesc>*>;
+
+public:
+	/* Struct of parameters passed to Initialize function. */
+	struct ENGINE_API FInitializeParams
+	{
+		FInitializeParams(UWorld* InWorld, FName InPackageName)
+			: World(InWorld)
+			, PackageName(InPackageName)
+		{}
+
+		/* The world the actor descriptor container is associated with. */
+		UWorld* World;
+			
+		/* The long package name of the container package on disk. */
+		FName PackageName;
+
+		/* Custom filter function used to filter actors descriptors. */
+		TUniqueFunction<bool(const FWorldPartitionActorDesc*)> FilterActorDesc;
+	};
+
+	UE_DEPRECATED(5.1, "UActorDescContainer::Initialize is deprecated, UActorDescContainer::Initialize with UActorDescContainer::FInitializeParams should be used instead.")
+	void Initialize(UWorld* InWorld, FName InPackageName);
+	void Initialize(const FInitializeParams& InitParams);
+	void Update();
+	void Uninitialize();
+
+	bool IsInitialized() const { return bContainerInitialized; }
+
+	void OnObjectPreSave(UObject* Object, FObjectPreSaveContext SaveContext);
+	void OnPackageDeleted(UPackage* Package);
+	void OnObjectsReplaced(const TMap<UObject*, UObject*>& OldToNewObjectMap);
+
+	FName GetContainerPackage() const { return ContainerPackageName; }
+	void SetContainerPackage(const FName& InContainerPackageName) { ContainerPackageName = InContainerPackageName; }
+
+	FGuid GetContentBundleGuid() const { return ContentBundleGuid; }
+	void SetContentBundleGuid(const FGuid& InGetContentBundleGuid) { ContentBundleGuid = InGetContentBundleGuid; }
+
+	bool IsTemplateContainer() const;
+	bool IsMainPartitionContainer() const;
+	UWorldPartition* GetWorldPartition() const;
+
+	FString GetExternalActorPath() const;
+
+	/** Removes an actor desc without the need to load a package */
+	bool RemoveActor(const FGuid& ActorGuid);
+
+	void LoadAllActors(TArray<FWorldPartitionReference>& OutReferences);
+
+	bool IsActorDescHandled(const AActor* Actor) const;
+
+	DECLARE_EVENT_OneParam(UWorldPartition, FActorDescAddedEvent, FWorldPartitionActorDesc*);
+	FActorDescAddedEvent OnActorDescAddedEvent;
+	
+	DECLARE_EVENT_OneParam(UWorldPartition, FActorDescRemovedEvent, FWorldPartitionActorDesc*);
+	FActorDescRemovedEvent OnActorDescRemovedEvent;
+
+	DECLARE_MULTICAST_DELEGATE_OneParam(FActorDescContainerInitializeDelegate, UActorDescContainer*);
+	static FActorDescContainerInitializeDelegate OnActorDescContainerInitialized;
+
+	const FLinkerInstancingContext* GetInstancingContext() const;
+	const FTransform& GetInstanceTransform() const;
+
+	bool HasInvalidActors() const { return InvalidActors.Num() > 0; }
+	const TArray<FAssetData>& GetInvalidActors() const { return InvalidActors; }
+	void ClearInvalidActors() { InvalidActors.Empty(); }
+
+	void RegisterActorDescriptor(FWorldPartitionActorDesc* ActorDesc, UWorld* InWorldContext);
+	void UnregisterActorDescriptor(FWorldPartitionActorDesc* ActorDesc);
+
+	void OnActorDescAdded(FWorldPartitionActorDesc* NewActorDesc);
+	void OnActorDescRemoved(FWorldPartitionActorDesc* ActorDesc);
+	void OnActorDescUpdating(FWorldPartitionActorDesc* ActorDesc);
+	void OnActorDescUpdated(FWorldPartitionActorDesc* ActorDesc);
+
+	bool ShouldHandleActorEvent(const AActor* Actor);
+
+	const FWorldPartitionActorDesc* GetActorDescByName(const FString& ActorPath) const;
+	const FWorldPartitionActorDesc* GetActorDescByName(const FSoftObjectPath& InActorPath) const;
+
+	bool bContainerInitialized;
+
+	FName ContainerPackageName;
+	FGuid ContentBundleGuid;
+
+	TArray<FAssetData> InvalidActors;
+
+protected:
+	FNameActorDescMap ActorsByName;
+
+	//~ Begin UObject Interface
+	virtual void BeginDestroy() override;
+	//~ End UObject Interface
+
+private:
+	// GetWorld() should never be called on an ActorDescContainer to avoid any confusion as it can be used as a template
+	virtual UWorld* GetWorld() const override { return nullptr; }
+
+	bool ShouldRegisterDelegates();
+	void RegisterEditorDelegates();
+	void UnregisterEditorDelegates();
+#endif
+};

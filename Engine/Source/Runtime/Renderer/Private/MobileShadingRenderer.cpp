@@ -428,6 +428,7 @@ void FMobileSceneRenderer::SetupMobileBasePassAfterShadowInit(FExclusiveDepthSte
  * Initialize scene's views.
  * Check visibility, sort translucent items, etc.
  */
+
 void FMobileSceneRenderer::InitViews(FRDGBuilder& GraphBuilder, FSceneTexturesConfig& SceneTexturesConfig, FInstanceCullingManager& InstanceCullingManager)
 {
 	FRHICommandListImmediate& RHICmdList = GraphBuilder.RHICmdList;

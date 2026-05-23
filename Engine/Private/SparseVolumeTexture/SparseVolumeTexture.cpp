@@ -1,0 +1,951 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	SparseVolumeTexture.cpp: SparseVolumeTexture implementation.
+=============================================================================*/
+
+#include "SparseVolumeTexture/SparseVolumeTexture.h"
+
+#include "Materials/Material.h"
+#include "MaterialShared.h"
+#include "UObject/UObjectIterator.h"
+#include "Misc/SecureHash.h"
+#include "EngineUtils.h"
+#include "Shader/ShaderTypes.h"
+#include "RenderingThread.h"
+#include "SparseVolumeTexture/SparseVolumeTextureSceneProxy.h"
+#include "SparseVolumeTexture/SparseVolumeTextureData.h"
+#include "SparseVolumeTexture/SparseVolumeTextureUtility.h"
+
+#if WITH_EDITORONLY_DATA
+#include "DerivedDataCache.h"
+#include "DerivedDataRequestOwner.h"
+#endif
+
+#include "Serialization/LargeMemoryReader.h"
+#include "Serialization/LargeMemoryWriter.h"
+#include "Serialization/MemoryReader.h"
+#include "Serialization/MemoryWriter.h"
+#include "Serialization/BulkDataReader.h"
+#include "Serialization/BulkDataWriter.h"
+#include "Serialization/EditorBulkDataReader.h"
+#include "Serialization/EditorBulkDataWriter.h"
+
+#include "ContentStreaming.h"
+
+#define LOCTEXT_NAMESPACE "USparseVolumeTexture"
+
+DEFINE_LOG_CATEGORY_STATIC(LogSparseVolumeTexture, Log, All);
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+static int32 SVTComputeNumMipLevels(const FIntVector3& InResolution)
+{
+	int32 Levels = 1;
+	FIntVector3 Resolution = InResolution;
+	while (Resolution.X > SPARSE_VOLUME_TILE_RES || Resolution.Y > SPARSE_VOLUME_TILE_RES || Resolution.Z > SPARSE_VOLUME_TILE_RES)
+	{
+		Resolution /= 2;
+		++Levels;
+	}
+	return Levels;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+FSparseVolumeTextureHeader::FSparseVolumeTextureHeader(const FIntVector3& AABBMin, const FIntVector3& AABBMax, EPixelFormat FormatA, EPixelFormat FormatB, const FVector4f& FallbackValueA, const FVector4f& FallbackValueB)
+{
+	VirtualVolumeAABBMin = AABBMin;
+	VirtualVolumeAABBMax = AABBMax;
+	VirtualVolumeResolution = VirtualVolumeAABBMax - VirtualVolumeAABBMin;
+
+	PageTableVolumeAABBMin = VirtualVolumeAABBMin / SPARSE_VOLUME_TILE_RES;
+	PageTableVolumeAABBMax = (VirtualVolumeAABBMax + FIntVector3(SPARSE_VOLUME_TILE_RES - 1)) / SPARSE_VOLUME_TILE_RES;
+	PageTableVolumeResolution = PageTableVolumeAABBMax - PageTableVolumeAABBMin;
+
+	// We need to ensure a power of two resolution for the page table in order to fit all mips of the page table into the physical mips of the texture resource.
+	PageTableVolumeResolution.X = FMath::RoundUpToPowerOfTwo(PageTableVolumeResolution.X);
+	PageTableVolumeResolution.Y = FMath::RoundUpToPowerOfTwo(PageTableVolumeResolution.Y);
+	PageTableVolumeResolution.Z = FMath::RoundUpToPowerOfTwo(PageTableVolumeResolution.Z);
+	PageTableVolumeAABBMax = PageTableVolumeAABBMin + PageTableVolumeResolution;
+
+	AttributesFormats[0] = FormatA;
+	AttributesFormats[1] = FormatB;
+
+	NullTileValues[0] = FallbackValueA;
+	NullTileValues[1] = FallbackValueB;
+	NullTileValuesQuantized[0] = FallbackValueA;
+	NullTileValuesQuantized[1] = FallbackValueB;
+}
+
+void FSparseVolumeTextureHeader::Serialize(FArchive& Ar)
+{
+	Ar << Version;
+
+	if (Version == 0)
+	{
+		Ar << VirtualVolumeResolution;
+		Ar << VirtualVolumeAABBMin;
+		Ar << VirtualVolumeAABBMax;
+		Ar << PageTableVolumeResolution;
+		Ar << PageTableVolumeAABBMin;
+		Ar << PageTableVolumeAABBMax;
+		UE::SVT::Private::SerializeEnumAs<uint8>(Ar, AttributesFormats[0]);
+		UE::SVT::Private::SerializeEnumAs<uint8>(Ar, AttributesFormats[1]);
+		Ar << NullTileValues[0];
+		Ar << NullTileValues[1];
+		Ar << NullTileValuesQuantized[0];
+		Ar << NullTileValuesQuantized[1];
+	}
+	else
+	{
+		// FSparseVolumeTextureHeader needs to account for new version
+		check(false);
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+USparseVolumeTexture::USparseVolumeTexture(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+}
+
+FVector4 USparseVolumeTexture::GetUniformParameter(int32 Index) const
+{
+	const FSparseVolumeTextureSceneProxy* Proxy = GetSparseVolumeTextureSceneProxy();
+	if (Proxy)
+	{
+		const FSparseVolumeTextureRuntimeHeader& Header = Proxy->GetHeader();
+		switch (Index)
+		{
+		case ESparseVolumeTexture_TileSize:
+		{
+			return FVector4(float(SPARSE_VOLUME_TILE_RES), 0.0f, 0.0f, 0.0f);
+		}
+		case ESparseVolumeTexture_PageTableSize:
+		{
+			return FVector4(Header.PageTableVolumeResolution.X, Header.PageTableVolumeResolution.Y, Header.PageTableVolumeResolution.Z, 0.0f);
+		}
+		case ESparseVolumeTexture_UVScale: // fallthrough
+		case ESparseVolumeTexture_UVBias:
+		{
+			FVector Scale;
+			FVector Bias;
+			GetFrameUVScaleBias(&Scale, &Bias);
+			return (Index == ESparseVolumeTexture_UVScale) ? FVector4(Scale) : FVector4(Bias);
+		}
+		default:
+		{
+			break;
+		}
+		}
+		checkNoEntry();
+		return FVector4(ForceInitToZero);
+	}
+
+	// 0 while waiting for the proxy
+	return FVector4(ForceInitToZero);
+}
+
+void USparseVolumeTexture::GetPackedUniforms(FUintVector4& OutPacked0, FUintVector4& OutPacked1) const
+{
+	FIntVector3 PageTableOffset = FIntVector3::ZeroValue;
+	FVector3f TileDataTexelSize = FVector3f(0.0f, 0.0f, 0.0f);
+	int32 MinMipLevel = 0;
+	int32 MaxMipLevel = 0;
+	const FSparseVolumeTextureSceneProxy* Proxy = GetSparseVolumeTextureSceneProxy();
+	if (Proxy)
+	{
+		const FSparseVolumeTextureRuntimeHeader& Header = Proxy->GetHeader();
+		PageTableOffset = Header.PageTableVolumeAABBMin;
+		TileDataTexelSize.X = 1.0f / Header.TileDataVolumeResolution.X;
+		TileDataTexelSize.Y = 1.0f / Header.TileDataVolumeResolution.Y;
+		TileDataTexelSize.Z = 1.0f / Header.TileDataVolumeResolution.Z;
+		MinMipLevel = Header.LowestResidentLevel;
+		MaxMipLevel = Header.HighestResidentLevel;
+	}
+	const FIntVector3 VolumeResolution = GetVolumeResolution();
+	const FVector3f VolumePageResolution = FVector3f(VolumeResolution) / SPARSE_VOLUME_TILE_RES;
+
+	auto AsUint = [](float X)
+	{
+		union { float F; uint32 U; } FU = { X };
+		return FU.U;
+	};
+
+	OutPacked0.X = AsUint(VolumePageResolution.X);
+	OutPacked0.Y = AsUint(VolumePageResolution.Y);
+	OutPacked0.Z = AsUint(VolumePageResolution.Z);
+	OutPacked0.W = UE::SVT::PackPageTableEntry(PageTableOffset);
+	OutPacked1.X = AsUint(TileDataTexelSize.X);
+	OutPacked1.Y = AsUint(TileDataTexelSize.Y);
+	OutPacked1.Z = AsUint(TileDataTexelSize.Z);
+	OutPacked1.W = 0;
+	OutPacked1.W |= (uint32)((MinMipLevel & 0xFF) << 0);
+	OutPacked1.W |= (uint32)((MaxMipLevel & 0xFF) << 8);
+	OutPacked1.W |= (uint32)((int32(SPARSE_VOLUME_TILE_RES) & 0xFF) << 16);
+	OutPacked1.W |= (uint32)((int32(SPARSE_VOLUME_TILE_BORDER) & 0xFF) << 24);
+}
+
+void USparseVolumeTexture::GetFrameUVScaleBias(FVector* OutScale, FVector* OutBias) const
+{
+	*OutScale = FVector::One();
+	*OutBias = FVector::Zero();
+	const FSparseVolumeTextureSceneProxy* Proxy = GetSparseVolumeTextureSceneProxy();
+	if (Proxy)
+	{
+		const FSparseVolumeTextureRuntimeHeader& Header = Proxy->GetHeader();
+		const FVector GlobalVolumeRes = FVector(GetVolumeResolution());
+		check(GlobalVolumeRes.X > 0.0 && GlobalVolumeRes.Y > 0.0 && GlobalVolumeRes.Z > 0.0);
+		const FVector FrameBoundsPaddedMin = FVector(Header.PageTableVolumeAABBMin * SPARSE_VOLUME_TILE_RES); // padded to multiple of page size
+		const FVector FrameBoundsPaddedMax = FVector(Header.PageTableVolumeAABBMax * SPARSE_VOLUME_TILE_RES);
+		const FVector FramePaddedSize = FrameBoundsPaddedMax - FrameBoundsPaddedMin;
+
+		*OutScale = GlobalVolumeRes / FramePaddedSize; // scale from SVT UV space to frame (padded) local UV space
+		*OutBias = -(FrameBoundsPaddedMin / GlobalVolumeRes * *OutScale);
+	}
+}
+
+UE::Shader::EValueType USparseVolumeTexture::GetUniformParameterType(int32 Index)
+{
+	switch (Index)
+	{
+	case ESparseVolumeTexture_TileSize:				return UE::Shader::EValueType::Float1;
+	case ESparseVolumeTexture_PageTableSize:		return UE::Shader::EValueType::Float3;
+	case ESparseVolumeTexture_UVScale:				return UE::Shader::EValueType::Float3;
+	case ESparseVolumeTexture_UVBias:				return UE::Shader::EValueType::Float3;
+	default:
+		break;
+	}
+	checkNoEntry();
+	return UE::Shader::EValueType::Float4;
+}
+
+#if WITH_EDITOR
+void USparseVolumeTexture::NotifyMaterials(const ENotifyMaterialsEffectOnShaders EffectOnShaders)
+{
+	// Create a material update context to safely update materials.
+	{
+		FMaterialUpdateContext UpdateContext;
+
+		// Notify any material that uses this texture
+		TSet<UMaterial*> BaseMaterialsThatUseThisTexture;
+		for (TObjectIterator<UMaterialInterface> It; It; ++It)
+		{
+			UMaterialInterface* MaterialInterface = *It;
+			if (!FPlatformProperties::IsServerOnly() && MaterialInterface->GetReferencedTextures().Contains(this))
+			{
+				UpdateContext.AddMaterialInterface(MaterialInterface);
+				// This is a bit tricky. We want to make sure all materials using this texture are
+				// updated. Materials are always updated. Material instances may also have to be
+				// updated and if they have static permutations their children must be updated
+				// whether they use the texture or not! The safe thing to do is to add the instance's
+				// base material to the update context causing all materials in the tree to update.
+				BaseMaterialsThatUseThisTexture.Add(MaterialInterface->GetMaterial());
+			}
+		}
+
+		// Go ahead and update any base materials that need to be.
+		if (EffectOnShaders == ENotifyMaterialsEffectOnShaders::Default)
+		{
+			for (TSet<UMaterial*>::TConstIterator It(BaseMaterialsThatUseThisTexture); It; ++It)
+			{
+				(*It)->PostEditChange();
+			}
+		}
+		else
+		{
+			FPropertyChangedEvent EmptyPropertyUpdateStruct(nullptr);
+			for (TSet<UMaterial*>::TConstIterator It(BaseMaterialsThatUseThisTexture); It; ++It)
+			{
+				(*It)->PostEditChangePropertyInternal(EmptyPropertyUpdateStruct, UMaterial::EPostEditChangeEffectOnShaders::DoesNotInvalidate);
+			}
+		}
+	}
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+USparseVolumeTextureFrame::USparseVolumeTextureFrame(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+}
+
+USparseVolumeTextureFrame* USparseVolumeTextureFrame::GetFrame(USparseVolumeTexture* SparseVolumeTexture, int32 FrameIndex)
+{
+	if (UStreamableSparseVolumeTexture* StreamableSVT = Cast<UStreamableSparseVolumeTexture>(SparseVolumeTexture))
+	{
+		return StreamableSVT->GetFrame(FrameIndex);
+	}
+	return nullptr;
+}
+
+bool USparseVolumeTextureFrame::Initialize(USparseVolumeTexture* InOwner, int32 InFrameIndex, FSparseVolumeTextureData& UncookedFrame)
+{
+#if WITH_EDITORONLY_DATA
+	Owner = InOwner;
+	FrameIndex = InFrameIndex;
+	{
+		UE::Serialization::FEditorBulkDataWriter RawDataArchiveWriter(RawData);
+		UncookedFrame.Serialize(RawDataArchiveWriter);
+	}
+
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool USparseVolumeTextureFrame::BuildDerivedData(FSparseVolumeTextureData* OutMippedTextureData)
+{
+#if WITH_EDITORONLY_DATA
+	// Check if the virtualized bulk data payload is available now
+	if (RawData.HasPayloadData())
+	{
+		// First, read the source data in from the raw data stored as bulk data
+		UE::Serialization::FEditorBulkDataReader RawDataArchiveReader(RawData);
+		FSparseVolumeTextureData TextureData;
+		TextureData.Serialize(RawDataArchiveReader);
+
+		FSparseVolumeTextureDataAddressingInfo AddressingInfo{};
+		AddressingInfo.VolumeResolution = GetVolumeResolution();
+		AddressingInfo.AddressX = GetTextureAddressX();
+		AddressingInfo.AddressY = GetTextureAddressY();
+		AddressingInfo.AddressZ = GetTextureAddressZ();
+
+		const int32 NumMipLevels = -1; // generate entire mip chain
+		const bool bMoveMip0FromSource = true; // we have no need to keep TextureData around
+		if (!TextureData.BuildDerivedData(AddressingInfo, NumMipLevels, bMoveMip0FromSource, *OutMippedTextureData))
+		{
+			return false;
+		}
+
+		// Now unload the raw data
+		RawData.UnloadData();
+
+		return true;
+	}
+#endif
+	return false;
+}
+
+void USparseVolumeTextureFrame::PostLoad()
+{
+	Super::PostLoad();
+}
+
+void USparseVolumeTextureFrame::FinishDestroy()
+{
+	Super::FinishDestroy();
+}
+
+void USparseVolumeTextureFrame::BeginDestroy()
+{
+	if (SceneProxy)
+	{
+		ENQUEUE_RENDER_COMMAND(USparseVolumeTextureFrame_DeleteSVTProxy)(
+			[Proxy = SceneProxy](FRHICommandListImmediate& RHICmdList)
+			{
+				Proxy->ReleaseResource();
+				delete Proxy;
+			});
+		SceneProxy = nullptr;
+	}
+
+	Super::BeginDestroy();
+}
+
+void USparseVolumeTextureFrame::Serialize(FArchive& Ar)
+{
+	Super::Serialize(Ar);
+
+	FStripDataFlags StripFlags(Ar);
+
+	const bool bInlinePayload = (FrameIndex == 0);
+	StreamingData.SetBulkDataFlags(bInlinePayload ? BULKDATA_ForceInlinePayload : BULKDATA_Force_NOT_InlinePayload);
+
+	if (StripFlags.IsEditorDataStripped() && Ar.IsLoadingFromCookedPackage())
+	{
+		// In this case we are loading in game with a cooked build so we only need to load the runtime data.
+
+		// Read cooked bulk data from archive
+		StreamingData.Serialize(Ar, Owner);
+
+		if (bInlinePayload)
+		{
+			SceneProxy = new FSparseVolumeTextureSceneProxy();
+
+			// Create runtime data from cooked bulk data
+			{
+				FBulkDataReader BulkDataReader(StreamingData);
+				FSparseVolumeTextureData TextureData;
+				TextureData.Serialize(BulkDataReader);
+				bool bSuccess = SceneProxy->GetRuntimeData().Create(TextureData);
+				check(bSuccess); // SVT_TODO
+			}
+
+			// The bulk data is no longer needed
+			StreamingData.RemoveBulkData();
+
+			// Runtime data is now valid, initialize the render thread proxy
+			BeginInitResource(SceneProxy);
+		}
+	}
+	else if (Ar.IsCooking())
+	{
+		// We are cooking the game, serialize the asset out.
+
+		FSparseVolumeTextureData DerivedData;
+		const bool bBuiltDerivedData = BuildDerivedData(&DerivedData);
+		check(bBuiltDerivedData); // SVT_TODO: actual error handling
+
+		// Write derived data into StreamingData
+		{
+			FBulkDataWriter BulkDataWriter(StreamingData);
+			DerivedData.Serialize(BulkDataWriter);
+		}
+
+		// And now write the cooked bulk data to the archive
+		StreamingData.Serialize(Ar, Owner);
+	}
+	else if (!Ar.IsObjectReferenceCollector())
+	{
+#if WITH_EDITORONLY_DATA
+		// When in EDITOR:
+		//  - We only serialize raw data 
+		//  - The runtime data is fetched/put from/to DDC
+		//  - This EditorBulk data do not load the full and huge OpenVDB data. That is only done explicitly later.
+		RawData.Serialize(Ar, Owner);
+#endif
+	}
+}
+
+void USparseVolumeTextureFrame::GetResourceSizeEx(FResourceSizeEx& CumulativeResourceSize)
+{
+	Super::GetResourceSizeEx(CumulativeResourceSize);
+}
+
+void USparseVolumeTextureFrame::GenerateOrLoadDDCRuntimeData(UE::DerivedData::FRequestOwner& DDCRequestOwner)
+{
+#if WITH_EDITORONLY_DATA
+	using namespace UE::DerivedData;
+
+	// Release any previously allocated render thread proxy
+	if (SceneProxy)
+	{
+		BeginReleaseResource(SceneProxy);
+	}
+	else
+	{
+		SceneProxy = new FSparseVolumeTextureSceneProxy();
+	}
+
+	static const FString SparseVolumeTextureDDCVersion = TEXT("381AE2A9-A903-4C8F-8486-891E24D6EC70");	// Bump this if you want to ignore all cached data so far.
+	const FString DerivedDataKey = RawData.GetIdentifier().ToString()
+		+ FString::Format(TEXT("{0},{1},{2}"), { GetTextureAddressX(), GetTextureAddressY(), GetTextureAddressZ() })
+		+ SparseVolumeTextureDDCVersion;
+
+	const FCacheKey Key = ConvertLegacyCacheKey(DerivedDataKey);
+	const FSharedString Name = MakeStringView(GetPathName());
+
+	UE::DerivedData::GetCache().GetValue({ {Name, Key} }, DDCRequestOwner,
+		[this, &DDCRequestOwner](FCacheGetValueResponse&& Response)
+		{
+			if (Response.Status == EStatus::Ok)
+			{
+				DDCRequestOwner.LaunchTask(TEXT("USparseVolumeTextureFrame_DerivedDataLoad"),
+					[this, Value = MoveTemp(Response.Value)]()
+					{
+						FSharedBuffer Data = Value.GetData().Decompress();
+						FMemoryReaderView Ar(Data, true /*bIsPersistent*/);
+						FSparseVolumeTextureData TextureData;
+						TextureData.Serialize(Ar);
+						bool bSuccess = SceneProxy->GetRuntimeData().Create(TextureData);
+						check(bSuccess); // SVT_TODO
+
+						// Runtime data is now valid, initialize the render thread proxy
+						BeginInitResource(SceneProxy);
+					});
+			}
+			else if (Response.Status == EStatus::Error)
+			{
+				DDCRequestOwner.LaunchTask(TEXT("USparseVolumeTextureFrame_DerivedDataBuild"),
+					[this, &DDCRequestOwner, Name = Response.Name, Key = Response.Key]()
+					{
+						FSparseVolumeTextureRuntime& RuntimeData = SceneProxy->GetRuntimeData();
+
+						// Check if the virtualized bulk data payload is available now
+						if (RawData.HasPayloadData())
+						{
+							FSparseVolumeTextureData TextureData;
+							bool bSuccess = BuildDerivedData(&TextureData);
+							ensure(bSuccess);
+
+							bSuccess = RuntimeData.Create(TextureData);
+							ensure(bSuccess);
+
+							// Using a LargeMemoryWriter for serialization since the data can be bigger than 2 GB
+							FLargeMemoryWriter LargeMemWriter(0, /*bIsPersistent=*/ true);
+							TextureData.Serialize(LargeMemWriter);
+
+							const int64 UncompressedSize = LargeMemWriter.TotalSize();
+
+							// Since the DDC doesn't support data bigger than 2 GB, we only cache for such uncompressed size.
+							constexpr int64 SizeThreshold = 2147483648LL;	// 2GB
+							const bool bIsCacheable = UncompressedSize < SizeThreshold;
+							if (bIsCacheable)
+							{
+								FValue Value = FValue::Compress(FSharedBuffer::MakeView(LargeMemWriter.GetView()));
+								UE::DerivedData::GetCache().PutValue({ {Name, Key, Value} }, DDCRequestOwner);
+							}
+							else
+							{
+								UE_LOG(LogSparseVolumeTexture, Error, TEXT("SparseVolumeTexture - the asset is too large to fit in Derived Data Cache %s"), *GetName());
+							}
+						}
+						else
+						{
+							UE_LOG(LogSparseVolumeTexture, Error, TEXT("SparseVolumeTexture - Raw source data is not available for %s. Using default data."), *GetName());
+							RuntimeData.SetAsDefaultTexture();
+						}
+
+						// Runtime data is now valid, initialize the render thread proxy
+						BeginInitResource(SceneProxy);
+					});
+			}
+		});
+#endif // WITH_EDITORONLY_DATA
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+UStreamableSparseVolumeTexture::UStreamableSparseVolumeTexture(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+}
+
+bool UStreamableSparseVolumeTexture::BeginInitialize(int32 NumExpectedFrames)
+{
+#if WITH_EDITORONLY_DATA
+	if (InitState != EInitState::Uninitialized)
+	{
+		UE_LOG(LogSparseVolumeTexture, Error, TEXT("Tried to call UStreamableSparseVolumeTexture::BeginInitialize() while not in the Uninitialized init state."));
+		return false;
+	}
+
+	check(Frames.IsEmpty());
+	Frames.Empty(NumExpectedFrames);
+	VolumeBoundsMin = FIntVector(INT32_MAX, INT32_MAX, INT32_MAX);
+	VolumeBoundsMax = FIntVector(INT32_MIN, INT32_MIN, INT32_MIN);
+
+	InitState = EInitState::Pending;
+
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool UStreamableSparseVolumeTexture::AppendFrame(FSparseVolumeTextureData& UncookedFrame)
+{
+#if WITH_EDITORONLY_DATA
+	if (InitState != EInitState::Pending)
+	{
+		UE_LOG(LogSparseVolumeTexture, Error, TEXT("Tried to call UStreamableSparseVolumeTexture::AppendFrame() while not in the Pending init state."));
+		return false;
+	}
+
+	// The the minimum of the union of all frame AABBs should ideally be at (0, 0, 0), but it should also be fine if it is greater than that.
+	// A mimimum of less than (0, 0, 0) is not permitted.
+	if (UncookedFrame.Header.VirtualVolumeAABBMin.X < 0 || UncookedFrame.Header.VirtualVolumeAABBMin.Y < 0 || UncookedFrame.Header.VirtualVolumeAABBMin.Z < 0)
+	{
+		UE_LOG(LogSparseVolumeTexture, Error, TEXT("Tried to add a frame to a SparseVolumeTexture with a VirtualVolumeAABBMin < 0 (%i, %i, %i)"),
+			VolumeBoundsMin.X, VolumeBoundsMin.Y, VolumeBoundsMin.Z);
+		return false;
+	}
+
+	// Compute union of all frame AABBs
+	VolumeBoundsMin.X = FMath::Min(VolumeBoundsMin.X, UncookedFrame.Header.VirtualVolumeAABBMin.X);
+	VolumeBoundsMin.Y = FMath::Min(VolumeBoundsMin.Y, UncookedFrame.Header.VirtualVolumeAABBMin.Y);
+	VolumeBoundsMin.Z = FMath::Min(VolumeBoundsMin.Z, UncookedFrame.Header.VirtualVolumeAABBMin.Z);
+	VolumeBoundsMax.X = FMath::Max(VolumeBoundsMax.X, UncookedFrame.Header.VirtualVolumeAABBMax.X);
+	VolumeBoundsMax.Y = FMath::Max(VolumeBoundsMax.Y, UncookedFrame.Header.VirtualVolumeAABBMax.Y);
+	VolumeBoundsMax.Z = FMath::Max(VolumeBoundsMax.Z, UncookedFrame.Header.VirtualVolumeAABBMax.Z);
+
+	VolumeResolution = VolumeBoundsMax;
+
+	USparseVolumeTextureFrame* Frame = NewObject<USparseVolumeTextureFrame>(this);
+	if (Frame->Initialize(this, Frames.Num(), UncookedFrame))
+	{
+		Frames.Add(Frame);
+		return true;
+	}
+	return false;
+	
+#else
+	return false;
+#endif
+}
+
+bool UStreamableSparseVolumeTexture::EndInitialize(int32 InNumMipLevels)
+{
+#if WITH_EDITORONLY_DATA
+	if (InitState != EInitState::Pending)
+	{
+		UE_LOG(LogSparseVolumeTexture, Error, TEXT("Tried to call UStreamableSparseVolumeTexture::EndInitialize() while not in the Pending init state."));
+		return false;
+	}
+
+	// Ensure that at least one frame of data exists
+	if (Frames.IsEmpty())
+	{
+		UE_LOG(LogSparseVolumeTexture, Warning, TEXT("SVT has zero frames! Adding a dummy frame. SVT: %s"), *GetName());
+		FSparseVolumeTextureData DummyFrame;
+		DummyFrame.CreateDefault();
+		AppendFrame(DummyFrame);
+	}
+
+	check(VolumeResolution.X > 0 && VolumeResolution.Y > 0 && VolumeResolution.Z > 0);
+	check(VolumeBoundsMin.X >= 0 && VolumeBoundsMin.Y >= 0 && VolumeBoundsMin.Z >= 0);
+
+	if (VolumeBoundsMin.X > 0 || VolumeBoundsMin.Y > 0 || VolumeBoundsMin.Z > 0)
+	{
+		UE_LOG(LogSparseVolumeTexture, Warning, TEXT("Initialized a SparseVolumeTexture with a VirtualVolumeAABBMin > 0 (%i, %i, %i). This wastes memory"),
+			VolumeBoundsMin.X, VolumeBoundsMin.Y, VolumeBoundsMin.Z);
+	}
+
+	const int32 NumMipLevelsFullMipChain = SVTComputeNumMipLevels(VolumeResolution);
+	check(NumMipLevelsFullMipChain > 0);
+
+	NumMipLevels = (InNumMipLevels <= INDEX_NONE) ? NumMipLevelsFullMipChain : FMath::Clamp(InNumMipLevels, 1, NumMipLevelsFullMipChain);
+
+	InitState = EInitState::Done;
+
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool UStreamableSparseVolumeTexture::Initialize(const TArrayView<FSparseVolumeTextureData>& InUncookedData, int32 InNumMipLevels)
+{
+	if (InUncookedData.IsEmpty())
+	{
+		UE_LOG(LogSparseVolumeTexture, Error, TEXT("Tried to initialize a SparseVolumeTexture with no frames"));
+		return false;
+	}
+
+	if (!BeginInitialize(InUncookedData.Num()))
+	{
+		return false;
+	}
+	for (FSparseVolumeTextureData& UncookedFrame : InUncookedData)
+	{
+		if (!AppendFrame(UncookedFrame))
+		{
+			return false;
+		}
+	}
+	if (!EndInitialize(InNumMipLevels))
+	{
+		return false;
+	}
+
+	return true;
+}
+
+const FSparseVolumeTextureSceneProxy* UStreamableSparseVolumeTexture::GetStreamedFrameProxyOrFallback(int32 FrameIndex, int32 MipLevel) const
+{
+#if WITH_EDITORONLY_DATA
+	if (InitState != EInitState::Done)
+	{
+		UE_LOG(LogSparseVolumeTexture, Warning, TEXT("Tried to call GetStreamedFrameProxyOrFallback() on uninitialized SVT: %s"), *GetName());
+		return nullptr;
+	}
+#endif
+	if (Frames.IsEmpty())
+	{
+		UE_LOG(LogSparseVolumeTexture, Warning, TEXT("SVT is empty and has no frames at all! SVT: %s"), *GetName());
+		return nullptr;
+	}
+	FrameIndex = FMath::Clamp(FrameIndex, 0, Frames.Num() - 1);
+
+#if WITH_EDITORONLY_DATA
+	return Frames[FrameIndex]->GetSparseVolumeTextureSceneProxy();
+#else
+	ISparseVolumeTextureStreamingManager& StreamingManager = IStreamingManager::Get().GetSparseVolumeTextureStreamingManager();
+	const FSparseVolumeTextureSceneProxy* Proxy = StreamingManager.GetSparseVolumeTextureSceneProxy(this, FrameIndex, MipLevel, true);
+
+	int32 FallbackFrameIndex = FrameIndex;
+	while (!Proxy)
+	{
+		FallbackFrameIndex = FallbackFrameIndex > 0 ? (FallbackFrameIndex - 1) : (Frames.Num() - 1);
+		if (FallbackFrameIndex == FrameIndex)
+		{
+			UE_LOG(LogSparseVolumeTexture, Warning, TEXT("Failed to get ANY streamed SparseVolumeTexture frame  SVT: %s, FrameIndex: %i"), *GetName(), FrameIndex);
+			return nullptr;
+		}
+		Proxy = StreamingManager.GetSparseVolumeTextureSceneProxy(this, FallbackFrameIndex, MipLevel, false);
+	}
+
+	return Proxy;
+#endif
+}
+
+void UStreamableSparseVolumeTexture::PostLoad()
+{
+	Super::PostLoad();
+
+#if WITH_EDITORONLY_DATA
+	GenerateOrLoadDDCRuntimeDataAndCreateSceneProxy();
+#else
+	IStreamingManager::Get().GetSparseVolumeTextureStreamingManager().AddSparseVolumeTexture(this); // GenerateOrLoadDDCRuntimeDataAndCreateSceneProxy() handles this in editor builds
+#endif
+}
+
+void UStreamableSparseVolumeTexture::FinishDestroy()
+{
+	Super::FinishDestroy();
+
+	IStreamingManager::Get().GetSparseVolumeTextureStreamingManager().RemoveSparseVolumeTexture(this);
+}
+
+void UStreamableSparseVolumeTexture::BeginDestroy()
+{
+	Super::BeginDestroy();
+}
+
+void UStreamableSparseVolumeTexture::Serialize(FArchive& Ar)
+{
+	Super::Serialize(Ar);
+
+	// To ensure that we keep the same binary format between builds with and without editor-only data, we serialize dummy data if the editor-only data is stripped.
+	// SVT_TODO: Is there a cleaner way of doing this?
+	FIntVector* VolumeBoundsMinPtr = nullptr;
+	FIntVector* VolumeBoundsMaxPtr = nullptr;
+	EInitState* InitStatePtr = nullptr;
+
+#if WITH_EDITORONLY_DATA
+	// Check that we are not trying to cook unitialized data!
+	check(!Ar.IsCooking() || InitState == EInitState::Done);
+
+	VolumeBoundsMinPtr = &VolumeBoundsMin;
+	VolumeBoundsMaxPtr = &VolumeBoundsMax;
+	InitStatePtr = &InitState;
+#else
+	FIntVector VolumeBoundsMinDummy{};
+	FIntVector VolumeBoundsMaxDummy{};
+	EInitState InitStateDummy{};
+	VolumeBoundsMinPtr = &VolumeBoundsMinDummy;
+	VolumeBoundsMaxPtr = &VolumeBoundsMaxDummy;
+	InitStatePtr = &InitStateDummy;
+#endif
+
+	UE::SVT::Private::SerializeEnumAs<uint8>(Ar, *InitStatePtr);
+	Ar << *VolumeBoundsMinPtr;
+	Ar << *VolumeBoundsMaxPtr;
+}
+
+#if WITH_EDITOR
+void UStreamableSparseVolumeTexture::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+	if (PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(UStreamableSparseVolumeTexture, AddressX)
+		|| PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(UStreamableSparseVolumeTexture, AddressY)
+		|| PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(UStreamableSparseVolumeTexture, AddressZ))
+	{
+		// SVT need to recompile shaders when address mode changes
+		NotifyMaterials();
+		for (USparseVolumeTextureFrame* Frame : Frames)
+		{
+			Frame->NotifyMaterials();
+		}
+	}
+
+	Super::PostEditChangeProperty(PropertyChangedEvent);
+
+	GenerateOrLoadDDCRuntimeDataAndCreateSceneProxy();
+}
+#endif // WITH_EDITOR
+
+void UStreamableSparseVolumeTexture::GetResourceSizeEx(FResourceSizeEx& CumulativeResourceSize)
+{
+	Super::GetResourceSizeEx(CumulativeResourceSize);
+	SIZE_T SizeCPU = sizeof(*this);
+	SIZE_T SizeGPU = 0;
+	SizeCPU += Frames.GetAllocatedSize();
+	for (USparseVolumeTextureFrame* Frame : Frames)
+	{
+		Frame->GetResourceSizeEx(CumulativeResourceSize);
+	}
+	ISparseVolumeTextureStreamingManager& StreamingManager = IStreamingManager::Get().GetSparseVolumeTextureStreamingManager();
+	StreamingManager.GetMemorySizeForSparseVolumeTexture(this, &SizeCPU, &SizeGPU);
+	CumulativeResourceSize.AddDedicatedSystemMemoryBytes(SizeCPU);
+	CumulativeResourceSize.AddDedicatedVideoMemoryBytes(SizeGPU);
+}
+
+void UStreamableSparseVolumeTexture::GenerateOrLoadDDCRuntimeDataAndCreateSceneProxy()
+{
+#if WITH_EDITORONLY_DATA
+
+	if (InitState != EInitState::Done)
+	{
+		UE_LOG(LogSparseVolumeTexture, Warning, TEXT("Tried to cache derived data of an uninitialized SVT: %s"), *GetName());
+		return;
+	}
+
+	UE::DerivedData::FRequestOwner DDCRequestOwner(UE::DerivedData::EPriority::Normal);
+	{
+		UE::DerivedData::FRequestBarrier DDCRequestBarrier(DDCRequestOwner);
+		for (USparseVolumeTextureFrame* Frame : Frames)
+		{
+			Frame->GenerateOrLoadDDCRuntimeData(DDCRequestOwner);
+		}
+	}
+
+	// Wait for all DDC requests to complete
+	DDCRequestOwner.Wait();
+
+	IStreamingManager::Get().GetSparseVolumeTextureStreamingManager().AddSparseVolumeTexture(this);
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+UStaticSparseVolumeTexture::UStaticSparseVolumeTexture(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+}
+
+bool UStaticSparseVolumeTexture::AppendFrame(FSparseVolumeTextureData& UncookedFrame)
+{
+	if (!Frames.IsEmpty())
+	{
+		UE_LOG(LogSparseVolumeTexture, Error, TEXT("Tried to initialize a UStaticSparseVolumeTexture with more than 1 frame"));
+		return false;
+	}
+	return Super::AppendFrame(UncookedFrame);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+UAnimatedSparseVolumeTexture::UAnimatedSparseVolumeTexture(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+}
+
+const FSparseVolumeTextureSceneProxy* UAnimatedSparseVolumeTexture::GetSparseVolumeTextureSceneProxy() const
+{
+	// When an AnimatedSparseVolumeTexture is used as SparseVolumeTexture, it can only be previewed using a single preview frame.
+	check(!Frames.IsEmpty());
+	const int32 FrameIndex = PreviewFrameIndex % Frames.Num();
+	const int32 MipLevel = FMath::Clamp(PreviewMipLevel, 0, GetNumMipLevels() - 1);
+	return GetStreamedFrameProxyOrFallback(FrameIndex, MipLevel);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+UAnimatedSparseVolumeTextureController::UAnimatedSparseVolumeTextureController(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+}
+
+void UAnimatedSparseVolumeTextureController::Play()
+{
+	bIsPlaying = true;
+}
+
+void UAnimatedSparseVolumeTextureController::Pause()
+{
+	bIsPlaying = false;
+}
+
+void UAnimatedSparseVolumeTextureController::Stop()
+{
+	if (bIsPlaying)
+	{
+		bIsPlaying = false;
+		Time = 0.0f;
+	}
+}
+
+void UAnimatedSparseVolumeTextureController::Update(float DeltaTime)
+{
+	if (!IsValid(SparseVolumeTexture) || !bIsPlaying)
+	{
+		return;
+	}
+
+	// Update animation time
+	const float AnimationDuration = GetDuration();
+	Time = FMath::Fmod(Time + DeltaTime, AnimationDuration + UE_SMALL_NUMBER);
+}
+
+float UAnimatedSparseVolumeTextureController::GetFractionalFrameIndex()
+{
+	if (!IsValid(SparseVolumeTexture))
+	{
+		return 0.0f;
+	}
+
+	const int32 FrameCount = SparseVolumeTexture->GetNumFrames();
+	const float FrameIndexF = FMath::Fmod(Time * FrameRate, (float)FrameCount);
+	return FrameIndexF;
+}
+
+USparseVolumeTextureFrame* UAnimatedSparseVolumeTextureController::GetFrameByIndex(int32 FrameIndex)
+{
+	if (!IsValid(SparseVolumeTexture))
+	{
+		return nullptr;
+	}
+
+	return USparseVolumeTextureFrame::GetFrame(SparseVolumeTexture, FrameIndex);
+}
+
+USparseVolumeTextureFrame* UAnimatedSparseVolumeTextureController::GetCurrentFrame()
+{
+	if (!IsValid(SparseVolumeTexture))
+	{
+		return nullptr;
+	}
+
+	// Compute (fractional) index of frame to sample
+	const float FrameIndexF = GetFractionalFrameIndex();
+	const int32 FrameIndex = (int32)FrameIndexF;
+
+	return USparseVolumeTextureFrame::GetFrame(SparseVolumeTexture, FrameIndex);
+}
+
+void UAnimatedSparseVolumeTextureController::GetCurrentFramesForInterpolation(USparseVolumeTextureFrame*& Frame0, USparseVolumeTextureFrame*& Frame1, float& LerpAlpha)
+{
+	if (!IsValid(SparseVolumeTexture))
+	{
+		return;
+	}
+
+	// Compute (fractional) index of frame to sample
+	const float FrameIndexF = GetFractionalFrameIndex();
+	const int32 FrameIndex = (int32)FrameIndexF;
+	LerpAlpha = FMath::Frac(FrameIndexF);
+
+	Frame0 = USparseVolumeTextureFrame::GetFrame(SparseVolumeTexture, FrameIndex);
+	Frame1 = USparseVolumeTextureFrame::GetFrame(SparseVolumeTexture, (FrameIndex + 1) % SparseVolumeTexture->GetNumFrames());
+}
+
+float UAnimatedSparseVolumeTextureController::GetDuration()
+{
+	if (!IsValid(SparseVolumeTexture))
+	{
+		return 0.0f;
+	}
+
+	const int32 FrameCount = SparseVolumeTexture->GetNumFrames();
+	const float AnimationDuration = FrameCount / (FrameRate + UE_SMALL_NUMBER);
+	return AnimationDuration;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+#undef LOCTEXT_NAMESPACE
